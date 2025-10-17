@@ -50,7 +50,18 @@ export default function SignupScreen() {
       console.log('Attempting registration with:', { name, email, password: '***', password_confirmation: '***' });
       await register(name, email, password, passwordConfirmation);
       console.log('Registration successful!');
-      router.replace('/');
+      // Wait for auth state to update, then navigate
+      setTimeout(() => {
+        // Try to dismiss any existing navigation stack first
+        try {
+          router.dismissAll();
+          router.replace('/');
+        } catch (error) {
+          console.log('Navigation error, trying alternative:', error);
+          // Alternative approach
+          router.push('/');
+        }
+      }, 300);
     } catch (error: any) {
       console.error('Registration error details:', {
         message: error.message,

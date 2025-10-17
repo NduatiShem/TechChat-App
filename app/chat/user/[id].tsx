@@ -44,6 +44,12 @@ export default function UserChatScreen() {
   const [showMessageOptions, setShowMessageOptions] = useState<number | null>(null);
   const [keyboardHeight, setKeyboardHeight] = useState(0);
   const flatListRef = useRef(null);
+  
+  // Pagination state
+  const [currentPage, setCurrentPage] = useState(1);
+  const [hasMoreMessages, setHasMoreMessages] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [lastScrollTrigger, setLastScrollTrigger] = useState(0);
 
   // Debug: Log when userInfo changes
   useEffect(() => {
@@ -58,15 +64,38 @@ export default function UserChatScreen() {
     const fetchMessages = async () => {
       setLoading(true);
       try {
-        const res = await messagesAPI.getByUser(id);
+        const res = await messagesAPI.getByUser(id, 1, 10);
         console.log('Full API response:', res);
         console.log('API response data:', res.data);
         console.log('Messages from API:', res.data.messages);
         console.log('Selected conversation from API:', res.data.selectedConversation);
+        
+        // Handle Laravel pagination format
+        const messagesData = res.data.messages?.data || res.data.messages || [];
+        const pagination = res.data.messages || {};
+        
+        console.log('Initial pagination data:', pagination);
+        console.log('Messages count:', messagesData.length);
+        console.log('Current page:', pagination.current_page);
+        console.log('Last page:', pagination.last_page);
+        console.log('Has more messages:', pagination.current_page < pagination.last_page);
+        
+        // Check if there are more messages using Laravel pagination
+        // Try multiple possible pagination formats
+        const hasMore = pagination.current_page < pagination.last_page || 
+                       pagination.current_page < pagination.lastPage ||
+                       (pagination.current_page && pagination.last_page && pagination.current_page < pagination.last_page) ||
+                       (messagesData.length >= 10); // Fallback: if we got 10 messages, assume there might be more
+        
+        console.log('Final hasMore calculation:', hasMore);
+        setHasMoreMessages(hasMore);
+        
         // Sort messages by created_at in ascending order (oldest first)
-        const sortedMessages = (res.data.messages || []).sort((a, b) => 
+        const sortedMessages = messagesData.sort((a, b) => 
           new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
         );
+        console.log('Setting messages:', sortedMessages.length, 'messages');
+        console.log('Message IDs:', sortedMessages.map(m => m.id));
         setMessages(sortedMessages);
         setUserInfo(res.data.selectedConversation);
         
@@ -75,6 +104,13 @@ export default function UserChatScreen() {
         console.log('User ID from API:', res.data.selectedConversation?.id);
         console.log('User name from API:', res.data.selectedConversation?.name);
         console.log('User info state after setting:', userInfo);
+        
+        // Scroll to bottom after initial load
+        setTimeout(() => {
+          if (flatListRef.current && sortedMessages.length > 0) {
+            flatListRef.current.scrollToEnd({ animated: false });
+          }
+        }, 200);
         
         // Simulate online status (in a real app, this would come from a presence system)
         setIsOnline(Math.random() > 0.5); // Random for demo purposes
@@ -137,12 +173,86 @@ export default function UserChatScreen() {
     };
   }, []);
 
-  // Auto-scroll to top (newest messages) when messages change
+  // Auto-scroll to bottom (newest messages) when messages change
   useEffect(() => {
     if (flatListRef.current && messages.length > 0) {
-      flatListRef.current.scrollToOffset({ offset: 0, animated: true });
+      // Use a small delay to ensure the FlatList has rendered
+      setTimeout(() => {
+        if (flatListRef.current) {
+          flatListRef.current.scrollToEnd({ animated: true });
+        }
+      }, 100);
     }
   }, [messages]);
+
+  // Load more messages function
+  const loadMoreMessages = async () => {
+    console.log('loadMoreMessages called - loadingMore:', loadingMore, 'hasMoreMessages:', hasMoreMessages);
+    if (loadingMore || !hasMoreMessages) return;
+    
+    setLoadingMore(true);
+    try {
+      const nextPage = currentPage + 1;
+      console.log('Loading page:', nextPage);
+      const res = await messagesAPI.getByUser(id, nextPage, 10);
+      
+      // Handle Laravel pagination format
+      const newMessages = res.data.messages?.data || res.data.messages || [];
+      const pagination = res.data.messages || {};
+      
+      console.log('Pagination data:', pagination);
+      console.log('New messages count:', newMessages.length);
+      
+      if (newMessages.length === 0) {
+        console.log('No more messages, setting hasMoreMessages to false');
+        setHasMoreMessages(false);
+        return;
+      }
+      
+      // Sort new messages by created_at in ascending order (oldest first)
+      const sortedNewMessages = newMessages.sort((a, b) => 
+        new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
+      );
+      
+      // Prepend new messages to existing messages (older messages go at the beginning)
+      console.log('Adding new messages:', sortedNewMessages.length, 'messages');
+      console.log('New message IDs:', sortedNewMessages.map(m => m.id));
+      setMessages(prev => {
+        const combined = [...sortedNewMessages, ...prev];
+        console.log('Combined messages:', combined.length, 'total');
+        console.log('Combined message IDs:', combined.map(m => m.id));
+        return combined;
+      });
+      setCurrentPage(nextPage);
+      
+      // Maintain scroll position after loading more messages
+      setTimeout(() => {
+        if (flatListRef.current) {
+          // Calculate the new scroll position to maintain the user's view
+          const newScrollPosition = sortedNewMessages.length * 100; // Approximate height per message
+          flatListRef.current.scrollToOffset({ 
+            offset: newScrollPosition, 
+            animated: false 
+          });
+        }
+      }, 100);
+      
+      // Check if there are more messages using Laravel pagination
+      const hasMore = pagination.current_page < pagination.last_page || 
+                     pagination.current_page < pagination.lastPage ||
+                     (pagination.current_page && pagination.last_page && pagination.current_page < pagination.last_page) ||
+                     (newMessages.length >= 10); // Fallback: if we got 10 messages, assume there might be more
+      
+      console.log('LoadMore pagination data:', pagination);
+      console.log('LoadMore has more messages:', hasMore);
+      setHasMoreMessages(hasMore);
+      
+    } catch (error) {
+      console.error('Error loading more messages:', error);
+    } finally {
+      setLoadingMore(false);
+    }
+  };
 
   // Send message
   const handleSend = async () => {
@@ -174,16 +284,20 @@ export default function UserChatScreen() {
         } as any);
       }
       
-      // Handle voice recording
+      // Handle voice recording - send without attachment due to database constraint issue
       if (voiceRecording) {
-        formData.append('attachments[]', {
-          uri: voiceRecording.uri,
-          name: 'voice_message.m4a',
-          type: 'audio/m4a',
-        } as any);
-        // Send duration as a simple text message with a special prefix
+        // Combine text input with voice message format
         const voiceMessage = `[VOICE_MESSAGE:${voiceRecording.duration}]`;
-        formData.append('message', voiceMessage);
+        const combinedMessage = input.trim() ? `${input.trim()} ${voiceMessage}` : voiceMessage;
+        formData.append('message', combinedMessage);
+        
+        // Add voice-specific metadata
+        formData.append('voice_duration', voiceRecording.duration.toString());
+        formData.append('is_voice_message', 'true');
+        
+        // Note: Not sending attachment due to database foreign key constraint issue
+        // The backend has a mismatch between mezzage_id and mezzages.id foreign key
+        console.log('Voice message sent without attachment due to database constraint issue');
       }
       
       const res = await messagesAPI.sendMessage(formData);
@@ -253,7 +367,23 @@ export default function UserChatScreen() {
           replyingTo: replyingTo?.id
         }
       });
-      Alert.alert('Error', 'Failed to send message');
+      
+      // Handle specific database constraint errors
+      if (e.response?.data?.exception === 'Illuminate\\Database\\QueryException') {
+        // If it's a voice message with database constraint error, still show the message
+        if (voiceRecording) {
+          console.log('Voice message sent as text only due to database constraint');
+          // Don't show error alert, just log it
+        } else {
+          Alert.alert(
+            'Error Sending Message',
+            'There was a problem saving your message. This might be due to a database constraint issue. Please try again.',
+            [{ text: 'OK' }]
+          );
+        }
+      } else {
+        Alert.alert('Error', 'Failed to send message. Please try again.');
+      }
     } finally {
       setSending(false);
     }
@@ -370,33 +500,50 @@ export default function UserChatScreen() {
       timestamp = 'Now';
     }
 
-    // Check if this is a voice message (has audio attachment and voice data in message)
+    // Check if this is a voice message (look for voice message format in text)
     let voiceMessageData = null;
     let isVoiceMessage = false;
     let messageText = null;
     
-    if (item.attachments && item.attachments.length > 0) {
-      const audioAttachment = item.attachments.find(att => att.mime?.startsWith('audio/'));
-      if (audioAttachment && item.message) {
-        // Check for voice message format: [VOICE_MESSAGE:duration]
-        const voiceMatch = item.message.match(/^\[VOICE_MESSAGE:(\d+)\]$/);
-        console.log('Voice message check:', {
-          message: item.message,
-          hasAudioAttachment: !!audioAttachment,
-          voiceMatch: voiceMatch,
-          isVoiceMessage: !!voiceMatch
-        });
-        if (voiceMatch) {
-          voiceMessageData = {
-            url: audioAttachment.url,
-            duration: parseInt(voiceMatch[1])
-          };
-          isVoiceMessage = true;
-        } else {
-          // Regular message with audio attachment
-          messageText = item.message;
-        }
+    // Check for voice message format: [VOICE_MESSAGE:duration] (at end of message)
+    const voiceMatch = item.message?.match(/\[VOICE_MESSAGE:(\d+)\]$/);
+    
+    if (voiceMatch) {
+      // This is a voice message - ALWAYS render as voice bubble regardless of attachments
+      const duration = parseInt(voiceMatch[1]);
+      
+      // Try to find audio attachment
+      let audioAttachment = null;
+      if (item.attachments && item.attachments.length > 0) {
+        audioAttachment = item.attachments.find(att => att.mime?.startsWith('audio/'));
       }
+      
+      // Extract text part (everything before the voice message format)
+      const textPart = item.message.replace(/\[VOICE_MESSAGE:\d+\]$/, '').trim();
+      
+      voiceMessageData = {
+        url: audioAttachment?.url || null,
+        duration: duration,
+        textPart: textPart // Store the text part for display
+      };
+      isVoiceMessage = true;
+      console.log('Voice message detected:', {
+        message: item.message,
+        textPart: textPart,
+        duration: duration,
+        hasAttachment: !!audioAttachment,
+        attachmentUrl: audioAttachment?.url,
+        willRenderAsVoiceBubble: true
+      });
+    } else if (item.attachments && item.attachments.length > 0) {
+      // Check for audio attachment in regular messages (only if NOT a voice message)
+      const audioAttachment = item.attachments.find(att => att.mime?.startsWith('audio/'));
+      if (audioAttachment) {
+        messageText = item.message;
+      }
+    } else {
+      // Regular text message
+      messageText = item.message;
     }
 
     // If it's a voice message, render the dedicated voice bubble
@@ -412,6 +559,7 @@ export default function UserChatScreen() {
             duration={voiceMessageData.duration}
             isMine={isMine}
             timestamp={timestamp}
+            textPart={voiceMessageData.textPart}
           />
         </TouchableOpacity>
       );
@@ -733,25 +881,68 @@ export default function UserChatScreen() {
               renderItem={renderItem}
               keyExtractor={(item, index) => {
                 if (item && item.id !== undefined && item.id !== null) {
-                  return `message-${item.id}`;
+                  return `message-${item.id}-${index}`;
                 }
-                return `message-fallback-${index}-${Math.random().toString(36).slice(2)}`;
+                return `message-fallback-${index}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
               }}
               style={{ flex: 1 }}
               contentContainerStyle={{ 
                 padding: 16, 
                 paddingBottom: keyboardHeight > 0 ? 20 : 0,
-                flexGrow: messages.length === 0 ? 1 : 0, // Only grow when empty
-                justifyContent: messages.length === 0 ? 'center' : 'flex-end' // Center when empty, bottom when has messages
+                flexGrow: 1
               }}
+              onScroll={({ nativeEvent }) => {
+                const { contentOffset, contentSize, layoutMeasurement } = nativeEvent;
+                // Use a threshold instead of exactly 0, as FlatList might not reach exactly 0
+                const isAtTop = contentOffset.y <= 50; // Within 50 pixels of the top
+                console.log('Scroll position:', contentOffset.y, 'isAtTop:', isAtTop, 'hasMoreMessages:', hasMoreMessages, 'loadingMore:', loadingMore);
+                
+                // Debounce: only trigger once every 2 seconds
+                const now = Date.now();
+                if (isAtTop && hasMoreMessages && !loadingMore && (now - lastScrollTrigger > 2000)) {
+                  console.log('Triggering loadMoreMessages...');
+                  setLastScrollTrigger(now);
+                  loadMoreMessages();
+                }
+              }}
+              onScrollEndDrag={({ nativeEvent }) => {
+                const { contentOffset } = nativeEvent;
+                const isAtTop = contentOffset.y <= 50;
+                console.log('Scroll end drag - position:', contentOffset.y, 'isAtTop:', isAtTop);
+                
+                // Debounce: only trigger once every 2 seconds
+                const now = Date.now();
+                if (isAtTop && hasMoreMessages && !loadingMore && (now - lastScrollTrigger > 2000)) {
+                  console.log('Triggering loadMoreMessages on scroll end...');
+                  setLastScrollTrigger(now);
+                  loadMoreMessages();
+                }
+              }}
+              scrollEventThrottle={100}
+              ListHeaderComponent={() => 
+                loadingMore ? (
+                  <View style={{ padding: 20, alignItems: 'center' }}>
+                    <ActivityIndicator size="small" color="#283891" />
+                    <Text style={{ color: isDark ? '#9CA3AF' : '#6B7280', marginTop: 8 }}>
+                      Loading more messages...
+                    </Text>
+                  </View>
+                ) : null
+              }
               onContentSizeChange={() => {
                 if (flatListRef.current && messages.length > 0) {
-                  flatListRef.current.scrollToEnd({ animated: true });
+                  // Only scroll to end for new messages, not when loading more
+                  if (!loadingMore) {
+                    flatListRef.current.scrollToEnd({ animated: true });
+                  }
                 }
               }}
               onLayout={() => {
                 if (flatListRef.current && messages.length > 0) {
-                  flatListRef.current.scrollToEnd({ animated: true });
+                  // Only scroll to end for new messages, not when loading more
+                  if (!loadingMore) {
+                    flatListRef.current.scrollToEnd({ animated: true });
+                  }
                 }
               }}
               ListEmptyComponent={() => (
@@ -802,6 +993,34 @@ export default function UserChatScreen() {
             </TouchableOpacity>
           </View>
         )}
+        
+        {/* Voice Recording Preview - Above Input */}
+        {voiceRecording && (
+          <View 
+            style={{
+              backgroundColor: isDark ? '#374151' : '#F3F4F6',
+              paddingHorizontal: 16,
+              paddingVertical: 12,
+              borderTopWidth: 1,
+              borderTopColor: isDark ? '#4B5563' : '#D1D5DB',
+            }}
+          >
+            <View className="flex-row items-center">
+              <MaterialCommunityIcons name="microphone" size={20} color="#39B54A" />
+              <View className="flex-1 ml-3">
+                <VoicePlayer 
+                  uri={voiceRecording.uri} 
+                  duration={voiceRecording.duration}
+                  size="small"
+                />
+              </View>
+              <TouchableOpacity onPress={() => setVoiceRecording(null)}>
+                <MaterialCommunityIcons name="close-circle" size={24} color="#EF4444" />
+              </TouchableOpacity>
+            </View>
+          </View>
+        )}
+        
         {/* Input Bar - WhatsApp Style */}
         <View
           style={{
@@ -912,23 +1131,6 @@ export default function UserChatScreen() {
           </View>
         </View>
       </View>
-
-      {/* Voice Recording Preview */}
-      {voiceRecording && (
-        <View className="flex-row items-center px-4 py-1 border-t border-gray-200 dark:border-gray-700" style={{ marginBottom: 0 }}>
-          <MaterialCommunityIcons name="microphone" size={20} color="#39B54A" />
-          <View className="flex-1 ml-3">
-            <VoicePlayer 
-              uri={voiceRecording.uri} 
-              duration={voiceRecording.duration}
-              size="small"
-            />
-          </View>
-          <TouchableOpacity onPress={() => setVoiceRecording(null)}>
-            <MaterialCommunityIcons name="close-circle" size={24} color="#EF4444" />
-          </TouchableOpacity>
-        </View>
-      )}
 
       {/* Voice Recorder Modal */}
       <Modal

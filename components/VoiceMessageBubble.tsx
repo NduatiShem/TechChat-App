@@ -1,22 +1,23 @@
-import React, { useState, useEffect, useRef } from 'react';
-import {
-  View,
-  Text,
-  TouchableOpacity,
-  StyleSheet,
-  Animated,
-  Alert,
-} from 'react-native';
-import { Audio } from 'expo-av';
-import { MaterialCommunityIcons } from '@expo/vector-icons';
 import { useTheme } from '@/context/ThemeContext';
+import { MaterialCommunityIcons } from '@expo/vector-icons';
+import { Audio } from 'expo-av';
+import React, { useEffect, useRef, useState } from 'react';
+import {
+    Alert,
+    Animated,
+    StyleSheet,
+    Text,
+    TouchableOpacity,
+    View,
+} from 'react-native';
 
 interface VoiceMessageBubbleProps {
-  uri: string;
+  uri: string | null; // Allow null for voice messages without URLs
   duration: number;
   isMine: boolean;
   timestamp: string;
   senderName?: string;
+  textPart?: string; // Optional text part for voice messages with text
 }
 
 export default function VoiceMessageBubble({ 
@@ -24,7 +25,8 @@ export default function VoiceMessageBubble({
   duration, 
   isMine, 
   timestamp,
-  senderName 
+  senderName,
+  textPart 
 }: VoiceMessageBubbleProps) {
   const [sound, setSound] = useState<Audio.Sound | null>(null);
   const [isPlaying, setIsPlaying] = useState(false);
@@ -57,11 +59,14 @@ export default function VoiceMessageBubble({
       
       console.log('VoiceMessageBubble - Loading audio with URI:', uri);
       
-      // Validate URI
+      // Check if URI is null or empty (voice message without attachment due to database constraint)
       if (!uri || uri.trim() === '') {
-        throw new Error('Invalid URI: URI is empty or null');
+        console.log('VoiceMessageBubble - No URI available, showing fallback UI');
+        setSound(null);
+        return;
       }
       
+      // Validate URI format
       if (!uri.startsWith('http://') && !uri.startsWith('https://') && !uri.startsWith('file://')) {
         throw new Error(`Invalid URI format: ${uri}`);
       }
@@ -91,7 +96,10 @@ export default function VoiceMessageBubble({
       });
       
       setSound(null);
-      Alert.alert('Error', 'Failed to load audio file.');
+      // Don't show alert for missing URI, just log the error
+      if (uri) {
+        Alert.alert('Error', 'Failed to load audio file.');
+      }
     } finally {
       setIsLoading(false);
     }
@@ -120,6 +128,16 @@ export default function VoiceMessageBubble({
   };
 
   const togglePlayback = async () => {
+    // If no URI, show a message that audio is not available
+    if (!uri) {
+      Alert.alert(
+        'Audio Not Available', 
+        'Voice message audio is temporarily unavailable due to a database constraint issue. The message was sent successfully, but the audio file could not be saved. This will be fixed in the next update.',
+        [{ text: 'OK' }]
+      );
+      return;
+    }
+
     if (!sound) {
       console.log('VoiceMessageBubble - No sound object available, attempting to reload...');
       await loadAudio();
@@ -301,6 +319,16 @@ export default function VoiceMessageBubble({
         </Text>
       )}
 
+      {/* Text part if present */}
+      {textPart && (
+        <Text style={[
+          styles.textPart,
+          { color: isMine ? '#FFFFFF' : (isDark ? '#FFFFFF' : '#1F2937') }
+        ]}>
+          {textPart}
+        </Text>
+      )}
+
       {/* Voice Message Content */}
       <View style={styles.voiceContent}>
         {/* Voice Icon */}
@@ -312,7 +340,7 @@ export default function VoiceMessageBubble({
           />
         </View>
 
-        {/* Play/Pause Button */}
+        {/* Play/Pause Button or Warning Icon */}
         <TouchableOpacity 
           onPress={togglePlayback} 
           style={[
@@ -322,15 +350,22 @@ export default function VoiceMessageBubble({
           disabled={isLoading}
         >
           <MaterialCommunityIcons 
-            name={isLoading ? 'loading' : (isPlaying ? 'pause' : 'play')} 
+            name={!uri ? 'alert-circle' : (isLoading ? 'loading' : (isPlaying ? 'pause' : 'play'))} 
             size={16} 
             color={isMine ? '#FFFFFF' : (isDark ? '#FFFFFF' : '#1F2937')} 
           />
         </TouchableOpacity>
 
-        {/* Waveform */}
+        {/* Waveform or Message */}
         <View style={styles.waveformWrapper}>
-          {renderWaveform()}
+          {uri ? renderWaveform() : (
+            <Text style={[
+              styles.unavailableText,
+              { color: isMine ? '#E0E7FF' : (isDark ? '#9CA3AF' : '#6B7280') }
+            ]}>
+              Voice message ({formatTime(duration)}) - Audio temporarily unavailable
+            </Text>
+          )}
         </View>
 
         {/* Duration */}
@@ -338,7 +373,7 @@ export default function VoiceMessageBubble({
           styles.durationText,
           { color: isMine ? '#E0E7FF' : (isDark ? '#9CA3AF' : '#6B7280') }
         ]}>
-          {formatTime(position)} / {formatTime(duration)}
+          {uri ? `${formatTime(position)} / ${formatTime(duration)}` : formatTime(duration)}
         </Text>
       </View>
 
@@ -428,5 +463,16 @@ const styles = StyleSheet.create({
     fontSize: 10,
     marginTop: 4,
     alignSelf: 'flex-end',
+  },
+  unavailableText: {
+    fontSize: 14,
+    fontStyle: 'italic',
+    textAlign: 'center',
+    flex: 1,
+  },
+  textPart: {
+    fontSize: 16,
+    marginBottom: 8,
+    lineHeight: 20,
   },
 }); 

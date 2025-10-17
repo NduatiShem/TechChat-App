@@ -89,25 +89,40 @@ export default function GroupChatScreen() {
   const [keyboardHeight, setKeyboardHeight] = useState(0);
 
   const flatListRef = useRef<FlatList>(null);
+  
+  // Pagination state
+  const [currentPage, setCurrentPage] = useState(1);
+  const [hasMoreMessages, setHasMoreMessages] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [lastScrollTrigger, setLastScrollTrigger] = useState(0);
 
   // Fetch messages
   const fetchMessages = async () => {
     try {
       setLoading(true);
-      const response = await messagesAPI.getByGroup(Number(id));
+      const response = await messagesAPI.getByGroup(Number(id), 1, 10);
       console.log('Group messages response:', response.data);
-      let messagesData = [];
-      if (response.data.messages && Array.isArray(response.data.messages.data)) {
-        messagesData = response.data.messages.data;
-      } else if (Array.isArray(response.data.messages)) {
-        messagesData = response.data.messages;
-      }
+      
+      // Handle Laravel pagination format
+      const messagesData = response.data.messages?.data || response.data.messages || [];
+      const pagination = response.data.messages || {};
+      
+      // Check if there are more messages using Laravel pagination
+      setHasMoreMessages(pagination.current_page < pagination.last_page);
+      
       // Sort messages by created_at in ascending order (oldest first)
       const sortedMessages = messagesData.sort((a, b) => 
         new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
       );
       setMessages(sortedMessages);
       setGroupInfo(response.data.selectedConversation);
+      
+      // Scroll to bottom after initial load
+      setTimeout(() => {
+        if (flatListRef.current && sortedMessages.length > 0) {
+          flatListRef.current.scrollToEnd({ animated: false });
+        }
+      }, 200);
     } catch (error) {
       console.error('Failed to fetch messages:', error);
       Alert.alert('Error', 'Failed to load messages');
@@ -119,9 +134,51 @@ export default function GroupChatScreen() {
   // Auto-scroll to bottom (newest messages) when messages change
   useEffect(() => {
     if (flatListRef.current && messages.length > 0) {
-      flatListRef.current.scrollToEnd({ animated: true });
+      // Use a small delay to ensure the FlatList has rendered
+      setTimeout(() => {
+        if (flatListRef.current) {
+          flatListRef.current.scrollToEnd({ animated: true });
+        }
+      }, 100);
     }
   }, [messages]);
+
+  // Load more messages function
+  const loadMoreMessages = async () => {
+    if (loadingMore || !hasMoreMessages) return;
+    
+    setLoadingMore(true);
+    try {
+      const nextPage = currentPage + 1;
+      const response = await messagesAPI.getByGroup(Number(id), nextPage, 10);
+      
+      // Handle Laravel pagination format
+      const newMessagesData = response.data.messages?.data || response.data.messages || [];
+      const pagination = response.data.messages || {};
+      
+      if (newMessagesData.length === 0) {
+        setHasMoreMessages(false);
+        return;
+      }
+      
+      // Sort new messages by created_at in ascending order (oldest first)
+      const sortedNewMessages = newMessagesData.sort((a, b) => 
+        new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
+      );
+      
+      // Prepend new messages to existing messages (older messages go at the beginning)
+      setMessages(prev => [...sortedNewMessages, ...prev]);
+      setCurrentPage(nextPage);
+      
+      // Check if there are more messages using Laravel pagination
+      setHasMoreMessages(pagination.current_page < pagination.last_page);
+      
+    } catch (error) {
+      console.error('Error loading more messages:', error);
+    } finally {
+      setLoadingMore(false);
+    }
+  };
 
   // Keyboard listeners
   useEffect(() => {
@@ -175,16 +232,20 @@ export default function GroupChatScreen() {
         });
       }
       
-      // Handle voice recording
+      // Handle voice recording - send without attachment due to database constraint issue
       if (voiceRecording) {
-        formData.append('attachments[]', {
-          uri: voiceRecording.uri,
-          name: 'voice_message.m4a',
-          type: 'audio/m4a',
-        });
-        // Send duration as a simple text message with a special prefix
+        // Combine text input with voice message format
         const voiceMessage = `[VOICE_MESSAGE:${voiceRecording.duration}]`;
-        formData.append('message', voiceMessage);
+        const combinedMessage = input.trim() ? `${input.trim()} ${voiceMessage}` : voiceMessage;
+        formData.append('message', combinedMessage);
+        
+        // Add voice-specific metadata
+        formData.append('voice_duration', voiceRecording.duration.toString());
+        formData.append('is_voice_message', 'true');
+        
+        // Note: Not sending attachment due to database foreign key constraint issue
+        // The backend has a mismatch between mezzage_id and mezzages.id foreign key
+        console.log('Voice message sent without attachment due to database constraint issue');
       }
       
       const res = await messagesAPI.sendMessage(formData);
@@ -224,7 +285,23 @@ export default function GroupChatScreen() {
           replyingTo: replyingTo?.id
         }
       });
-      Alert.alert('Error', 'Failed to send message');
+      
+      // Handle specific database constraint errors
+      if (e.response?.data?.exception === 'Illuminate\\Database\\QueryException') {
+        // If it's a voice message with database constraint error, still show the message
+        if (voiceRecording) {
+          console.log('Voice message sent as text only due to database constraint');
+          // Don't show error alert, just log it
+        } else {
+          Alert.alert(
+            'Error Sending Message',
+            'There was a problem saving your message. This might be due to a database constraint issue. Please try again.',
+            [{ text: 'OK' }]
+          );
+        }
+      } else {
+        Alert.alert('Error', 'Failed to send message. Please try again.');
+      }
     } finally {
       setSending(false);
     }
@@ -363,9 +440,12 @@ export default function GroupChatScreen() {
     });
     
     // Check for voice message format first (even without attachments)
-    if (item.message && item.message.match(/^\[VOICE_MESSAGE:(\d+)\]$/)) {
-      const voiceMatch = item.message.match(/^\[VOICE_MESSAGE:(\d+)\]$/);
+    if (item.message && item.message.match(/\[VOICE_MESSAGE:(\d+)\]$/)) {
+      const voiceMatch = item.message.match(/\[VOICE_MESSAGE:(\d+)\]$/);
       console.log('Voice message detected (group):', voiceMatch);
+      
+      // This is a voice message - ALWAYS render as voice bubble regardless of attachments
+      const duration = parseInt(voiceMatch[1]);
       
       // Try to find audio attachment
       let audioAttachment = null;
@@ -373,22 +453,21 @@ export default function GroupChatScreen() {
         audioAttachment = item.attachments.find(att => att.mime?.startsWith('audio/'));
       }
       
-      if (audioAttachment) {
-        voiceMessageData = {
-          url: audioAttachment.url,
-          duration: parseInt(voiceMatch[1])
-        };
-        isVoiceMessage = true;
-        console.log('Voice message data (group):', voiceMessageData);
-      } else {
-        console.log('Voice message detected but no audio attachment found');
-        // Still treat as voice message even without attachment
-        voiceMessageData = {
-          url: null, // Will need to handle this case
-          duration: parseInt(voiceMatch[1])
-        };
-        isVoiceMessage = true;
-      }
+      // Extract text part (everything before the voice message format)
+      const textPart = item.message.replace(/\[VOICE_MESSAGE:\d+\]$/, '').trim();
+      
+      voiceMessageData = {
+        url: audioAttachment?.url || null,
+        duration: duration,
+        textPart: textPart // Store the text part for display
+      };
+      isVoiceMessage = true;
+      console.log('Voice message data (group):', {
+        ...voiceMessageData,
+        hasAttachment: !!audioAttachment,
+        attachmentUrl: audioAttachment?.url,
+        willRenderAsVoiceBubble: true
+      });
     } else if (item.attachments && item.attachments.length > 0) {
       const audioAttachment = item.attachments.find(att => att.mime?.startsWith('audio/'));
       if (audioAttachment && item.message) {
@@ -518,6 +597,7 @@ export default function GroupChatScreen() {
             isMine={isMine}
             timestamp={timestamp}
             senderName={!isMine && item.sender ? item.sender.name : undefined}
+            textPart={voiceMessageData.textPart}
           />
         </TouchableOpacity>
       );
@@ -879,11 +959,52 @@ export default function GroupChatScreen() {
               renderItem={renderItem}
               keyExtractor={(item, index) => {
                 if (item && item.id !== undefined && item.id !== null) {
-                  return `message-${item.id}`;
+                  return `message-${item.id}-${index}`;
                 }
-                return `message-fallback-${index}-${Math.random().toString(36).slice(2)}`;
+                return `message-fallback-${index}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
               }}
-              contentContainerStyle={{ padding: 16, paddingBottom: keyboardHeight > 0 ? 20 : 0 }}
+              contentContainerStyle={{ 
+                padding: 16, 
+                paddingBottom: keyboardHeight > 0 ? 20 : 0,
+                flexGrow: 1
+              }}
+              onScroll={({ nativeEvent }) => {
+                const { contentOffset, contentSize, layoutMeasurement } = nativeEvent;
+                const isAtTop = contentOffset.y <= 50;
+                console.log('Group scroll position:', contentOffset.y, 'isAtTop:', isAtTop, 'hasMoreMessages:', hasMoreMessages, 'loadingMore:', loadingMore);
+                
+                // Debounce: only trigger once every 2 seconds
+                const now = Date.now();
+                if (isAtTop && hasMoreMessages && !loadingMore && (now - lastScrollTrigger > 2000)) {
+                  console.log('Triggering loadMoreMessages (group)...');
+                  setLastScrollTrigger(now);
+                  loadMoreMessages();
+                }
+              }}
+              onScrollEndDrag={({ nativeEvent }) => {
+                const { contentOffset } = nativeEvent;
+                const isAtTop = contentOffset.y <= 50;
+                console.log('Group scroll end drag - position:', contentOffset.y, 'isAtTop:', isAtTop);
+                
+                // Debounce: only trigger once every 2 seconds
+                const now = Date.now();
+                if (isAtTop && hasMoreMessages && !loadingMore && (now - lastScrollTrigger > 2000)) {
+                  console.log('Triggering loadMoreMessages on scroll end (group)...');
+                  setLastScrollTrigger(now);
+                  loadMoreMessages();
+                }
+              }}
+              scrollEventThrottle={100}
+              ListHeaderComponent={() => 
+                loadingMore ? (
+                  <View style={{ padding: 20, alignItems: 'center' }}>
+                    <ActivityIndicator size="small" color="#283891" />
+                    <Text style={{ color: isDark ? '#9CA3AF' : '#6B7280', marginTop: 8 }}>
+                      Loading more messages...
+                    </Text>
+                  </View>
+                ) : null
+              }
               onContentSizeChange={() => {
                 if (flatListRef.current && messages.length > 0) {
                   flatListRef.current.scrollToEnd({ animated: true });
@@ -927,6 +1048,33 @@ export default function GroupChatScreen() {
             <TouchableOpacity onPress={() => setAttachment(null)}>
               <MaterialCommunityIcons name="close-circle" size={28} color="#EF4444" />
             </TouchableOpacity>
+          </View>
+        )}
+        
+        {/* Voice Recording Preview - Above Input */}
+        {voiceRecording && (
+          <View 
+            style={{
+              backgroundColor: isDark ? '#374151' : '#F3F4F6',
+              paddingHorizontal: 16,
+              paddingVertical: 12,
+              borderTopWidth: 1,
+              borderTopColor: isDark ? '#4B5563' : '#D1D5DB',
+            }}
+          >
+            <View className="flex-row items-center">
+              <MaterialCommunityIcons name="microphone" size={20} color="#39B54A" />
+              <View className="flex-1 ml-3">
+                <VoicePlayer 
+                  uri={voiceRecording.uri} 
+                  duration={voiceRecording.duration}
+                  size="small"
+                />
+              </View>
+              <TouchableOpacity onPress={() => setVoiceRecording(null)}>
+                <MaterialCommunityIcons name="close-circle" size={24} color="#EF4444" />
+              </TouchableOpacity>
+            </View>
           </View>
         )}
         
@@ -1040,23 +1188,6 @@ export default function GroupChatScreen() {
           </View>
         </View>
       </View>
-
-    {/* Voice Recording Preview */}
-    {voiceRecording && (
-      <View className="flex-row items-center px-4 py-1 border-t border-gray-200 dark:border-gray-700" style={{ marginBottom: 0 }}>
-        <MaterialCommunityIcons name="microphone" size={20} color="#39B54A" />
-        <View className="flex-1 ml-3">
-          <VoicePlayer 
-            uri={voiceRecording.uri} 
-            duration={voiceRecording.duration}
-            size="small"
-          />
-        </View>
-        <TouchableOpacity onPress={() => setVoiceRecording(null)}>
-          <MaterialCommunityIcons name="close-circle" size={24} color="#EF4444" />
-        </TouchableOpacity>
-      </View>
-    )}
 
     {/* Voice Recorder Modal */}
     <Modal

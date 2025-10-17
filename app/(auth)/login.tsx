@@ -2,7 +2,7 @@ import { useAuth } from '@/context/AuthContext';
 import { useTheme } from '@/context/ThemeContext';
 import { MaterialCommunityIcons } from '@expo/vector-icons';
 import { router } from 'expo-router';
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   Alert,
   Image,
@@ -21,15 +21,68 @@ export default function LoginScreen() {
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
+  const [emailError, setEmailError] = useState('');
+  const [passwordError, setPasswordError] = useState('');
+  const [showError, setShowError] = useState(false);
+  const [errorMessage, setErrorMessage] = useState('');
+  
+  // Use refs to persist error state across re-renders
+  const emailErrorRef = useRef('');
+  const passwordErrorRef = useRef('');
+  const showErrorRef = useRef(false);
+  const errorMessageRef = useRef('');
+  
+  // Debug: Log component lifecycle
+  console.log('Login component render - email:', email, 'password:', password, 'emailError:', emailError, 'passwordError:', passwordError);
+  
   const { login } = useAuth();
   const { currentTheme } = useTheme();
   const passwordInputRef = useRef<TextInput>(null);
 
   const isDark = currentTheme === 'dark';
 
+  // Debug: Track component lifecycle
+  useEffect(() => {
+    console.log('Login component mounted');
+    return () => {
+      console.log('Login component unmounted');
+    };
+  }, []);
+
+  // Restore error state from refs if component re-renders
+  useEffect(() => {
+    if (passwordErrorRef.current && !passwordError) {
+      console.log('Restoring password error from ref:', passwordErrorRef.current);
+      setPasswordError(passwordErrorRef.current);
+    }
+    if (emailErrorRef.current && !emailError) {
+      console.log('Restoring email error from ref:', emailErrorRef.current);
+      setEmailError(emailErrorRef.current);
+    }
+    if (showErrorRef.current && !showError) {
+      console.log('Restoring show error from ref:', showErrorRef.current);
+      setShowError(showErrorRef.current);
+    }
+    if (errorMessageRef.current && !errorMessage) {
+      console.log('Restoring error message from ref:', errorMessageRef.current);
+      setErrorMessage(errorMessageRef.current);
+    }
+  }, [emailError, passwordError, showError, errorMessage]);
+
   const handleLogin = async () => {
+    // Clear previous errors
+    setEmailError('');
+    setPasswordError('');
+    setShowError(false);
+    setErrorMessage('');
+    emailErrorRef.current = '';
+    passwordErrorRef.current = '';
+    showErrorRef.current = false;
+    errorMessageRef.current = '';
+    
     if (!email || !password) {
-      Alert.alert('Error', 'Please fill in all fields');
+      if (!email) setEmailError('Email is required');
+      if (!password) setPasswordError('Password is required');
       return;
     }
 
@@ -57,7 +110,18 @@ export default function LoginScreen() {
       
       await login(email, password);
       console.log('Login successful!');
-      router.replace('/');
+      // Wait for auth state to update, then navigate
+      setTimeout(() => {
+        // Try to dismiss any existing navigation stack first
+        try {
+          router.dismissAll();
+          router.replace('/');
+        } catch (error) {
+          console.log('Navigation error, trying alternative:', error);
+          // Alternative approach
+          router.push('/');
+        }
+      }, 300);
     } catch (error: any) {
       console.error('Login error details:', {
         message: error.message,
@@ -66,24 +130,41 @@ export default function LoginScreen() {
         config: error.config
       });
       
-      let errorMessage = 'An error occurred during login';
+      // Handle different error types with field-specific validation
+      console.log('Error handling - Status:', error.response?.status, 'Message:', error.response?.data?.message);
       
-      if (error.message === 'Network Error') {
-        errorMessage = 'Cannot connect to server. Please check:\n\n1. Laravel server is running\n2. Server is accessible from your device\n3. Run: php artisan serve --host=0.0.0.0 --port=8000';
-      } else if (error.response?.data?.message) {
-        errorMessage = error.response.data.message;
+      if (error.response?.status === 401) {
+        // Unauthorized - could be wrong email or password
+        const errorMessage = error.response?.data?.message || 'Invalid credentials';
+        console.log('401 Error - Message:', errorMessage);
+        
+        // For 401 errors, show persistent error message
+        console.log('Before setting error - current state:', { email, password, emailError, passwordError });
+        const errorMsg = 'Wrong credentials. Please check your email and password.';
+        setShowError(true);
+        setErrorMessage(errorMsg);
+        showErrorRef.current = true;
+        errorMessageRef.current = errorMsg;
+        setPassword(''); // Clear password for retry
+        console.log('After setting error - should show persistent error message');
       } else if (error.response?.data?.errors) {
         // Handle Laravel validation errors
         const errors = error.response.data.errors;
-        const errorText = Object.keys(errors).map(key => 
-          `${key}: ${errors[key].join(', ')}`
-        ).join('\n');
-        errorMessage = errorText;
-      } else if (error.message) {
-        errorMessage = error.message;
+        if (errors.email) {
+          setEmailError(errors.email[0]);
+        }
+        if (errors.password) {
+          setPasswordError(errors.password[0]);
+        }
+      } else if (error.message === 'Network Error') {
+        Alert.alert(
+          'Network Error', 
+          'Cannot connect to server. Please check:\n\n1. Laravel server is running\n2. Server is accessible from your device\n3. Run: php artisan serve --host=0.0.0.0 --port=8000'
+        );
+      } else {
+        // Generic error - show alert for unexpected errors
+        Alert.alert('Login Failed', error.message || 'An unexpected error occurred');
       }
-      
-      Alert.alert('Login Failed', errorMessage);
     } finally {
       setIsLoading(false);
     }
@@ -134,14 +215,23 @@ export default function LoginScreen() {
             >
               Sign in to your account to continue
             </Text>
-            <View className="mt-2 px-4 py-2 bg-secondary/10 rounded-lg">
-              <Text className="text-secondary text-sm font-medium text-center">
-                Welcome to TechChat
-              </Text>
-            </View>
-          </View>
+                <View className="mt-2 px-4 py-2 bg-secondary/10 rounded-lg">
+                  <Text className="text-secondary text-sm font-medium text-center">
+                    Welcome to TechChat
+                  </Text>
+                </View>
+              </View>
 
-          {/* Form */}
+              {/* Persistent Error Message */}
+              {showError && (
+                <View className="mb-4 px-4 py-3 bg-red-50 border border-red-200 rounded-lg">
+                  <Text className="text-red-600 text-sm text-center font-medium">
+                    {errorMessage}
+                  </Text>
+                </View>
+              )}
+
+              {/* Form */}
           <View className="space-y-6">
             <View>
               <Text
@@ -153,23 +243,48 @@ export default function LoginScreen() {
               </Text>
               <TextInput
                 value={email}
-                onChangeText={setEmail}
+                onChangeText={(text) => {
+                  setEmail(text);
+                  // Don't clear error immediately - let user see the error
+                }}
                 placeholder="Enter your email"
                 placeholderTextColor={isDark ? '#9CA3AF' : '#6B7280'}
                 keyboardType="email-address"
                 autoCapitalize="none"
                 returnKeyType="next"
+                onFocus={() => {
+                  if (emailError) {
+                    setEmailError(''); // Clear error when user focuses on email
+                    emailErrorRef.current = '';
+                  }
+                  if (showError) {
+                    setShowError(false); // Clear persistent error when user focuses
+                    showErrorRef.current = false;
+                    setErrorMessage('');
+                    errorMessageRef.current = '';
+                  }
+                }}
                 onSubmitEditing={() => {
                   // Focus on password field when email is submitted
                   passwordInputRef.current?.focus();
                 }}
                 className={`w-full px-4 py-4 rounded-xl border-2 ${
-                  isDark
+                  emailError
+                    ? 'border-red-500 bg-red-50'
+                    : isDark
                     ? 'bg-gray-800 border-gray-600 text-white focus:border-primary'
                     : 'bg-gray-50 border-gray-300 text-gray-900 focus:border-primary'
                 }`}
-                style={{ fontSize: 16 }}
+                style={{ 
+                  fontSize: 16,
+                  color: emailError ? '#DC2626' : (isDark ? '#FFFFFF' : '#111827')
+                }}
               />
+              {emailError ? (
+                <Text className="text-red-500 text-sm mt-2 ml-1">
+                  {emailError}
+                </Text>
+              ) : null}
             </View>
 
             <View>
@@ -184,18 +299,38 @@ export default function LoginScreen() {
                 <TextInput
                   ref={passwordInputRef}
                   value={password}
-                  onChangeText={setPassword}
+                  onChangeText={(text) => {
+                    setPassword(text);
+                    // Don't clear error immediately - let user see the error
+                  }}
                   placeholder="Enter your password"
                   placeholderTextColor={isDark ? '#9CA3AF' : '#6B7280'}
                   secureTextEntry={!showPassword}
                   returnKeyType="done"
+                  onFocus={() => {
+                    if (passwordError) {
+                      setPasswordError(''); // Clear error when user focuses on password
+                      passwordErrorRef.current = '';
+                    }
+                    if (showError) {
+                      setShowError(false); // Clear persistent error when user focuses
+                      showErrorRef.current = false;
+                      setErrorMessage('');
+                      errorMessageRef.current = '';
+                    }
+                  }}
                   onSubmitEditing={handleLogin}
                   className={`w-full px-4 py-4 pr-12 rounded-xl border-2 ${
-                    isDark
+                    passwordError
+                      ? 'border-red-500 bg-red-50'
+                      : isDark
                       ? 'bg-gray-800 border-gray-600 text-white focus:border-primary'
                       : 'bg-gray-50 border-gray-300 text-gray-900 focus:border-primary'
                   }`}
-                  style={{ fontSize: 16 }}
+                  style={{ 
+                    fontSize: 16,
+                    color: passwordError ? '#DC2626' : (isDark ? '#FFFFFF' : '#111827')
+                  }}
                 />
                 <TouchableOpacity
                   onPress={() => setShowPassword(!showPassword)}
@@ -204,10 +339,15 @@ export default function LoginScreen() {
                   <MaterialCommunityIcons
                     name={showPassword ? 'eye-off' : 'eye'}
                     size={24}
-                    color={isDark ? '#9CA3AF' : '#6B7280'}
+                    color={passwordError ? '#DC2626' : (isDark ? '#9CA3AF' : '#6B7280')}
                   />
                 </TouchableOpacity>
               </View>
+              {passwordError ? (
+                <Text className="text-red-500 text-sm mt-2 ml-1">
+                  {passwordError}
+                </Text>
+              ) : null}
             </View>
 
             <TouchableOpacity

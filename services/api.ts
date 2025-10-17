@@ -183,7 +183,7 @@ export const authAPI = {
   
   refreshToken: () => api.post('/auth/refresh'),
   
-  getProfile: () => api.get('/user/profile'),
+  getProfile: () => api.get('/users/me'),
   
   updateProfile: (data: any) => api.put('/user/profile', data),
   
@@ -215,9 +215,11 @@ export const messagesAPI = {
   getConversationMessages: (conversationId: number, type: 'individual' | 'group') => 
     api.get(`/conversations/${conversationId}?type=${type}`),
   
-  getByUser: (userId: number) => api.get(`/messages/user/${userId}`),
+  getByUser: (userId: number, page: number = 1, perPage: number = 10) => 
+    api.get(`/messages/user/${userId}?page=${page}&per_page=${perPage}`),
   
-  getByGroup: (groupId: number) => api.get(`/messages/group/${groupId}`),
+  getByGroup: (groupId: number, page: number = 1, perPage: number = 10) => 
+    api.get(`/messages/group/${groupId}?page=${page}&per_page=${perPage}`),
   
   sendMessage: (data: FormData | {
     message?: string;
@@ -261,6 +263,8 @@ export const usersAPI = {
   getOnlineUsers: () => api.get('/users/online'),
   
   updateLastSeen: () => api.post('/users/last-seen'),
+  
+  me: () => api.get('/users/me'),
 };
 
 // Groups API
