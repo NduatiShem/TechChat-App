@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "663757122947",
+    "project_id": "techchat-52c59",
+    "storage_bucket": "techchat-52c59.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:663757122947:android:1f923e41986150c8dbdab6",
+        "android_client_info": {
+          "package_name": "com.techchat.messageapp"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyC85WGkdVkbOicbyi_ROzuA-ZDKPGXLQdk"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

@@ -1,0 +1,71 @@
+{
+  "expo": {
+    "name": "TechChat",
+    "slug": "techchat",
+    "version": "1.0.0",
+    "sdkVersion": "54.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/ic_launcher/ios/AppIcon.appiconset/ItunesArtwork@2x.png",
+    "userInterfaceStyle": "automatic",
+    "splash": {
+      "image": "./assets/splash_screens/icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#283891"
+    },
+    "assetBundlePatterns": [
+      "**/*"
+    ],
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.techchat.app",
+      "infoPlist": {
+        "UIBackgroundModes": [
+          "remote-notification"
+        ]
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/ic_launcher/android/mipmap-xxxhdpi/ic_launcher_foreground.png",
+        "backgroundColor": "#283891"
+      },
+      "package": "com.techchat.app",
+      "permissions": [
+        "RECEIVE_BOOT_COMPLETED",
+        "VIBRATE",
+        "WAKE_LOCK"
+      ]
+    },
+    "web": {
+      "favicon": "./assets/icons/Icon-48.png"
+    },
+    "plugins": [
+      "expo-router",
+      "expo-dev-client",
+      [
+        "expo-notifications",
+        {
+          "icon": "./assets/ic_launcher/ios/AppIcon.appiconset/ItunesArtwork@2x.png",
+          "color": "#283891"
+        }
+      ]
+    ],
+    "notification": {
+      "icon": "./assets/ic_launcher/ios/AppIcon.appiconset/ItunesArtwork@2x.png",
+      "color": "#283891",
+      "iosDisplayInForeground": true,
+      "androidMode": "default",
+      "androidCollapsedTitle": "TechChat",
+      "androidChannelId": "techchat-messages",
+      "androidChannelName": "Messages",
+      "androidChannelDescription": "New messages and notifications from TechChat"
+    },
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "da2b4840-030b-49e4-b16d-21748aec572c"
+      }
+    },
+    "owner": "shemnduati"
+  }
+}
