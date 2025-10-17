@@ -8,14 +8,16 @@ import { useAuth } from '@/context/AuthContext';
 import { useTheme } from '@/context/ThemeContext';
 import { messagesAPI } from '@/services/api';
 import { MaterialCommunityIcons, MaterialIcons } from '@expo/vector-icons';
+import { useFocusEffect } from '@react-navigation/native';
 import { Picker } from 'emoji-mart-native';
 import * as DocumentPicker from 'expo-document-picker';
 import * as ImagePicker from 'expo-image-picker';
 import { router, useLocalSearchParams } from 'expo-router';
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
     ActivityIndicator,
     Alert,
+    BackHandler,
     FlatList,
     Image,
     Keyboard,
@@ -201,6 +203,21 @@ export default function GroupChatScreen() {
       setKeyboardHeight(0);
     };
   }, []);
+
+  // Handle mobile hardware back button
+  useFocusEffect(
+    useCallback(() => {
+      const onBackPress = () => {
+        // Clear navigation stack and go to groups tab
+        router.dismissAll();
+        router.push('/groups');
+        return true; // Prevent default back behavior
+      };
+
+      const subscription = BackHandler.addEventListener('hardwareBackPress', onBackPress);
+      return () => subscription.remove();
+    }, [])
+  );
 
   // Send message
   const handleSend = async () => {
@@ -842,7 +859,11 @@ export default function GroupChatScreen() {
       <View style={{ zIndex: 10 }} className={`border-b ${isDark ? 'bg-gray-800 border-gray-700' : 'bg-white border-gray-200'}`}>
         {/* Main Header */}
         <View className="flex-row items-center p-4 pt-12">
-          <TouchableOpacity onPress={() => router.back()} className="mr-3">
+          <TouchableOpacity onPress={() => {
+            // Clear navigation stack and go to groups tab
+            router.dismissAll();
+            router.push('/groups');
+          }} className="mr-3">
             <MaterialCommunityIcons name="arrow-left" size={24} color={isDark ? '#fff' : '#000'} />
           </TouchableOpacity>
           

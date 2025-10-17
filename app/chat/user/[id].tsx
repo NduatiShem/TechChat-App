@@ -8,12 +8,13 @@ import { useAuth } from '@/context/AuthContext';
 import { useTheme } from '@/context/ThemeContext';
 import { messagesAPI } from '@/services/api';
 import { MaterialCommunityIcons, MaterialIcons } from '@expo/vector-icons';
+import { useFocusEffect } from '@react-navigation/native';
 import { Picker } from 'emoji-mart-native';
 import * as DocumentPicker from 'expo-document-picker';
 import * as ImagePicker from 'expo-image-picker';
 import { router, useLocalSearchParams } from 'expo-router';
-import { useEffect, useRef, useState } from 'react';
-import { ActivityIndicator, Alert, FlatList, Image, Keyboard, Modal, StatusBar, Text, TextInput, TouchableOpacity, View } from 'react-native';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { ActivityIndicator, Alert, BackHandler, FlatList, Image, Keyboard, Modal, StatusBar, Text, TextInput, TouchableOpacity, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 export const options = ({ params }) => ({
@@ -184,6 +185,21 @@ export default function UserChatScreen() {
       }, 100);
     }
   }, [messages]);
+
+  // Handle mobile hardware back button
+  useFocusEffect(
+    useCallback(() => {
+      const onBackPress = () => {
+        // Clear navigation stack and go to messages tab
+        router.dismissAll();
+        router.push('/');
+        return true; // Prevent default back behavior
+      };
+
+      const subscription = BackHandler.addEventListener('hardwareBackPress', onBackPress);
+      return () => subscription.remove();
+    }, [])
+  );
 
   // Load more messages function
   const loadMoreMessages = async () => {
@@ -814,7 +830,11 @@ export default function UserChatScreen() {
       {/* Header */}
       <View className={`flex-row items-center p-4 pt-12 border-b ${isDark ? 'bg-gray-800 border-gray-700' : 'bg-white border-gray-200'}`}>
         {/* User Avatar and Info with Back Button */}
-        <TouchableOpacity onPress={() => router.back()} className="flex-1 flex-row items-center">
+        <TouchableOpacity onPress={() => {
+          // Clear navigation stack and go to messages tab
+          router.dismissAll();
+          router.push('/');
+        }} className="flex-1 flex-row items-center">
           <MaterialCommunityIcons name="arrow-left" size={24} color={isDark ? '#fff' : '#000'} className="mr-3" />
           
           {/* User Avatar with Online Status */}
