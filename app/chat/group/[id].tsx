@@ -136,7 +136,7 @@ export default function GroupChatScreen() {
   // Auto-scroll to bottom (newest messages) when messages change
   useEffect(() => {
     if (flatListRef.current && messages.length > 0) {
-      // Use a small delay to ensure the FlatList has rendered
+      // Simple scroll to bottom
       setTimeout(() => {
         if (flatListRef.current) {
           flatListRef.current.scrollToEnd({ animated: true });
@@ -144,6 +144,18 @@ export default function GroupChatScreen() {
       }, 100);
     }
   }, [messages]);
+
+  // Force scroll to bottom when component first loads
+  useEffect(() => {
+    if (flatListRef.current && messages.length > 0 && !loading) {
+      // Simple scroll to bottom when loading completes
+      setTimeout(() => {
+        if (flatListRef.current) {
+          flatListRef.current.scrollToEnd({ animated: false });
+        }
+      }, 200);
+    }
+  }, [loading, messages.length]);
 
   // Load more messages function
   const loadMoreMessages = async () => {
@@ -989,6 +1001,7 @@ export default function GroupChatScreen() {
                 paddingBottom: keyboardHeight > 0 ? 20 : 0,
                 flexGrow: 1
               }}
+              inverted={false} // Make sure it's not inverted
               onScroll={({ nativeEvent }) => {
                 const { contentOffset, contentSize, layoutMeasurement } = nativeEvent;
                 const isAtTop = contentOffset.y <= 50;
