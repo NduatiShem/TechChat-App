@@ -711,8 +711,8 @@ export default function GroupChatScreen() {
               borderTopLeftRadius: isMine ? 18 : 4,
               borderTopRightRadius: isMine ? 4 : 18,
               padding: 12,
-              maxWidth: '90%', // Increased max width to prevent unnecessary wrapping
-              minWidth: 60,
+              maxWidth: isMine ? '85%' : '75%', // Wider for sent messages to use more space
+              minWidth: 120, // Increased minimum width for short messages
               alignSelf: isMine ? 'flex-end' : 'flex-start', // This ensures proper alignment
               shadowColor: '#000',
               shadowOffset: { width: 0, height: 1 },
@@ -876,20 +876,39 @@ export default function GroupChatScreen() {
             )
           )}
           
-          {item.message && !isVoiceMessage && (
-            <Text 
-              style={{ 
-                color: isMine ? '#fff' : (isDark ? '#fff' : '#111827'),
-                fontSize: 16,
-                lineHeight: 20,
-                textAlign: 'left',
-                flexWrap: 'wrap',
-              }}
-            >
-              {item.message}
-            </Text>
-          )}
-          <Text style={{ fontSize: 10, color: isMine ? '#E0E7FF' : '#6B7280', marginTop: 2, alignSelf: 'flex-end' }}>{timestamp}</Text>
+          {/* Message content and timestamp in a flex container */}
+          <View style={{ width: '100%' }}>
+            {item.message && !isVoiceMessage && (
+              <Text 
+                style={{ 
+                  color: isMine ? '#fff' : (isDark ? '#fff' : '#111827'),
+                  fontSize: 16,
+                  lineHeight: 20,
+                  textAlign: 'left',
+                  flexWrap: 'wrap',
+                  flexShrink: 0, // Don't shrink text unnecessarily
+                  flexGrow: 1,   // Allow text to grow
+                  width: 'auto', // Allow text to take its natural width
+                  marginRight: 40, // Make room for timestamp
+                  wordBreak: 'break-word', // Prevent words from breaking unnecessarily
+                }}
+              >
+                {item.message}
+              </Text>
+            )}
+            
+            {/* Timestamp positioned absolutely */}
+            <Text style={{ 
+              fontSize: 10, 
+              color: isMine ? '#E0E7FF' : '#6B7280',
+              position: 'absolute',
+              bottom: 0,
+              right: 0,
+              paddingLeft: 4,
+              paddingBottom: 0,
+              backgroundColor: 'transparent',
+            }}>{timestamp}</Text>
+          </View>
         </View>
         </TouchableOpacity>
         
