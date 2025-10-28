@@ -745,13 +745,14 @@ export default function UserChatScreen() {
                 style={{ 
                   flexDirection: 'row', 
                   alignItems: 'center', 
-                  marginBottom: 6,
-                  backgroundColor: isMine ? '#2A2A2A' : '#374151',
-                  borderRadius: 8,
-                  padding: 12,
+                  backgroundColor: isMine ? '#25D366' : (isDark ? '#374151' : '#E5E7EB'),
+                  borderRadius: 12,
+                  padding: 8,
+                  paddingVertical: 8,
                   borderWidth: 0,
+                  width: 'auto',
                   maxWidth: 280,
-                  minHeight: 60,
+                  minHeight: 0,
                   shadowColor: '#000',
                   shadowOffset: { width: 0, height: 1 },
                   shadowOpacity: 0.2,
@@ -773,50 +774,80 @@ export default function UserChatScreen() {
                   ]);
                 }}
               >
-                {/* File icon */}
+                {/* File icon - using document icon with file extension */}
                 <View style={{ 
-                  backgroundColor: '#007AFF', 
-                  borderRadius: 4, 
-                  padding: 8, 
-                  marginRight: 12,
-                  width: 40,
-                  height: 40,
+                  backgroundColor: '#2B5DF5', 
+                  borderRadius: 6, 
+                  padding: 0,
+                  marginRight: 10,
+                  width: 32,
+                  height: 32,
                   justifyContent: 'center',
-                  alignItems: 'center'
+                  alignItems: 'center',
+                  overflow: 'hidden'
                 }}>
+                  <Text style={{
+                    color: 'white',
+                    fontSize: 8,
+                    fontWeight: 'bold',
+                    position: 'absolute',
+                    bottom: 1
+                  }}>
+                    {(item.attachments[0].name || 'file').split('.').pop()?.toUpperCase() || 'FILE'}
+                  </Text>
                   <MaterialCommunityIcons 
-                    name="file-document" 
-                    size={20} 
-                    color="#fff" 
+                    name="file-document-outline" 
+                    size={18} 
+                    color="#fff"
+                    style={{ marginBottom: 6 }}
                   />
                 </View>
                 
-                {/* File information */}
+                {/* File information (improved layout) */}
                 <View style={{ flex: 1, justifyContent: 'center' }}>
                   <Text style={{ 
-                    color: '#fff',
-                    fontSize: 15,
-                    fontWeight: '500',
+                    color: isMine ? '#fff' : (isDark ? '#fff' : '#111827'),
+                    fontSize: 14,
+                    fontWeight: '600',
                     marginBottom: 2,
                     numberOfLines: 1,
-                    ellipsizeMode: 'tail'
+                    ellipsizeMode: 'middle'
                   }}>
                     {item.attachments[0].name}
                   </Text>
                   <Text style={{ 
-                    color: '#9CA3AF',
-                    fontSize: 12
+                    color: isMine ? '#E0E7FF' : '#6B7280',
+                    fontSize: 11
                   }}>
-                    {item.attachments[0].size ? `${(item.attachments[0].size / 1024).toFixed(0)} kB` : 'Unknown size'} • {(item.attachments[0].name || 'file').split('.').pop()?.toUpperCase() || 'FILE'}
+                    {item.attachments[0].size ? `${(item.attachments[0].size / 1024).toFixed(0)} kB` : 'Unknown size'} • {item.attachments[0].pages ? `${item.attachments[0].pages} pages` : ''}
                   </Text>
                 </View>
                 
-                {/* Download arrow */}
-                <MaterialCommunityIcons 
-                  name="download" 
-                  size={20} 
-                  color="#9CA3AF" 
-                />
+                {/* Download button - styled as a circle */}
+                <View style={{
+                  backgroundColor: isMine ? 'rgba(255,255,255,0.2)' : 'rgba(0,0,0,0.1)',
+                  width: 28,
+                  height: 28,
+                  borderRadius: 14,
+                  justifyContent: 'center',
+                  alignItems: 'center',
+                  marginLeft: 6
+                }}>
+                  <MaterialCommunityIcons 
+                    name="download" 
+                    size={16} 
+                    color={isMine ? '#fff' : '#6B7280'} 
+                  />
+                </View>
+                
+                {/* Timestamp inside file bubble */}
+                <Text style={{ 
+                  fontSize: 10, 
+                  color: isMine ? '#E0E7FF' : '#6B7280',
+                  position: 'absolute',
+                  bottom: 4,
+                  right: 8,
+                }}>{timestamp}</Text>
               </TouchableOpacity>
             )
           )}
