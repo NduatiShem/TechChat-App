@@ -1,4 +1,6 @@
+import { AppConfig } from '@/config/app.config';
 import { useTheme } from '@/context/ThemeContext';
+import { Device } from 'expo-device';
 import React, { useState } from 'react';
 import { Alert, Platform, Text, TouchableOpacity, View } from 'react-native';
 
@@ -10,10 +12,19 @@ export default function NetworkTest() {
   const testNetworkConnection = async () => {
     setIsLoading(true);
     
-    // Use different URLs based on platform
-    const testUrl = Platform.OS === 'ios' 
-      ? 'http://127.0.0.1:8000/api/test'  // iOS Simulator
-      : 'http://192.168.100.25:8000/api/test';  // Physical devices (Android/iOS)
+    // Use different URLs based on device type
+    let testUrl;
+    if (Device && Device.isDevice) {
+      // Physical device - use the physical IP
+      testUrl = AppConfig.api.development.physical.replace('/api', '/api/test');
+    } else {
+      // Simulator/Emulator - use platform-specific URLs
+      if (Platform.OS === 'ios') {
+        testUrl = AppConfig.api.development.ios.replace('/api', '/api/test');
+      } else {
+        testUrl = AppConfig.api.development.android.replace('/api', '/api/test');
+      }
+    }
     
     try {
       // Test basic connectivity
@@ -45,8 +56,8 @@ export default function NetworkTest() {
     
     // Use different URLs based on platform
     const loginUrl = Platform.OS === 'ios' 
-      ? 'http://127.0.0.1:8000/api/auth/login'  // iOS Simulator
-      : 'http://192.168.100.25:8000/api/auth/login';  // Physical devices (Android/iOS)
+      ? AppConfig.api.development.ios.replace('/api', '/api/auth/login')  // iOS Simulator
+      : AppConfig.api.development.physical.replace('/api', '/api/auth/login');  // Physical devices (Android/iOS)
     
     try {
       const response = await fetch(loginUrl, {
@@ -84,7 +95,7 @@ export default function NetworkTest() {
       </Text>
       
       <Text className={`text-sm mb-4 ${isDark ? 'text-gray-300' : 'text-gray-600'}`}>
-        Testing connection to: {Platform.OS === 'ios' ? 'http://127.0.0.1:8000/api' : 'http://192.168.100.25:8000/api'}
+        Testing connection to: {Platform.OS === 'ios' ? AppConfig.api.development.ios : AppConfig.api.development.physical}
       </Text>
       
       <TouchableOpacity

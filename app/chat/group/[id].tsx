@@ -4,6 +4,7 @@ import UserAvatar from '@/components/UserAvatar';
 import VoiceMessageBubble from '@/components/VoiceMessageBubble';
 import VoicePlayer from '@/components/VoicePlayer';
 import VoiceRecorder from '@/components/VoiceRecorder';
+import { AppConfig } from '@/config/app.config';
 import { useAuth } from '@/context/AuthContext';
 import { useTheme } from '@/context/ThemeContext';
 import { messagesAPI } from '@/services/api';
@@ -22,6 +23,7 @@ import {
     Image,
     Keyboard,
     Modal,
+    Platform,
     StatusBar,
     Text,
     TextInput,
@@ -67,6 +69,22 @@ interface Attachment {
   isImage?: boolean;
 }
 
+// Helper function to get base URL without /api suffix
+const getBaseUrl = () => {
+  if (__DEV__) {
+    // For Android devices (both physical and emulator in Expo Go), use the physical device URL
+    // This is because Expo Go on physical devices needs your computer's network IP
+    if (Platform.OS === 'android') {
+      return AppConfig.api.development.physical.replace('/api', '');
+    } else if (Platform.OS === 'ios') {
+      return AppConfig.api.development.ios.replace('/api', '');
+    } else {
+      return AppConfig.api.development.physical.replace('/api', '');
+    }
+  }
+  return AppConfig.api.production.replace('/api', '');
+};
+
 export default function GroupChatScreen() {
   const { id } = useLocalSearchParams();
   const { currentTheme } = useTheme();
@@ -87,6 +105,7 @@ export default function GroupChatScreen() {
   const [showVoiceRecorder, setShowVoiceRecorder] = useState(false);
   const [voiceRecording, setVoiceRecording] = useState<{ uri: string; duration: number } | null>(null);
   const [replyingTo, setReplyingTo] = useState<any>(null);
+  const [showImagePreview, setShowImagePreview] = useState<string | null>(null);
   const [showMessageOptions, setShowMessageOptions] = useState<number | null>(null);
   const [keyboardHeight, setKeyboardHeight] = useState(0);
 
@@ -103,8 +122,6 @@ export default function GroupChatScreen() {
     try {
       setLoading(true);
       const response = await messagesAPI.getByGroup(Number(id), 1, 10);
-      console.log('Group messages response:', response.data);
-      
       // Handle Laravel pagination format
       const messagesData = response.data.messages?.data || response.data.messages || [];
       const pagination = response.data.messages || {};
@@ -261,29 +278,29 @@ export default function GroupChatScreen() {
         });
       }
       
-      // Handle voice recording - send without attachment due to database constraint issue
+      // Handle voice recording - attach file + keep marker text
       if (voiceRecording) {
-        // Combine text input with voice message format
         const voiceMessage = `[VOICE_MESSAGE:${voiceRecording.duration}]`;
         const combinedMessage = input.trim() ? `${input.trim()} ${voiceMessage}` : voiceMessage;
         formData.append('message', combinedMessage);
-        
-        // Add voice-specific metadata
+
+        // Important: send as attachments[] so Laravel sees an array
+        formData.append('attachments[]', {
+          uri: voiceRecording.uri,
+          name: 'voice_message.m4a',
+          type: 'audio/m4a',
+        } as any);
+
+        // Optional metadata
         formData.append('voice_duration', voiceRecording.duration.toString());
         formData.append('is_voice_message', 'true');
-        
-        // Note: Not sending attachment due to database foreign key constraint issue
-        // The backend has a mismatch between mezzage_id and mezzages.id foreign key
-        console.log('Voice message sent without attachment due to database constraint issue');
       }
       
       const res = await messagesAPI.sendMessage(formData);
-      console.log('Sent message response:', res.data);
       setMessages(prev => {
         // Check if message already exists to prevent duplicates
         const messageExists = prev.some(msg => msg.id === res.data.id);
         if (messageExists) {
-          console.log('Message already exists, not adding duplicate');
           return prev;
         }
         return [...prev, res.data];
@@ -319,7 +336,6 @@ export default function GroupChatScreen() {
       if (e.response?.data?.exception === 'Illuminate\\Database\\QueryException') {
         // If it's a voice message with database constraint error, still show the message
         if (voiceRecording) {
-          console.log('Voice message sent as text only due to database constraint');
           // Don't show error alert, just log it
         } else {
           Alert.alert(
@@ -345,10 +361,12 @@ export default function GroupChatScreen() {
     });
     if (!result.canceled && result.assets && result.assets.length > 0) {
       const asset = result.assets[0];
+      const guessedName = asset.fileName || `photo_${Date.now()}.jpg`;
+      const guessedMime = (asset as any).mimeType || 'image/jpeg';
       setAttachment({
         uri: asset.uri,
-        name: asset.fileName || 'photo.jpg',
-        type: asset.type || 'image/jpeg',
+        name: guessedName,
+        type: guessedMime,
         isImage: true,
       });
     }
@@ -356,18 +374,37 @@ export default function GroupChatScreen() {
 
   // Pick any file
   const pickFile = async () => {
-    const result = await DocumentPicker.getDocumentAsync({
-      copyToCacheDirectory: true,
-      multiple: false,
-      type: '*/*',
-    });
-    if (result.type === 'success') {
-      setAttachment({
-        uri: result.uri,
-        name: result.name,
-        type: result.mimeType || 'application/octet-stream',
-        isImage: result.mimeType?.startsWith('image/'),
+    try {
+      const result: any = await DocumentPicker.getDocumentAsync({
+        copyToCacheDirectory: true,
+        multiple: false,
+        type: '*/*',
       });
+      
+      if (result?.type === 'success') {
+        const mime = result.mimeType || 'application/octet-stream';
+        setAttachment({
+          uri: result.uri,
+          name: result.name || `file_${Date.now()}`,
+          type: mime,
+          isImage: mime.startsWith('image/'),
+        });
+        return;
+      }
+
+      if (result?.canceled === false && Array.isArray(result.assets) && result.assets.length > 0) {
+        const asset = result.assets[0];
+        const mime = asset.mimeType || asset.type || 'application/octet-stream';
+        setAttachment({
+          uri: asset.uri,
+          name: asset.name || asset.fileName || `file_${Date.now()}`,
+          type: mime,
+          isImage: mime.startsWith('image/'),
+        });
+        return;
+      }
+    } catch (e) {
+      console.error('group pickFile error:', e);
     }
   };
 
@@ -460,18 +497,9 @@ export default function GroupChatScreen() {
     let isVoiceMessage = false;
     let messageText = null;
     
-    // Debug: Log the message structure
-    console.log('Message structure (group):', {
-      id: item.id,
-      message: item.message,
-      attachments: item.attachments,
-      hasAttachments: !!(item.attachments && item.attachments.length > 0)
-    });
-    
     // Check for voice message format first (even without attachments)
     if (item.message && item.message.match(/\[VOICE_MESSAGE:(\d+)\]$/)) {
       const voiceMatch = item.message.match(/\[VOICE_MESSAGE:(\d+)\]$/);
-      console.log('Voice message detected (group):', voiceMatch);
       
       // This is a voice message - ALWAYS render as voice bubble regardless of attachments
       const duration = parseInt(voiceMatch[1]);
@@ -485,29 +513,28 @@ export default function GroupChatScreen() {
       // Extract text part (everything before the voice message format)
       const textPart = item.message.replace(/\[VOICE_MESSAGE:\d+\]$/, '').trim();
       
+      // Construct full URL for audio attachment
+      let audioUrl = null;
+      if (audioAttachment?.url) {
+        if (audioAttachment.url.startsWith('http')) {
+          audioUrl = audioAttachment.url;
+        } else {
+          const cleanUrl = audioAttachment.url.startsWith('/') ? audioAttachment.url.substring(1) : audioAttachment.url;
+          audioUrl = `${getBaseUrl()}/${cleanUrl}`;
+        }
+      }
+      
       voiceMessageData = {
-        url: audioAttachment?.url || null,
+        url: audioUrl,
         duration: duration,
         textPart: textPart // Store the text part for display
       };
       isVoiceMessage = true;
-      console.log('Voice message data (group):', {
-        ...voiceMessageData,
-        hasAttachment: !!audioAttachment,
-        attachmentUrl: audioAttachment?.url,
-        willRenderAsVoiceBubble: true
-      });
     } else if (item.attachments && item.attachments.length > 0) {
       const audioAttachment = item.attachments.find(att => att.mime?.startsWith('audio/'));
       if (audioAttachment && item.message) {
         // Check for voice message format: [VOICE_MESSAGE:duration]
         const voiceMatch = item.message.match(/^\[VOICE_MESSAGE:(\d+)\]$/);
-        console.log('Voice message check (group):', {
-          message: item.message,
-          hasAudioAttachment: !!audioAttachment,
-          voiceMatch: voiceMatch,
-          isVoiceMessage: !!voiceMatch
-        });
         if (voiceMatch) {
           voiceMessageData = {
             url: audioAttachment.url,
@@ -523,11 +550,9 @@ export default function GroupChatScreen() {
 
     // If it's a voice message, render the dedicated voice bubble
     if (isVoiceMessage && voiceMessageData) {
-      console.log('Rendering voice message bubble (group):', voiceMessageData);
       
       // If no URL is available, show a placeholder or fallback
       if (!voiceMessageData.url) {
-        console.log('No URL available for voice message, showing fallback');
         return (
           <View>
             {/* Date Separator */}
@@ -720,12 +745,134 @@ export default function GroupChatScreen() {
 
           {item.attachments && item.attachments.length > 0 && (
             item.attachments[0].mime?.startsWith('image/') ? (
-              <Image source={{ uri: item.attachments[0].url }} style={{ width: 180, height: 180, borderRadius: 12, marginBottom: 6 }} />
+              <TouchableOpacity 
+                onPress={() => {
+                  // Try multiple possible URL fields and construct full URL
+                  let imageUrl = item.attachments[0].url || 
+                                item.attachments[0].path || 
+                                item.attachments[0].uri;
+                  
+                  // If URL is relative, make it absolute
+                  if (imageUrl && !imageUrl.startsWith('http')) {
+                    const cleanUrl = imageUrl.startsWith('/') ? imageUrl.substring(1) : imageUrl;
+                    imageUrl = `${getBaseUrl()}/${cleanUrl}`;
+                  }
+                  
+                  if (imageUrl) {
+                    setShowImagePreview(imageUrl);
+                  }
+                }}
+                style={{ marginBottom: 6 }}
+              >
+                <Image 
+                  source={{ 
+                    uri: (() => {
+                      let url = item.attachments[0].url || item.attachments[0].path || item.attachments[0].uri;
+                      
+                      if (url && !url.startsWith('http')) {
+                        // Remove leading slash if present and construct full URL
+                        const cleanUrl = url.startsWith('/') ? url.substring(1) : url;
+                        const fullUrl = `${getBaseUrl()}/${cleanUrl}`;
+                        return fullUrl;
+                      }
+                      return url;
+                    })()
+                  }} 
+                  style={{ 
+                    width: 200, 
+                    height: 200, 
+                    borderRadius: 12,
+                    backgroundColor: isDark ? '#374151' : '#F3F4F6',
+                    alignSelf: 'flex-start', // Prevent overflow
+                    maxWidth: '100%',         // Ensure it doesn't overflow
+                  }}
+                  resizeMode="cover"
+                  onError={(error) => {
+                    // Silent fail for image loading
+                  }}
+                  onLoad={() => {
+                    // Image loaded successfully
+                  }}
+                />
+              </TouchableOpacity>
             ) : (
-              <View style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 6 }}>
-                <MaterialCommunityIcons name="file" size={28} color="#283891" />
-                <Text style={{ marginLeft: 6, color: isMine ? '#fff' : (isDark ? '#fff' : '#111827') }}>{item.attachments[0].name || 'File'}</Text>
-              </View>
+              <TouchableOpacity 
+                style={{ 
+                  flexDirection: 'row', 
+                  alignItems: 'center', 
+                  marginBottom: 6,
+                  backgroundColor: isMine ? '#2A2A2A' : '#374151',
+                  borderRadius: 8,
+                  padding: 12,
+                  borderWidth: 0,
+                  maxWidth: 280,
+                  minHeight: 60,
+                  shadowColor: '#000',
+                  shadowOffset: { width: 0, height: 1 },
+                  shadowOpacity: 0.2,
+                  shadowRadius: 2,
+                  elevation: 2,
+                }}
+                onPress={async () => {
+                  const fileUrl = item.attachments[0].url || item.attachments[0].path || item.attachments[0].uri;
+                  let downloadUrl = fileUrl;
+                  if (fileUrl && !fileUrl.startsWith('http')) {
+                    const cleanUrl = fileUrl.startsWith('/') ? fileUrl.substring(1) : fileUrl;
+                    downloadUrl = `${getBaseUrl()}/${cleanUrl}`;
+                  }
+                  
+                  const fileName = item.attachments[0].name || 'download';
+                  
+                  Alert.alert('File Download', `File: ${fileName}\nURL: ${downloadUrl}`, [
+                    { text: 'OK', style: 'default' }
+                  ]);
+                }}
+              >
+                {/* File icon */}
+                <View style={{ 
+                  backgroundColor: '#007AFF', 
+                  borderRadius: 4, 
+                  padding: 8, 
+                  marginRight: 12,
+                  width: 40,
+                  height: 40,
+                  justifyContent: 'center',
+                  alignItems: 'center'
+                }}>
+                  <MaterialCommunityIcons 
+                    name="file-document" 
+                    size={20} 
+                    color="#fff" 
+                  />
+                </View>
+                
+                {/* File information */}
+                <View style={{ flex: 1, justifyContent: 'center' }}>
+                  <Text style={{ 
+                    color: '#fff',
+                    fontSize: 15,
+                    fontWeight: '500',
+                    marginBottom: 2,
+                    numberOfLines: 1,
+                    ellipsizeMode: 'tail'
+                  }}>
+                    {item.attachments[0].name}
+                  </Text>
+                  <Text style={{ 
+                    color: '#9CA3AF',
+                    fontSize: 12
+                  }}>
+                    {item.attachments[0].size ? `${(item.attachments[0].size / 1024).toFixed(0)} kB` : 'Unknown size'} • {(item.attachments[0].name || 'file').split('.').pop()?.toUpperCase() || 'FILE'}
+                  </Text>
+                </View>
+                
+                {/* Download arrow */}
+                <MaterialCommunityIcons 
+                  name="download" 
+                  size={20} 
+                  color="#9CA3AF" 
+                />
+              </TouchableOpacity>
             )
           )}
           
@@ -735,7 +882,8 @@ export default function GroupChatScreen() {
                 color: isMine ? '#fff' : (isDark ? '#fff' : '#111827'),
                 fontSize: 16,
                 lineHeight: 20,
-                flexShrink: 1,
+                textAlign: 'left',
+                flexWrap: 'wrap',
               }}
             >
               {item.message}
@@ -812,37 +960,83 @@ export default function GroupChatScreen() {
 
   // Format message date for separators
   const formatMessageDate = (dateString: string) => {
-    const messageDate = new Date(dateString);
-    const today = new Date();
-    const yesterday = new Date(today);
-    yesterday.setDate(yesterday.getDate() - 1);
-    
-    // Reset time to compare only dates
-    const messageDateOnly = new Date(messageDate.getFullYear(), messageDate.getMonth(), messageDate.getDate());
-    const todayOnly = new Date(today.getFullYear(), today.getMonth(), today.getDate());
-    const yesterdayOnly = new Date(yesterday.getFullYear(), yesterday.getMonth(), yesterday.getDate());
-    
-    if (messageDateOnly.getTime() === todayOnly.getTime()) {
+    try {
+      // Handle invalid or empty date strings
+      if (!dateString || dateString === 'Invalid Date' || dateString === 'null' || dateString === 'undefined') {
+        return 'Today';
+      }
+      
+      const messageDate = new Date(dateString);
+      
+      // Check if the date is valid
+      if (isNaN(messageDate.getTime())) {
+        console.warn('Invalid date string:', dateString);
+        return 'Today';
+      }
+      
+      const today = new Date();
+      const yesterday = new Date(today);
+      yesterday.setDate(yesterday.getDate() - 1);
+      
+      // Reset time to compare only dates
+      const messageDateOnly = new Date(messageDate.getFullYear(), messageDate.getMonth(), messageDate.getDate());
+      const todayOnly = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+      const yesterdayOnly = new Date(yesterday.getFullYear(), yesterday.getMonth(), yesterday.getDate());
+      
+      if (messageDateOnly.getTime() === todayOnly.getTime()) {
+        return 'Today';
+      } else if (messageDateOnly.getTime() === yesterdayOnly.getTime()) {
+        return 'Yesterday';
+      } else {
+        return messageDate.toLocaleDateString('en-US', { 
+          weekday: 'long', 
+          year: 'numeric', 
+          month: 'long', 
+          day: 'numeric' 
+        });
+      }
+    } catch (error) {
+      console.error('Error formatting message date:', error, 'Date string:', dateString);
       return 'Today';
-    } else if (messageDateOnly.getTime() === yesterdayOnly.getTime()) {
-      return 'Yesterday';
-    } else {
-      return messageDate.toLocaleDateString('en-US', { 
-        weekday: 'long', 
-        year: 'numeric', 
-        month: 'long', 
-        day: 'numeric' 
-      });
     }
   };
 
   const formatMessageTime = (dateString: string) => {
-    const date = new Date(dateString);
-    return date.toLocaleTimeString('en-US', { 
-      hour: '2-digit', 
-      minute: '2-digit',
-      hour12: false 
-    });
+    try {
+      // Handle invalid or empty date strings
+      if (!dateString || dateString === 'Invalid Date' || dateString === 'null' || dateString === 'undefined') {
+        return new Date().toLocaleTimeString('en-US', { 
+          hour: '2-digit', 
+          minute: '2-digit',
+          hour12: false 
+        });
+      }
+      
+      const date = new Date(dateString);
+      
+      // Check if the date is valid
+      if (isNaN(date.getTime())) {
+        console.warn('Invalid time string:', dateString);
+        return new Date().toLocaleTimeString('en-US', { 
+          hour: '2-digit', 
+          minute: '2-digit',
+          hour12: false 
+        });
+      }
+      
+      return date.toLocaleTimeString('en-US', { 
+        hour: '2-digit', 
+        minute: '2-digit',
+        hour12: false 
+      });
+    } catch (error) {
+      console.error('Error formatting message time:', error, 'Date string:', dateString);
+      return new Date().toLocaleTimeString('en-US', { 
+        hour: '2-digit', 
+        minute: '2-digit',
+        hour12: false 
+      });
+    }
   };
 
   const shouldShowDateSeparator = (currentMessage: any, previousMessage: any) => {
@@ -1005,12 +1199,10 @@ export default function GroupChatScreen() {
               onScroll={({ nativeEvent }) => {
                 const { contentOffset, contentSize, layoutMeasurement } = nativeEvent;
                 const isAtTop = contentOffset.y <= 50;
-                console.log('Group scroll position:', contentOffset.y, 'isAtTop:', isAtTop, 'hasMoreMessages:', hasMoreMessages, 'loadingMore:', loadingMore);
                 
                 // Debounce: only trigger once every 2 seconds
                 const now = Date.now();
                 if (isAtTop && hasMoreMessages && !loadingMore && (now - lastScrollTrigger > 2000)) {
-                  console.log('Triggering loadMoreMessages (group)...');
                   setLastScrollTrigger(now);
                   loadMoreMessages();
                 }
@@ -1018,12 +1210,10 @@ export default function GroupChatScreen() {
               onScrollEndDrag={({ nativeEvent }) => {
                 const { contentOffset } = nativeEvent;
                 const isAtTop = contentOffset.y <= 50;
-                console.log('Group scroll end drag - position:', contentOffset.y, 'isAtTop:', isAtTop);
                 
                 // Debounce: only trigger once every 2 seconds
                 const now = Date.now();
                 if (isAtTop && hasMoreMessages && !loadingMore && (now - lastScrollTrigger > 2000)) {
-                  console.log('Triggering loadMoreMessages on scroll end (group)...');
                   setLastScrollTrigger(now);
                   loadMoreMessages();
                 }
@@ -1173,6 +1363,21 @@ export default function GroupChatScreen() {
               blurOnSubmit={false}
             />
 
+            {/* Gallery Button (WhatsApp-style) */}
+            <TouchableOpacity 
+              onPress={pickImage} 
+              style={{ 
+                width: 42,
+                height: 42,
+                borderRadius: 21,
+                alignItems: 'center',
+                justifyContent: 'center',
+                marginRight: 4,
+              }}
+            >
+              <MaterialCommunityIcons name="image" size={24} color="#6B7280" />
+            </TouchableOpacity>
+
             {/* Attachment Button */}
             <TouchableOpacity 
               onPress={pickFile} 
@@ -1250,6 +1455,45 @@ export default function GroupChatScreen() {
             maxDuration={60}
           />
         </View>
+      </View>
+    </Modal>
+
+    {/* Image Preview Modal */}
+    <Modal
+      visible={!!showImagePreview}
+      transparent
+      animationType="fade"
+      onRequestClose={() => setShowImagePreview(null)}
+    >
+      <View style={{
+        flex: 1,
+        backgroundColor: 'rgba(0, 0, 0, 0.9)',
+        justifyContent: 'center',
+        alignItems: 'center',
+      }}>
+        <TouchableOpacity 
+          style={{
+            position: 'absolute',
+            top: 50,
+            right: 20,
+            zIndex: 1,
+          }}
+          onPress={() => setShowImagePreview(null)}
+        >
+          <MaterialCommunityIcons name="close" size={30} color="#fff" />
+        </TouchableOpacity>
+        
+        <Image 
+          source={{ uri: showImagePreview || '' }}
+          style={{
+            width: '90%',
+            height: '80%',
+            resizeMode: 'contain',
+          }}
+          onError={(error) => {
+            // Silent fail for image preview loading
+          }}
+        />
       </View>
     </Modal>
   </View>

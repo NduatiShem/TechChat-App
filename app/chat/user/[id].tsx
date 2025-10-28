@@ -4,6 +4,7 @@ import UserAvatar from '@/components/UserAvatar';
 import VoiceMessageBubble from '@/components/VoiceMessageBubble';
 import VoicePlayer from '@/components/VoicePlayer';
 import VoiceRecorder from '@/components/VoiceRecorder';
+import { AppConfig } from '@/config/app.config';
 import { useAuth } from '@/context/AuthContext';
 import { useTheme } from '@/context/ThemeContext';
 import { messagesAPI } from '@/services/api';
@@ -14,12 +15,28 @@ import * as DocumentPicker from 'expo-document-picker';
 import * as ImagePicker from 'expo-image-picker';
 import { router, useLocalSearchParams } from 'expo-router';
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { ActivityIndicator, Alert, BackHandler, FlatList, Image, Keyboard, Modal, StatusBar, Text, TextInput, TouchableOpacity, View } from 'react-native';
+import { ActivityIndicator, Alert, BackHandler, FlatList, Image, Keyboard, Modal, Platform, StatusBar, Text, TextInput, TouchableOpacity, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 export const options = ({ params }) => ({
   headerShown: false, // Hide the default header, use custom header instead
 });
+
+// Helper function to get base URL without /api suffix
+const getBaseUrl = () => {
+  if (__DEV__) {
+    // For Android devices (both physical and emulator in Expo Go), use the physical device URL
+    // This is because Expo Go on physical devices needs your computer's network IP
+    if (Platform.OS === 'android') {
+      return AppConfig.api.development.physical.replace('/api', '');
+    } else if (Platform.OS === 'ios') {
+      return AppConfig.api.development.ios.replace('/api', '');
+    } else {
+      return AppConfig.api.development.physical.replace('/api', '');
+    }
+  }
+  return AppConfig.api.production.replace('/api', '');
+};
 
 export default function UserChatScreen() {
   const { id } = useLocalSearchParams();
@@ -27,8 +44,6 @@ export default function UserChatScreen() {
   const { user, isAuthenticated, isLoading } = useAuth();
   const insets = useSafeAreaInsets();
   
-  // Debug: Log the received ID
-  console.log('UserChatScreen received ID:', id, 'Type:', typeof id);
   // Remove the navigation effect - let the AppLayout handle authentication state changes
   const isDark = currentTheme === 'dark';
   const [messages, setMessages] = useState([]);
@@ -42,6 +57,7 @@ export default function UserChatScreen() {
   const [showVoiceRecorder, setShowVoiceRecorder] = useState(false);
   const [voiceRecording, setVoiceRecording] = useState<{ uri: string; duration: number } | null>(null);
   const [replyingTo, setReplyingTo] = useState<any>(null);
+  const [showImagePreview, setShowImagePreview] = useState<string | null>(null);
   const [showMessageOptions, setShowMessageOptions] = useState<number | null>(null);
   const [keyboardHeight, setKeyboardHeight] = useState(0);
   const flatListRef = useRef(null);
@@ -54,9 +70,7 @@ export default function UserChatScreen() {
 
   // Debug: Log when userInfo changes
   useEffect(() => {
-    console.log('UserInfo state changed:', userInfo);
-    console.log('UserInfo name:', userInfo?.name);
-    console.log('UserInfo id:', userInfo?.id);
+    // UserInfo state changed
   }, [userInfo]);
 
   // Fetch messages and user info
@@ -66,20 +80,17 @@ export default function UserChatScreen() {
       setLoading(true);
       try {
         const res = await messagesAPI.getByUser(id, 1, 10);
-        console.log('Full API response:', res);
-        console.log('API response data:', res.data);
-        console.log('Messages from API:', res.data.messages);
-        console.log('Selected conversation from API:', res.data.selectedConversation);
         
         // Handle Laravel pagination format
         const messagesData = res.data.messages?.data || res.data.messages || [];
         const pagination = res.data.messages || {};
         
-        console.log('Initial pagination data:', pagination);
-        console.log('Messages count:', messagesData.length);
-        console.log('Current page:', pagination.current_page);
-        console.log('Last page:', pagination.last_page);
-        console.log('Has more messages:', pagination.current_page < pagination.last_page);
+        // Debug each message's attachments
+        messagesData.forEach((message, index) => {
+          if (message.attachments && message.attachments.length > 0) {
+            // Message has attachments
+          }
+        });
         
         // Check if there are more messages using Laravel pagination
         // Try multiple possible pagination formats
@@ -88,23 +99,14 @@ export default function UserChatScreen() {
                        (pagination.current_page && pagination.last_page && pagination.current_page < pagination.last_page) ||
                        (messagesData.length >= 10); // Fallback: if we got 10 messages, assume there might be more
         
-        console.log('Final hasMore calculation:', hasMore);
         setHasMoreMessages(hasMore);
         
         // Sort messages by created_at in ascending order (oldest first)
         const sortedMessages = messagesData.sort((a, b) => 
           new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
         );
-        console.log('Setting messages:', sortedMessages.length, 'messages');
-        console.log('Message IDs:', sortedMessages.map(m => m.id));
         setMessages(sortedMessages);
         setUserInfo(res.data.selectedConversation);
-        
-        // Debug: Log the user info received
-        console.log('User info received:', res.data.selectedConversation);
-        console.log('User ID from API:', res.data.selectedConversation?.id);
-        console.log('User name from API:', res.data.selectedConversation?.name);
-        console.log('User info state after setting:', userInfo);
         
         // Scroll to bottom after initial load
         setTimeout(() => {
@@ -133,7 +135,6 @@ export default function UserChatScreen() {
       }
       return `message-fallback-${index}`;
     });
-    console.log('Message keys:', keys);
     // Check for duplicate keys
     const keySet = new Set();
     const duplicateKeys = keys.filter(key => {
@@ -215,24 +216,18 @@ export default function UserChatScreen() {
 
   // Load more messages function
   const loadMoreMessages = async () => {
-    console.log('loadMoreMessages called - loadingMore:', loadingMore, 'hasMoreMessages:', hasMoreMessages);
     if (loadingMore || !hasMoreMessages) return;
     
     setLoadingMore(true);
     try {
       const nextPage = currentPage + 1;
-      console.log('Loading page:', nextPage);
       const res = await messagesAPI.getByUser(id, nextPage, 10);
       
       // Handle Laravel pagination format
       const newMessages = res.data.messages?.data || res.data.messages || [];
       const pagination = res.data.messages || {};
       
-      console.log('Pagination data:', pagination);
-      console.log('New messages count:', newMessages.length);
-      
       if (newMessages.length === 0) {
-        console.log('No more messages, setting hasMoreMessages to false');
         setHasMoreMessages(false);
         return;
       }
@@ -243,12 +238,8 @@ export default function UserChatScreen() {
       );
       
       // Prepend new messages to existing messages (older messages go at the beginning)
-      console.log('Adding new messages:', sortedNewMessages.length, 'messages');
-      console.log('New message IDs:', sortedNewMessages.map(m => m.id));
       setMessages(prev => {
         const combined = [...sortedNewMessages, ...prev];
-        console.log('Combined messages:', combined.length, 'total');
-        console.log('Combined message IDs:', combined.map(m => m.id));
         return combined;
       });
       setCurrentPage(nextPage);
@@ -271,8 +262,6 @@ export default function UserChatScreen() {
                      (pagination.current_page && pagination.last_page && pagination.current_page < pagination.last_page) ||
                      (newMessages.length >= 10); // Fallback: if we got 10 messages, assume there might be more
       
-      console.log('LoadMore pagination data:', pagination);
-      console.log('LoadMore has more messages:', hasMore);
       setHasMoreMessages(hasMore);
       
     } catch (error) {
@@ -312,24 +301,26 @@ export default function UserChatScreen() {
         } as any);
       }
       
-      // Handle voice recording - send without attachment due to database constraint issue
+      // Handle voice recording - attach file + keep marker text
       if (voiceRecording) {
-        // Combine text input with voice message format
         const voiceMessage = `[VOICE_MESSAGE:${voiceRecording.duration}]`;
         const combinedMessage = input.trim() ? `${input.trim()} ${voiceMessage}` : voiceMessage;
         formData.append('message', combinedMessage);
-        
-        // Add voice-specific metadata
+
+        // Important: send as attachments[] so Laravel sees an array
+        // Use a stable filename and correct MIME
+        formData.append('attachments[]', {
+          uri: voiceRecording.uri,
+          name: 'voice_message.m4a',
+          type: 'audio/m4a',
+        } as any);
+
+        // Optional metadata (controller will ignore unknown fields)
         formData.append('voice_duration', voiceRecording.duration.toString());
         formData.append('is_voice_message', 'true');
-        
-        // Note: Not sending attachment due to database foreign key constraint issue
-        // The backend has a mismatch between mezzage_id and mezzages.id foreign key
-        console.log('Voice message sent without attachment due to database constraint issue');
       }
       
       const res = await messagesAPI.sendMessage(formData);
-      console.log('Sent message response:', res.data);
       
       // Create a temporary message object with proper structure
       const newMessage = {
@@ -363,10 +354,8 @@ export default function UserChatScreen() {
         // Check if message already exists to prevent duplicates
         const messageExists = prev.some(msg => msg.id === newMessage.id);
         if (messageExists) {
-          console.log('Message already exists, not adding duplicate');
           return prev;
         }
-        console.log('Adding new message to state:', newMessage);
         return [...prev, newMessage];
       });
       setInput('');
@@ -400,7 +389,6 @@ export default function UserChatScreen() {
       if (e.response?.data?.exception === 'Illuminate\\Database\\QueryException') {
         // If it's a voice message with database constraint error, still show the message
         if (voiceRecording) {
-          console.log('Voice message sent as text only due to database constraint');
           // Don't show error alert, just log it
         } else {
           Alert.alert(
@@ -426,10 +414,13 @@ export default function UserChatScreen() {
     });
     if (!result.canceled && result.assets && result.assets.length > 0) {
       const asset = result.assets[0];
+      // Normalize filename and mime type for upload compatibility
+      const guessedName = asset.fileName || `photo_${Date.now()}.jpg`;
+      const guessedMime = (asset as any).mimeType || 'image/jpeg';
       setAttachment({
         uri: asset.uri,
-        name: asset.fileName || 'photo.jpg',
-        type: asset.type || 'image/jpeg',
+        name: guessedName,
+        type: guessedMime,
         isImage: true,
       });
     }
@@ -437,18 +428,38 @@ export default function UserChatScreen() {
 
   // Pick any file
   const pickFile = async () => {
-    const result = await DocumentPicker.getDocumentAsync({
-      copyToCacheDirectory: true,
-      multiple: false,
-      type: '*/*',
-    });
-    if (result.type === 'success') {
-      setAttachment({
-        uri: result.uri,
-        name: result.name,
-        type: result.mimeType || 'application/octet-stream',
-        isImage: result.mimeType?.startsWith('image/'),
+    try {
+      const result: any = await DocumentPicker.getDocumentAsync({
+        copyToCacheDirectory: true,
+        multiple: false,
+        type: '*/*',
       });
+      
+      // Support both legacy { type: 'success' } and newer { canceled, assets } shapes
+      if (result?.type === 'success') {
+        const mime = result.mimeType || 'application/octet-stream';
+        setAttachment({
+          uri: result.uri,
+          name: result.name || `file_${Date.now()}`,
+          type: mime,
+          isImage: mime.startsWith('image/'),
+        });
+        return;
+      }
+
+      if (result?.canceled === false && Array.isArray(result.assets) && result.assets.length > 0) {
+        const asset = result.assets[0];
+        const mime = asset.mimeType || asset.type || 'application/octet-stream';
+        setAttachment({
+          uri: asset.uri,
+          name: asset.name || asset.fileName || `file_${Date.now()}`,
+          type: mime,
+          isImage: mime.startsWith('image/'),
+        });
+        return;
+      }
+    } catch (e) {
+      console.error('pickFile error:', e);
     }
   };
 
@@ -549,20 +560,23 @@ export default function UserChatScreen() {
       // Extract text part (everything before the voice message format)
       const textPart = item.message.replace(/\[VOICE_MESSAGE:\d+\]$/, '').trim();
       
+      // Construct full URL for audio attachment
+      let audioUrl = null;
+      if (audioAttachment?.url) {
+        if (audioAttachment.url.startsWith('http')) {
+          audioUrl = audioAttachment.url;
+        } else {
+          const cleanUrl = audioAttachment.url.startsWith('/') ? audioAttachment.url.substring(1) : audioAttachment.url;
+          audioUrl = `${getBaseUrl()}/${cleanUrl}`;
+        }
+      }
+      
       voiceMessageData = {
-        url: audioAttachment?.url || null,
+        url: audioUrl,
         duration: duration,
         textPart: textPart // Store the text part for display
       };
       isVoiceMessage = true;
-      console.log('Voice message detected:', {
-        message: item.message,
-        textPart: textPart,
-        duration: duration,
-        hasAttachment: !!audioAttachment,
-        attachmentUrl: audioAttachment?.url,
-        willRenderAsVoiceBubble: true
-      });
     } else if (item.attachments && item.attachments.length > 0) {
       // Check for audio attachment in regular messages (only if NOT a voice message)
       const audioAttachment = item.attachments.find(att => att.mime?.startsWith('audio/'));
@@ -576,7 +590,6 @@ export default function UserChatScreen() {
 
     // If it's a voice message, render the dedicated voice bubble
     if (isVoiceMessage && voiceMessageData) {
-      console.log('Rendering voice message with data:', voiceMessageData);
       return (
         <TouchableOpacity
           onLongPress={() => handleMessageLongPress(item)}
@@ -667,12 +680,134 @@ export default function UserChatScreen() {
           
           {item.attachments && item.attachments.length > 0 && (
             item.attachments[0].mime?.startsWith('image/') ? (
-              <Image source={{ uri: item.attachments[0].url }} style={{ width: 180, height: 180, borderRadius: 12, marginBottom: 6 }} />
+              <TouchableOpacity 
+                onPress={() => {
+                  // Try multiple possible URL fields and construct full URL
+                  let imageUrl = item.attachments[0].url || 
+                                item.attachments[0].path || 
+                                item.attachments[0].uri;
+                  
+                  // If URL is relative, make it absolute
+                  if (imageUrl && !imageUrl.startsWith('http')) {
+                    const cleanUrl = imageUrl.startsWith('/') ? imageUrl.substring(1) : imageUrl;
+                    imageUrl = `${getBaseUrl()}/${cleanUrl}`;
+                  }
+                  
+                  if (imageUrl) {
+                    setShowImagePreview(imageUrl);
+                  }
+                }}
+                style={{ marginBottom: 6 }}
+              >
+                <Image 
+                  source={{ 
+                    uri: (() => {
+                      let url = item.attachments[0].url || item.attachments[0].path || item.attachments[0].uri;
+                      
+                      if (url && !url.startsWith('http')) {
+                        // Remove leading slash if present and construct full URL
+                        const cleanUrl = url.startsWith('/') ? url.substring(1) : url;
+                        const fullUrl = `${getBaseUrl()}/${cleanUrl}`;
+                        return fullUrl;
+                      }
+                      return url;
+                    })()
+                  }} 
+                  style={{ 
+                    width: 200, 
+                    height: 200, 
+                    borderRadius: 12,
+                    backgroundColor: isDark ? '#374151' : '#F3F4F6',
+                    alignSelf: 'flex-start', // Prevent overflow
+                    maxWidth: '100%',         // Ensure it doesn't overflow
+                  }}
+                  resizeMode="cover"
+                  onError={(error) => {
+                    // Silent fail for image loading
+                  }}
+                  onLoad={() => {
+                    // Image loaded successfully
+                  }}
+                />
+              </TouchableOpacity>
             ) : (
-              <View style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 6 }}>
-                <MaterialCommunityIcons name="file" size={28} color="#283891" />
-                <Text style={{ marginLeft: 6, color: isMine ? '#fff' : (isDark ? '#fff' : '#111827') }}>{item.attachments[0].name || 'File'}</Text>
-              </View>
+              <TouchableOpacity 
+                style={{ 
+                  flexDirection: 'row', 
+                  alignItems: 'center', 
+                  marginBottom: 6,
+                  backgroundColor: isMine ? '#2A2A2A' : '#374151',
+                  borderRadius: 8,
+                  padding: 12,
+                  borderWidth: 0,
+                  maxWidth: 280,
+                  minHeight: 60,
+                  shadowColor: '#000',
+                  shadowOffset: { width: 0, height: 1 },
+                  shadowOpacity: 0.2,
+                  shadowRadius: 2,
+                  elevation: 2,
+                }}
+                onPress={async () => {
+                  const fileUrl = item.attachments[0].url || item.attachments[0].path || item.attachments[0].uri;
+                  let downloadUrl = fileUrl;
+                  if (fileUrl && !fileUrl.startsWith('http')) {
+                    const cleanUrl = fileUrl.startsWith('/') ? fileUrl.substring(1) : fileUrl;
+                    downloadUrl = `${getBaseUrl()}/${cleanUrl}`;
+                  }
+                  
+                  const fileName = item.attachments[0].name || 'download';
+                  
+                  Alert.alert('File Download', `File: ${fileName}\nURL: ${downloadUrl}`, [
+                    { text: 'OK', style: 'default' }
+                  ]);
+                }}
+              >
+                {/* File icon */}
+                <View style={{ 
+                  backgroundColor: '#007AFF', 
+                  borderRadius: 4, 
+                  padding: 8, 
+                  marginRight: 12,
+                  width: 40,
+                  height: 40,
+                  justifyContent: 'center',
+                  alignItems: 'center'
+                }}>
+                  <MaterialCommunityIcons 
+                    name="file-document" 
+                    size={20} 
+                    color="#fff" 
+                  />
+                </View>
+                
+                {/* File information */}
+                <View style={{ flex: 1, justifyContent: 'center' }}>
+                  <Text style={{ 
+                    color: '#fff',
+                    fontSize: 15,
+                    fontWeight: '500',
+                    marginBottom: 2,
+                    numberOfLines: 1,
+                    ellipsizeMode: 'tail'
+                  }}>
+                    {item.attachments[0].name}
+                  </Text>
+                  <Text style={{ 
+                    color: '#9CA3AF',
+                    fontSize: 12
+                  }}>
+                    {item.attachments[0].size ? `${(item.attachments[0].size / 1024).toFixed(0)} kB` : 'Unknown size'} • {(item.attachments[0].name || 'file').split('.').pop()?.toUpperCase() || 'FILE'}
+                  </Text>
+                </View>
+                
+                {/* Download arrow */}
+                <MaterialCommunityIcons 
+                  name="download" 
+                  size={20} 
+                  color="#9CA3AF" 
+                />
+              </TouchableOpacity>
             )
           )}
           
@@ -682,7 +817,7 @@ export default function UserChatScreen() {
                 color: isMine ? '#fff' : (isDark ? '#fff' : '#111827'),
                 fontSize: 16,
                 lineHeight: 20,
-                flexShrink: 1,
+                textAlign: 'left',
               }}
             >
               {item.message}
@@ -928,12 +1063,10 @@ export default function UserChatScreen() {
                 const { contentOffset, contentSize, layoutMeasurement } = nativeEvent;
                 // Use a threshold instead of exactly 0, as FlatList might not reach exactly 0
                 const isAtTop = contentOffset.y <= 50; // Within 50 pixels of the top
-                console.log('Scroll position:', contentOffset.y, 'isAtTop:', isAtTop, 'hasMoreMessages:', hasMoreMessages, 'loadingMore:', loadingMore);
                 
                 // Debounce: only trigger once every 2 seconds
                 const now = Date.now();
                 if (isAtTop && hasMoreMessages && !loadingMore && (now - lastScrollTrigger > 2000)) {
-                  console.log('Triggering loadMoreMessages...');
                   setLastScrollTrigger(now);
                   loadMoreMessages();
                 }
@@ -941,12 +1074,10 @@ export default function UserChatScreen() {
               onScrollEndDrag={({ nativeEvent }) => {
                 const { contentOffset } = nativeEvent;
                 const isAtTop = contentOffset.y <= 50;
-                console.log('Scroll end drag - position:', contentOffset.y, 'isAtTop:', isAtTop);
                 
                 // Debounce: only trigger once every 2 seconds
                 const now = Date.now();
                 if (isAtTop && hasMoreMessages && !loadingMore && (now - lastScrollTrigger > 2000)) {
-                  console.log('Triggering loadMoreMessages on scroll end...');
                   setLastScrollTrigger(now);
                   loadMoreMessages();
                 }
@@ -1115,6 +1246,21 @@ export default function UserChatScreen() {
               blurOnSubmit={false}
             />
 
+            {/* Gallery Button (WhatsApp-style) */}
+            <TouchableOpacity 
+              onPress={pickImage} 
+              style={{ 
+                width: 42, 
+                height: 42, 
+                borderRadius: 21, 
+                alignItems: 'center', 
+                justifyContent: 'center',
+                marginRight: 4,
+              }}
+            >
+              <MaterialCommunityIcons name="image" size={24} color="#6B7280" />
+            </TouchableOpacity>
+
             {/* Attachment Button */}
             <TouchableOpacity 
               onPress={pickFile} 
@@ -1192,6 +1338,45 @@ export default function UserChatScreen() {
               maxDuration={60}
             />
           </View>
+        </View>
+      </Modal>
+
+      {/* Image Preview Modal */}
+      <Modal
+        visible={!!showImagePreview}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setShowImagePreview(null)}
+      >
+        <View style={{
+          flex: 1,
+          backgroundColor: 'rgba(0, 0, 0, 0.9)',
+          justifyContent: 'center',
+          alignItems: 'center',
+        }}>
+          <TouchableOpacity 
+            style={{
+              position: 'absolute',
+              top: 50,
+              right: 20,
+              zIndex: 1,
+            }}
+            onPress={() => setShowImagePreview(null)}
+          >
+            <MaterialCommunityIcons name="close" size={30} color="#fff" />
+          </TouchableOpacity>
+          
+          <Image 
+            source={{ uri: showImagePreview || '' }}
+            style={{
+              width: '90%',
+              height: '80%',
+              resizeMode: 'contain',
+            }}
+            onError={(error) => {
+              // Silent fail for image preview loading
+            }}
+          />
         </View>
       </Modal>
     </View>

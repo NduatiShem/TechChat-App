@@ -6,14 +6,63 @@ interface LastMessagePreviewProps {
   message: string;
   isDark?: boolean;
   maxLength?: number;
+  attachments?: Array<{
+    id: number;
+    name: string;
+    mime: string;
+    url: string;
+  }>;
 }
 
 export default function LastMessagePreview({ 
   message, 
   isDark = false, 
-  maxLength = 50 
+  maxLength = 50,
+  attachments = []
 }: LastMessagePreviewProps) {
-  //console.log('LastMessagePreview render:', { message, isDark, maxLength });
+  
+  // Check if there are attachments
+  if (attachments && attachments.length > 0) {
+    const firstAttachment = attachments[0];
+    
+    // Check if it's an image
+    if (firstAttachment.mime?.startsWith('image/')) {
+      return (
+        <View style={styles.container}>
+          <MaterialCommunityIcons 
+            name="image" 
+            size={16} 
+            color={isDark ? '#39B54A' : '#6B7280'} 
+          />
+          <Text style={[
+            styles.attachmentText,
+            { color: isDark ? '#39B54A' : '#6B7280' }
+          ]}>
+            Photo
+          </Text>
+        </View>
+      );
+    }
+    
+    // Check if it's a file (not image)
+    const fileName = firstAttachment.name || 'File';
+    
+    return (
+      <View style={styles.container}>
+        <MaterialCommunityIcons 
+          name="file-document" 
+          size={16} 
+          color={isDark ? '#39B54A' : '#6B7280'} 
+        />
+        <Text style={[
+          styles.attachmentText,
+          { color: isDark ? '#39B54A' : '#6B7280' }
+        ]}>
+          {fileName}
+        </Text>
+      </View>
+    );
+  }
   
   // Check if this is a voice message (starts with 🎤 or [VOICE_MESSAGE:])
   if (message.startsWith('🎤 ')) {
@@ -22,18 +71,16 @@ export default function LastMessagePreview({
     
     return (
       <View style={styles.container}>
-        <View style={styles.iconContainer}>
-          <MaterialCommunityIcons 
-            name="microphone" 
-            size={16} 
-            color={isDark ? '#39B54A' : '#6B7280'} 
-          />
-        </View>
+        <MaterialCommunityIcons 
+          name="microphone" 
+          size={16} 
+          color={isDark ? '#39B54A' : '#6B7280'} 
+        />
         <Text style={[
-          styles.durationText,
+          styles.attachmentText,
           { color: isDark ? '#39B54A' : '#6B7280' }
         ]}>
-          {duration}
+          Voice message ({duration})
         </Text>
       </View>
     );
@@ -47,15 +94,13 @@ export default function LastMessagePreview({
     
     return (
       <View style={styles.container}>
-        <View style={styles.iconContainer}>
-          <MaterialCommunityIcons 
-            name="microphone" 
-            size={16} 
-            color={isDark ? '#39B54A' : '#6B7280'} 
-          />
-        </View>
+        <MaterialCommunityIcons 
+          name="microphone" 
+          size={16} 
+          color={isDark ? '#39B54A' : '#6B7280'} 
+        />
         <Text style={[
-          styles.durationText,
+          styles.attachmentText,
           { color: isDark ? '#39B54A' : '#6B7280' }
         ]}>
           Voice message ({formattedDuration})
@@ -64,8 +109,47 @@ export default function LastMessagePreview({
     );
   }
   
+  // Check if message contains attachment indicators (fallback for when backend doesn't send attachment data)
+  if (message && (message.includes('[IMAGE]') || message.includes('[FILE]') || message.includes('[ATTACHMENT]'))) {
+    if (message.includes('[IMAGE]')) {
+      return (
+        <View style={styles.container}>
+          <MaterialCommunityIcons 
+            name="image" 
+            size={16} 
+            color={isDark ? '#39B54A' : '#6B7280'} 
+          />
+          <Text style={[
+            styles.attachmentText,
+            { color: isDark ? '#39B54A' : '#6B7280' }
+          ]}>
+            Photo
+          </Text>
+        </View>
+      );
+    }
+    
+    if (message.includes('[FILE]') || message.includes('[ATTACHMENT]')) {
+      return (
+        <View style={styles.container}>
+          <MaterialCommunityIcons 
+            name="file-document" 
+            size={16} 
+            color={isDark ? '#39B54A' : '#6B7280'} 
+          />
+          <Text style={[
+            styles.attachmentText,
+            { color: isDark ? '#39B54A' : '#6B7280' }
+          ]}>
+            File
+          </Text>
+        </View>
+      );
+    }
+  }
+  
   // Regular text message - truncate if too long
-  const truncatedMessage = message.length > maxLength 
+  const truncatedMessage = message && message.length > maxLength 
     ? message.substring(0, maxLength) + '...'
     : message;
   
@@ -79,7 +163,7 @@ export default function LastMessagePreview({
       ]}
       numberOfLines={1}
     >
-      {truncatedMessage}
+      {truncatedMessage || 'No message'}
     </Text>
   );
 }
@@ -99,6 +183,11 @@ const styles = StyleSheet.create({
   durationText: {
     fontSize: 14,
     fontWeight: '500',
+  },
+  attachmentText: {
+    fontSize: 14,
+    fontWeight: '500',
+    flex: 1,
   },
   messageText: {
     fontSize: 14,

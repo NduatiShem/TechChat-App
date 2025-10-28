@@ -1,5 +1,5 @@
 import { authAPI } from '@/services/api';
-import * as SecureStore from 'expo-secure-store';
+import { secureStorage } from '@/utils/secureStore';
 import React, { createContext, useContext, useEffect, useState } from 'react';
 
 interface User {
@@ -40,7 +40,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   const checkAuth = async () => {
     try {
-      const token = await SecureStore.getItemAsync('auth_token');
+      const token = await secureStorage.getItem('auth_token');
       console.log('AuthContext: Checking auth, token exists:', !!token);
       if (token) {
         const response = await authAPI.getProfile();
@@ -52,7 +52,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       }
     } catch (error) {
       console.error('Auth check failed:', error);
-      await SecureStore.deleteItemAsync('auth_token');
+      // Safely delete the token with error handling
+      await secureStorage.deleteItem('auth_token');
     } finally {
       setIsLoading(false);
     }
@@ -73,7 +74,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       }
       
       console.log('AuthContext: Setting token and user...');
-      await SecureStore.setItemAsync('auth_token', token);
+      await secureStorage.setItem('auth_token', token);
       setUser(userData);
       console.log('AuthContext: Login completed successfully');
     } catch (error) {
@@ -97,7 +98,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       }
       
       console.log('AuthContext: Setting token and user...');
-      await SecureStore.setItemAsync('auth_token', token);
+      await secureStorage.setItem('auth_token', token);
       setUser(userData);
       console.log('AuthContext: Registration completed successfully');
     } catch (error) {
@@ -115,7 +116,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       // Don't throw the error - we still want to logout locally
     } finally {
       // Always clear local auth state regardless of API call success
-      await SecureStore.deleteItemAsync('auth_token');
+      await secureStorage.deleteItem('auth_token');
       setUser(null);
       // Don't navigate here - let the AppLayout handle the navigation
       // The AppLayout will automatically show the auth screens when isAuthenticated becomes false
@@ -124,7 +125,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   const refreshUser = async () => {
     try {
-      const token = await SecureStore.getItemAsync('auth_token');
+      const token = await secureStorage.getItem('auth_token');
       if (token) {
         const response = await authAPI.getProfile();
         setUser(response.data.data);

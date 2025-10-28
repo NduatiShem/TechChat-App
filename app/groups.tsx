@@ -12,6 +12,7 @@ import {
     FlatList,
     RefreshControl,
     Text,
+    TextInput,
     TouchableOpacity,
     View,
 } from 'react-native';
@@ -27,6 +28,12 @@ interface Group {
   created_at: string;
   updated_at: string;
   users?: any[];
+  last_message_attachments?: Array<{
+    id: number;
+    name: string;
+    mime: string;
+    url: string;
+  }>;
 }
 
 export const options = {
@@ -35,6 +42,8 @@ export const options = {
 
 export default function GroupsScreen() {
   const [groups, setGroups] = useState<Group[]>([]);
+  const [filteredGroups, setFilteredGroups] = useState<Group[]>([]);
+  const [searchQuery, setSearchQuery] = useState('');
   const [isLoading, setIsLoading] = useState(true);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const { user } = useAuth();
@@ -46,6 +55,7 @@ export default function GroupsScreen() {
     try {
       const response = await groupsAPI.getAll();
       setGroups(response.data);
+      setFilteredGroups(response.data);
     } catch (error) {
       console.error('Failed to load groups:', error);
     } finally {
@@ -58,6 +68,18 @@ export default function GroupsScreen() {
     await loadGroups();
     setIsRefreshing(false);
   };
+
+  // Filter groups based on search query
+  useEffect(() => {
+    if (searchQuery.trim() === '') {
+      setFilteredGroups(groups);
+    } else {
+      const filtered = groups.filter(group =>
+        group.name && group.name.toLowerCase().includes(searchQuery.toLowerCase())
+      );
+      setFilteredGroups(filtered);
+    }
+  }, [searchQuery, groups]);
 
   useEffect(() => {
     loadGroups();
@@ -94,10 +116,23 @@ export default function GroupsScreen() {
       className={`flex-row items-center p-4 border-b ${
         isDark ? 'bg-gray-800 border-gray-700' : 'bg-white border-gray-200'
       }`}
+      style={{
+        shadowColor: isDark ? '#000' : '#000',
+        shadowOffset: { width: 0, height: 1 },
+        shadowOpacity: isDark ? 0.1 : 0.05,
+        shadowRadius: 2,
+        elevation: 1,
+      }}
     >
       {/* Avatar */}
-      <View className="w-12 h-12 rounded-full bg-primary items-center justify-center mr-4">
-        <MaterialCommunityIcons name="account-group" size={24} color="white" />
+      <View className="relative mr-4">
+        <View className="w-12 h-12 rounded-full bg-primary items-center justify-center">
+          <MaterialCommunityIcons name="account-group" size={24} color="white" />
+        </View>
+        {/* Online indicator for active groups */}
+        {item.last_message_date && (
+          <View className="absolute -bottom-1 -right-1 w-4 h-4 bg-secondary rounded-full border-2 border-white"></View>
+        )}
       </View>
 
       {/* Content */}
@@ -107,18 +142,29 @@ export default function GroupsScreen() {
             className={`font-semibold text-base ${
               isDark ? 'text-white' : 'text-gray-900'
             }`}
+            numberOfLines={1}
           >
             {item.name}
           </Text>
-          {item.last_message_date && (
-            <Text
-              className={`text-xs ${
-                isDark ? 'text-gray-400' : 'text-gray-500'
-              }`}
-            >
-              {formatDate(item.last_message_date)}
-            </Text>
-          )}
+          <View className="flex-row items-center">
+            {item.owner_id === user?.id && (
+              <MaterialCommunityIcons
+                name="crown"
+                size={14}
+                color="#39B54A"
+                style={{ marginRight: 4 }}
+              />
+            )}
+            {item.last_message_date && (
+              <Text
+                className={`text-xs ${
+                  isDark ? 'text-gray-400' : 'text-gray-500'
+                }`}
+              >
+                {formatDate(item.last_message_date)}
+              </Text>
+            )}
+          </View>
         </View>
         
         {item.description && (
@@ -136,21 +182,10 @@ export default function GroupsScreen() {
           <LastMessagePreview
             message={item.last_message}
             isDark={isDark}
+            attachments={item.last_message_attachments}
           />
         )}
       </View>
-
-      {/* Owner indicator */}
-      {item.owner_id === user?.id && (
-        <View className="ml-2 flex-row items-center">
-          <MaterialCommunityIcons
-            name="crown"
-            size={16}
-            color="#39B54A"
-          />
-          <Text className="text-secondary text-xs font-medium ml-1">Admin</Text>
-        </View>
-      )}
     </TouchableOpacity>
   );
 
@@ -184,7 +219,7 @@ export default function GroupsScreen() {
     );
   }
 
-  const sortedGroups = [...groups].sort((a, b) => {
+  const sortedGroups = [...filteredGroups].sort((a, b) => {
     if (!a.last_message_date) return 1;
     if (!b.last_message_date) return -1;
     return new Date(b.last_message_date) - new Date(a.last_message_date);
@@ -195,26 +230,69 @@ export default function GroupsScreen() {
       edges={['top']}
       className={`flex-1 ${isDark ? 'bg-gray-900' : 'bg-white'}`}
     >
-      {/* Groups Info */}
+      {/* Header with Welcome Message and Search */}
       <View
         className={`px-4 py-4 border-b ${
           isDark ? 'bg-gray-800 border-gray-700' : 'bg-white border-gray-200'
         }`}
       >
-        <View className="flex-row justify-between items-center">
-          <Text
-            className={`text-base ${
-              isDark ? 'text-gray-300' : 'text-gray-600'
-            }`}
-          >
-            {groups.length} group{groups.length !== 1 ? 's' : ''}
-          </Text>
+        <View className="flex-row items-center justify-between mb-3">
+          <View className="flex-1">
+            <Text
+              className={`text-lg font-semibold ${
+                isDark ? 'text-white' : 'text-gray-900'
+              }`}
+            >
+              Groups
+            </Text>
+            <Text
+              className={`text-sm ${
+                isDark ? 'text-gray-400' : 'text-gray-600'
+              }`}
+            >
+              {groups.length} group{groups.length !== 1 ? 's' : ''} available
+            </Text>
+          </View>
           {isAdmin && (
             <TouchableOpacity
               onPress={handleCreateGroup}
               className="w-10 h-10 rounded-full bg-primary items-center justify-center"
             >
               <MaterialCommunityIcons name="plus" size={24} color="white" />
+            </TouchableOpacity>
+          )}
+        </View>
+        
+        {/* Search Bar */}
+        <View className="relative">
+          <TextInput
+            value={searchQuery}
+            onChangeText={setSearchQuery}
+            placeholder="Search groups..."
+            placeholderTextColor={isDark ? '#9CA3AF' : '#6B7280'}
+            className={`w-full px-4 py-3 pl-10 rounded-lg border ${
+              isDark
+                ? 'bg-gray-700 border-gray-600 text-white'
+                : 'bg-gray-50 border-gray-300 text-gray-900'
+            }`}
+          />
+          <View className="absolute left-3 top-3">
+            <MaterialCommunityIcons
+              name="magnify"
+              size={20}
+              color={isDark ? '#9CA3AF' : '#6B7280'}
+            />
+          </View>
+          {searchQuery.length > 0 && (
+            <TouchableOpacity
+              onPress={() => setSearchQuery('')}
+              className="absolute right-3 top-3"
+            >
+              <MaterialCommunityIcons
+                name="close-circle"
+                size={20}
+                color={isDark ? '#9CA3AF' : '#6B7280'}
+              />
             </TouchableOpacity>
           )}
         </View>
@@ -235,7 +313,7 @@ export default function GroupsScreen() {
         ListEmptyComponent={
           <View className="flex-1 justify-center items-center py-12">
             <MaterialCommunityIcons
-              name="account-group"
+              name={searchQuery ? "magnify" : "account-group"}
               size={64}
               color={isDark ? '#6B7280' : '#9CA3AF'}
             />
@@ -244,19 +322,21 @@ export default function GroupsScreen() {
                 isDark ? 'text-gray-300' : 'text-gray-600'
               }`}
             >
-              No groups yet
+              {searchQuery ? 'No groups found' : 'No groups yet'}
             </Text>
             <Text
               className={`text-base text-center mt-2 px-8 ${
                 isDark ? 'text-gray-400' : 'text-gray-500'
               }`}
             >
-              {isAdmin 
-                ? 'Create a group to start chatting with multiple people'
-                : 'No groups available yet. Contact an administrator to create a group.'
+              {searchQuery 
+                ? `No groups match "${searchQuery}"`
+                : isAdmin 
+                  ? 'Create a group to start chatting with multiple people'
+                  : 'No groups available yet. Contact an administrator to create a group.'
               }
             </Text>
-            {isAdmin && (
+            {isAdmin && !searchQuery && (
               <TouchableOpacity
                 onPress={handleCreateGroup}
                 className="mt-4 px-6 py-3 bg-primary rounded-lg"
@@ -266,7 +346,30 @@ export default function GroupsScreen() {
             )}
           </View>
         }
+        contentContainerStyle={{}}
       />
+
+      {/* Floating Action Button for Admin */}
+      {isAdmin && (
+        <TouchableOpacity
+          onPress={handleCreateGroup}
+          className={`absolute bottom-6 right-6 w-14 h-14 rounded-full items-center justify-center shadow-lg ${
+            isDark ? 'bg-primary shadow-primary' : 'bg-primary shadow-gray-400'
+          }`}
+          style={{
+            elevation: 8,
+            shadowOffset: { width: 0, height: 4 },
+            shadowOpacity: 0.3,
+            shadowRadius: 8,
+          }}
+        >
+          <MaterialCommunityIcons
+            name="plus"
+            size={28}
+            color="white"
+          />
+        </TouchableOpacity>
+      )}
     </SafeAreaView>
   );
 } 

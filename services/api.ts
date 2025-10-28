@@ -1,12 +1,35 @@
+import { secureStorage } from '@/utils/secureStore';
 import axios from 'axios';
+import Constants from 'expo-constants';
 import { router } from 'expo-router';
-import * as SecureStore from 'expo-secure-store';
 import { Platform } from 'react-native';
-
+import { AppConfig } from '../config/app.config';
 
 // API Base URL - Configured for TechChat app
-// TEMPORARY: Hardcode the URL for testing
-const API_BASE_URL = 'http://192.168.100.25:8000/api';
+// Use the configuration from AppConfig
+const getApiBaseUrl = () => {
+  if (__DEV__) {
+    console.log('🔧 API Configuration - Device Detection:', {
+      platform: Platform.OS,
+      executionEnvironment: Constants.executionEnvironment,
+      appOwnership: Constants.appOwnership,
+    });
+    
+    // For Android devices (both physical and emulator in Expo Go), use the physical device URL
+    // This is because Expo Go on physical devices needs your computer's network IP
+    if (Platform.OS === 'android') {
+      console.log('📱 Android device detected - using physical device URL');
+      return AppConfig.api.development.physical;
+    } else if (Platform.OS === 'ios') {
+      console.log('🍎 iOS device detected - using simulator URL');
+      return AppConfig.api.development.ios;
+    }
+  }
+  // In production, use the production URL
+  return AppConfig.api.production;
+};
+
+const API_BASE_URL = getApiBaseUrl();
 
 // Debug logging
 console.log('🔧 API Configuration:', {
@@ -19,10 +42,9 @@ console.log('🔧 API Configuration:', {
 const api = axios.create({
   baseURL: API_BASE_URL,
   headers: {
-    'Content-Type': 'application/json',
     'Accept': 'application/json',
   },
-  timeout: 30000, // 30 second timeout for debugging
+  timeout: 30000,
   transformResponse: [function (data) {
     // Ensure proper JSON parsing
     if (typeof data === 'string') {
@@ -78,10 +100,10 @@ api.interceptors.request.use(
       baseURL: config.baseURL,
       fullURL: `${config.baseURL}${config.url}`,
       headers: config.headers,
-      data: config.data
+      // Don't log data - FormData cannot be serialized
     });
     
-    const token = await SecureStore.getItemAsync('auth_token');
+    const token = await secureStorage.getItem('auth_token');
     if (token) {
       config.headers.Authorization = `Bearer ${token}`;
     }
@@ -164,7 +186,7 @@ api.interceptors.response.use(
     
     if (error.response?.status === 401) {
       // Token expired or invalid, redirect to login
-      await SecureStore.deleteItemAsync('auth_token');
+      await secureStorage.deleteItem('auth_token');
       router.replace('/(auth)/login');
     }
     return Promise.reject(error);
@@ -192,20 +214,18 @@ export const authAPI = {
   
   registerFcmToken: (fcmToken: string) => api.post('/user/fcm-token', { fcm_token: fcmToken }),
   
-  uploadAvatar: (formData: FormData) => api.post('/user/avatar', formData, {
-    headers: {
-      'Content-Type': 'multipart/form-data',
-    },
-    timeout: 300000, // 5 minute timeout for file uploads
-    maxContentLength: Infinity,
-    maxBodyLength: Infinity,
-    onUploadProgress: (progressEvent) => {
-      if (progressEvent.total) {
-        const percentCompleted = Math.round((progressEvent.loaded * 100) / progressEvent.total);
-        console.log('Upload progress:', percentCompleted + '%');
-      }
-    },
-  }),
+  uploadAvatar: (formData: FormData) => {
+    console.log('DEBUG: Using EXACT same pattern as working message upload');
+    
+    // Use the EXACT same approach as sendMessage which is known to work
+    return api.post('/user/avatar', formData, {
+      headers: {
+        'Content-Type': 'multipart/form-data',
+      },
+      // Increase timeout for larger files
+      timeout: 60000,
+    });
+  },
 };
 
 // Messages API

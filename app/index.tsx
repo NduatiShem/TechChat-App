@@ -31,6 +31,12 @@ interface Conversation {
   updated_at: string;
   user_id?: number; // The actual user ID for user conversations
   conversation_id?: number; // The conversation ID
+  last_message_attachments?: Array<{
+    id: number;
+    name: string;
+    mime: string;
+    url: string;
+  }>;
 }
 
 export default function ConversationsScreen() {
@@ -199,6 +205,7 @@ export default function ConversationsScreen() {
           <LastMessagePreview
             message={item.last_message}
             isDark={isDark}
+            attachments={item.last_message_attachments}
           />
         )}
       </View>

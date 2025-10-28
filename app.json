@@ -39,6 +39,7 @@
     "web": {
       "favicon": "./assets/icons/Icon-48.png"
     },
+    "scheme": "techchat",
     "plugins": [
       "expo-router",
       "expo-dev-client",

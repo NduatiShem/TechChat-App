@@ -1,5 +1,7 @@
+import { AppConfig } from '@/config/app.config';
 import { useNotifications } from '@/context/NotificationContext';
 import { useTheme } from '@/context/ThemeContext';
+import { Device } from 'expo-device';
 import * as SecureStore from 'expo-secure-store';
 import React, { useState } from 'react';
 import { Alert, Platform, ScrollView, Text, TouchableOpacity, View } from 'react-native';
@@ -28,17 +30,35 @@ export default function ApiTest() {
   };
 
   const testApiConnection = async () => {
-    const testUrl = Platform.OS === 'ios' 
-      ? 'http://127.0.0.1:8000/api/test' 
-      : 'http://192.168.100.25:8000/api/test';
+    let testUrl;
+    if (Device && Device.isDevice) {
+      // Physical device - use the physical IP
+      testUrl = AppConfig.api.development.physical.replace('/api', '/api/test');
+    } else {
+      // Simulator/Emulator - use platform-specific URLs
+      if (Platform.OS === 'ios') {
+        testUrl = AppConfig.api.development.ios.replace('/api', '/api/test');
+      } else {
+        testUrl = AppConfig.api.development.android.replace('/api', '/api/test');
+      }
+    }
     const response = await fetch(testUrl);
     return await response.json();
   };
 
   const testUserProfile = async () => {
-    const testUrl = Platform.OS === 'ios' 
-      ? 'http://127.0.0.1:8000/api/user/profile' 
-      : 'http://192.168.100.25:8000/api/user/profile';
+    let testUrl;
+    if (Device && Device.isDevice) {
+      // Physical device - use the physical IP
+      testUrl = AppConfig.api.development.physical.replace('/api', '/api/user/profile');
+    } else {
+      // Simulator/Emulator - use platform-specific URLs
+      if (Platform.OS === 'ios') {
+        testUrl = AppConfig.api.development.ios.replace('/api', '/api/user/profile');
+      } else {
+        testUrl = AppConfig.api.development.android.replace('/api', '/api/user/profile');
+      }
+    }
     
     const token = await SecureStore.getItemAsync('auth_token');
     if (!token) {
@@ -62,8 +82,8 @@ export default function ApiTest() {
 
   const testUserUpdate = async () => {
     const testUrl = Platform.OS === 'ios' 
-      ? 'http://127.0.0.1:8000/api/user/profile' 
-      : 'http://192.168.100.25:8000/api/user/profile';
+      ? AppConfig.api.development.ios.replace('/api', '/api/user/profile')
+      : AppConfig.api.development.physical.replace('/api', '/api/user/profile');
     
     const token = await SecureStore.getItemAsync('auth_token');
     if (!token) {
@@ -108,8 +128,8 @@ export default function ApiTest() {
     }
 
     const testUrl = Platform.OS === 'ios' 
-      ? 'http://127.0.0.1:8000/api/user/avatar' 
-      : 'http://192.168.100.25:8000/api/user/avatar';
+      ? AppConfig.api.development.ios.replace('/api', '/api/user/avatar')
+      : AppConfig.api.development.physical.replace('/api', '/api/user/avatar');
     
     // Create a mock file for testing (1x1 pixel JPEG)
     const formData = new FormData();
@@ -143,8 +163,8 @@ export default function ApiTest() {
     }
 
     const testUrl = Platform.OS === 'ios' 
-      ? 'http://127.0.0.1:8000/api/conversations' 
-      : 'http://192.168.100.25:8000/api/conversations';
+      ? AppConfig.api.development.ios.replace('/api', '/api/conversations')
+      : AppConfig.api.development.physical.replace('/api', '/api/conversations');
     
     const response = await fetch(testUrl, {
       method: 'GET',
@@ -169,8 +189,8 @@ export default function ApiTest() {
     }
 
     const testUrl = Platform.OS === 'ios' 
-      ? 'http://127.0.0.1:8000/api/groups' 
-      : 'http://192.168.100.25:8000/api/groups';
+      ? AppConfig.api.development.ios.replace('/api', '/api/groups')
+      : AppConfig.api.development.physical.replace('/api', '/api/groups');
     
     const response = await fetch(testUrl, {
       method: 'GET',
@@ -195,8 +215,8 @@ export default function ApiTest() {
     }
 
     const testUrl = Platform.OS === 'ios' 
-      ? 'http://127.0.0.1:8000/api/users' 
-      : 'http://192.168.100.25:8000/api/users';
+      ? AppConfig.api.development.ios.replace('/api', '/api/users')
+      : AppConfig.api.development.physical.replace('/api', '/api/users');
     
     const response = await fetch(testUrl, {
       method: 'GET',
@@ -220,8 +240,8 @@ export default function ApiTest() {
     }
 
     const testUrl = Platform.OS === 'ios' 
-      ? 'http://127.0.0.1:8000/api/test-push' 
-      : 'http://192.168.100.25:8000/api/test-push';
+      ? AppConfig.api.development.ios.replace('/api', '/api/test-push')
+      : AppConfig.api.development.physical.replace('/api', '/api/test-push');
     
     const response = await fetch(testUrl, {
       method: 'POST',

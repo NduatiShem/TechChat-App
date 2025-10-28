@@ -1,18 +1,19 @@
+import { AppConfig } from '@/config/app.config';
 import { useAuth } from '@/context/AuthContext';
 import { useTheme } from '@/context/ThemeContext';
 import { MaterialCommunityIcons } from '@expo/vector-icons';
 import { router } from 'expo-router';
 import { useEffect, useRef, useState } from 'react';
 import {
-  Alert,
-  Image,
-  KeyboardAvoidingView,
-  Platform,
-  ScrollView,
-  Text,
-  TextInput,
-  TouchableOpacity,
-  View
+    Alert,
+    Image,
+    KeyboardAvoidingView,
+    Platform,
+    ScrollView,
+    Text,
+    TextInput,
+    TouchableOpacity,
+    View
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
@@ -40,6 +41,21 @@ export default function LoginScreen() {
   const passwordInputRef = useRef<TextInput>(null);
 
   const isDark = currentTheme === 'dark';
+
+  // Helper function to get base URL
+  const getBaseUrl = () => {
+    if (__DEV__) {
+      if (Platform.OS === 'ios') {
+        return AppConfig.api.development.ios;
+      } else if (Platform.OS === 'android') {
+        // Use physical device URL for Android (includes Expo Go on physical devices)
+        return AppConfig.api.development.physical;
+      } else {
+        return AppConfig.api.development.physical;
+      }
+    }
+    return AppConfig.api.production;
+  };
 
   // Debug: Track component lifecycle
   useEffect(() => {
@@ -89,13 +105,12 @@ export default function LoginScreen() {
     setIsLoading(true);
     try {
       console.log('Attempting login with:', { email, password: '***' });
-      console.log('API Base URL:', 'http://192.168.100.25:8000/api');
+      console.log('API Base URL:', getBaseUrl());
       
       // Test network connectivity first
       try {
-        const testResponse = await fetch('http://192.168.100.25:8000/api', {
+        const testResponse = await fetch(getBaseUrl(), {
           method: 'GET',
-          timeout: 5000
         });
         console.log('Network test response:', testResponse.status);
       } catch (networkError) {
