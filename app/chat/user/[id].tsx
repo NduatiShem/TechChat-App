@@ -680,56 +680,66 @@ export default function UserChatScreen() {
           
           {item.attachments && item.attachments.length > 0 && (
             item.attachments[0].mime?.startsWith('image/') ? (
-              <TouchableOpacity 
-                onPress={() => {
-                  // Try multiple possible URL fields and construct full URL
-                  let imageUrl = item.attachments[0].url || 
-                                item.attachments[0].path || 
-                                item.attachments[0].uri;
-                  
-                  // If URL is relative, make it absolute
-                  if (imageUrl && !imageUrl.startsWith('http')) {
-                    const cleanUrl = imageUrl.startsWith('/') ? imageUrl.substring(1) : imageUrl;
-                    imageUrl = `${getBaseUrl()}/${cleanUrl}`;
-                  }
-                  
-                  if (imageUrl) {
-                    setShowImagePreview(imageUrl);
-                  }
-                }}
-                style={{ marginBottom: 6 }}
-              >
-                <Image 
-                  source={{ 
-                    uri: (() => {
-                      let url = item.attachments[0].url || item.attachments[0].path || item.attachments[0].uri;
-                      
-                      if (url && !url.startsWith('http')) {
-                        // Remove leading slash if present and construct full URL
-                        const cleanUrl = url.startsWith('/') ? url.substring(1) : url;
-                        const fullUrl = `${getBaseUrl()}/${cleanUrl}`;
-                        return fullUrl;
-                      }
-                      return url;
-                    })()
-                  }} 
-                  style={{ 
-                    width: 200, 
-                    height: 200, 
-                    borderRadius: 12,
-                    backgroundColor: isDark ? '#374151' : '#F3F4F6',
-                    alignSelf: 'flex-start', // Prevent overflow
-                    maxWidth: '100%',         // Ensure it doesn't overflow
+              <View style={{ width: '100%' }}>
+                <TouchableOpacity 
+                  onPress={() => {
+                    // Try multiple possible URL fields and construct full URL
+                    let imageUrl = item.attachments[0].url || 
+                                  item.attachments[0].path || 
+                                  item.attachments[0].uri;
+                    
+                    // If URL is relative, make it absolute
+                    if (imageUrl && !imageUrl.startsWith('http')) {
+                      const cleanUrl = imageUrl.startsWith('/') ? imageUrl.substring(1) : imageUrl;
+                      imageUrl = `${getBaseUrl()}/${cleanUrl}`;
+                    }
+                    
+                    if (imageUrl) {
+                      setShowImagePreview(imageUrl);
+                    }
                   }}
-                  resizeMode="cover"
-                  onError={(error) => {
-                    // Silent fail for image loading
-                  }}
-                  onLoad={() => {
-                    // Image loaded successfully
-                  }}
-                />
-              </TouchableOpacity>
+                >
+                  <Image 
+                    source={{ 
+                      uri: (() => {
+                        let url = item.attachments[0].url || item.attachments[0].path || item.attachments[0].uri;
+                        
+                        if (url && !url.startsWith('http')) {
+                          // Remove leading slash if present and construct full URL
+                          const cleanUrl = url.startsWith('/') ? url.substring(1) : url;
+                          const fullUrl = `${getBaseUrl()}/${cleanUrl}`;
+                          return fullUrl;
+                        }
+                        return url;
+                      })()
+                    }} 
+                    style={{ 
+                      width: 200, 
+                      height: 200, 
+                      borderRadius: 12,
+                      backgroundColor: isDark ? '#374151' : '#F3F4F6',
+                      alignSelf: 'flex-start', // Prevent overflow
+                      maxWidth: '100%',         // Ensure it doesn't overflow
+                    }}
+                    resizeMode="cover"
+                    onError={(error) => {
+                      // Silent fail for image loading
+                    }}
+                    onLoad={() => {
+                      // Image loaded successfully
+                    }}
+                  />
+                </TouchableOpacity>
+                
+                {/* Timestamp below image */}
+                <Text style={{ 
+                  fontSize: 10, 
+                  color: isMine ? '#E0E7FF' : '#6B7280',
+                  alignSelf: 'flex-end',
+                  marginTop: 2,
+                  marginRight: 2,
+                }}>{timestamp}</Text>
+              </View>
             ) : (
               <TouchableOpacity 
                 style={{ 
@@ -824,7 +834,7 @@ export default function UserChatScreen() {
                   flexGrow: 1,   // Allow text to grow
                   flexWrap: 'wrap', // Ensure text wraps properly
                   width: 'auto', // Allow text to take its natural width
-                  marginRight: 40, // Make room for timestamp
+                  marginRight: item.message.length > 30 ? 0 : 40, // Only add margin for short messages
                   wordBreak: 'break-word', // Prevent words from breaking unnecessarily
                 }}
               >
@@ -832,17 +842,20 @@ export default function UserChatScreen() {
               </Text>
             )}
             
-            {/* Timestamp positioned absolutely */}
-            <Text style={{ 
-              fontSize: 10, 
-              color: isMine ? '#E0E7FF' : '#6B7280',
-              position: 'absolute',
-              bottom: 0,
-              right: 0,
-              paddingLeft: 4,
-              paddingBottom: 0,
-              backgroundColor: 'transparent',
-            }}>{timestamp}</Text>
+            {/* Timestamp for text messages */}
+            {(!item.attachments || item.attachments.length === 0) && 
+              <Text style={{ 
+                fontSize: 10, 
+                color: isMine ? '#E0E7FF' : '#6B7280',
+                position: 'absolute',
+                bottom: 0,
+                right: 0,
+                paddingLeft: 4,
+                paddingBottom: 0,
+                paddingRight: 2,
+                backgroundColor: 'transparent',
+              }}>{timestamp}</Text>
+            }
           </View>
         </View>
         </TouchableOpacity>
