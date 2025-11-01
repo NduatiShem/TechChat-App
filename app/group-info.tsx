@@ -1,7 +1,7 @@
 import UserAvatar from '@/components/UserAvatar';
 import { useAuth } from '@/context/AuthContext';
 import { useTheme } from '@/context/ThemeContext';
-import { groupsAPI } from '@/services/api';
+import { groupsAPI, usersAPI } from '@/services/api';
 import { MaterialCommunityIcons } from '@expo/vector-icons';
 import { router, useLocalSearchParams } from 'expo-router';
 import React, { useEffect, useState } from 'react';
@@ -9,8 +9,10 @@ import {
     ActivityIndicator,
     Alert,
     FlatList,
+    Modal,
     ScrollView,
     Text,
+    TextInput,
     TouchableOpacity,
     View,
 } from 'react-native';
@@ -41,6 +43,15 @@ export default function GroupInfoScreen() {
   const [groupInfo, setGroupInfo] = useState<GroupInfo | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [isDeleting, setIsDeleting] = useState(false);
+  const [isUpdating, setIsUpdating] = useState(false);
+  const [isAddingMembers, setIsAddingMembers] = useState(false);
+  const [isEditModalVisible, setIsEditModalVisible] = useState(false);
+  const [isAddMemberModalVisible, setIsAddMemberModalVisible] = useState(false);
+  const [editName, setEditName] = useState('');
+  const [editDescription, setEditDescription] = useState('');
+  const [availableUsers, setAvailableUsers] = useState<any[]>([]);
+  const [selectedUsers, setSelectedUsers] = useState<number[]>([]);
+  const [searchQuery, setSearchQuery] = useState('');
   const { user } = useAuth();
   const { currentTheme } = useTheme();
 
@@ -87,6 +98,30 @@ export default function GroupInfoScreen() {
   useEffect(() => {
     loadGroupInfo();
   }, [id, groupData]);
+  
+  useEffect(() => {
+    if (groupInfo) {
+      setEditName(groupInfo.name);
+      setEditDescription(groupInfo.description || '');
+    }
+  }, [groupInfo]);
+  
+  const loadAvailableUsers = async () => {
+    try {
+      const response = await usersAPI.getAll();
+      if (response.data) {
+        // Filter out users who are already members of the group
+        const existingMemberIds = groupInfo?.users.map(user => user.id) || [];
+        const filteredUsers = response.data.filter((user: any) => 
+          !existingMemberIds.includes(user.id)
+        );
+        setAvailableUsers(filteredUsers);
+      }
+    } catch (error) {
+      console.error('Failed to load users:', error);
+      Alert.alert('Error', 'Failed to load available users');
+    }
+  };
 
   const handleDeleteGroup = () => {
     if (!isAdmin && !isOwner) {
@@ -137,6 +172,136 @@ export default function GroupInfoScreen() {
     } finally {
       setIsDeleting(false);
     }
+  };
+  
+  const handleUpdateGroup = async () => {
+    if (!isAdmin && !isOwner) {
+      Alert.alert('Permission Denied', 'Only administrators or group owners can edit group details.');
+      return;
+    }
+    
+    if (!editName.trim()) {
+      Alert.alert('Error', 'Group name cannot be empty');
+      return;
+    }
+    
+    setIsUpdating(true);
+    try {
+      await groupsAPI.update(Number(id), {
+        name: editName.trim(),
+        description: editDescription.trim() || undefined,
+      });
+      
+      // Update local state
+      if (groupInfo) {
+        setGroupInfo({
+          ...groupInfo,
+          name: editName.trim(),
+          description: editDescription.trim() || undefined,
+        });
+      }
+      
+      setIsEditModalVisible(false);
+      Alert.alert('Success', 'Group information updated successfully!');
+    } catch (error: any) {
+      console.error('Failed to update group:', error);
+      let errorMessage = 'Failed to update group information';
+      
+      if (error.response?.data?.message) {
+        errorMessage = error.response.data.message;
+      }
+      
+      Alert.alert('Error', errorMessage);
+    } finally {
+      setIsUpdating(false);
+    }
+  };
+  
+  const handleAddMembers = async () => {
+    if (!isAdmin && !isOwner) {
+      Alert.alert('Permission Denied', 'Only administrators or group owners can add members.');
+      return;
+    }
+    
+    if (selectedUsers.length === 0) {
+      Alert.alert('Error', 'Please select at least one user to add');
+      return;
+    }
+    
+    setIsAddingMembers(true);
+    try {
+      await groupsAPI.addMembers(Number(id), selectedUsers);
+      
+      // Refresh group info to get updated members list
+      await loadGroupInfo();
+      
+      setIsAddMemberModalVisible(false);
+      setSelectedUsers([]);
+      Alert.alert('Success', 'Members added successfully!');
+    } catch (error: any) {
+      console.error('Failed to add members:', error);
+      let errorMessage = 'Failed to add members';
+      
+      if (error.response?.data?.message) {
+        errorMessage = error.response.data.message;
+      }
+      
+      Alert.alert('Error', errorMessage);
+    } finally {
+      setIsAddingMembers(false);
+    }
+  };
+  
+  const handleRemoveMember = async (memberId: number) => {
+    if (!isAdmin && !isOwner) {
+      Alert.alert('Permission Denied', 'Only administrators or group owners can remove members.');
+      return;
+    }
+    
+    // Don't allow removing the owner
+    if (memberId === groupInfo?.owner_id) {
+      Alert.alert('Error', 'Cannot remove the group owner');
+      return;
+    }
+    
+    Alert.alert(
+      'Remove Member',
+      'Are you sure you want to remove this member from the group?',
+      [
+        {
+          text: 'Cancel',
+          style: 'cancel',
+        },
+        {
+          text: 'Remove',
+          style: 'destructive',
+          onPress: async () => {
+            try {
+              await groupsAPI.removeMembers(Number(id), [memberId]);
+              
+              // Update local state
+              if (groupInfo) {
+                setGroupInfo({
+                  ...groupInfo,
+                  users: groupInfo.users.filter(user => user.id !== memberId),
+                });
+              }
+              
+              Alert.alert('Success', 'Member removed successfully!');
+            } catch (error: any) {
+              console.error('Failed to remove member:', error);
+              let errorMessage = 'Failed to remove member';
+              
+              if (error.response?.data?.message) {
+                errorMessage = error.response.data.message;
+              }
+              
+              Alert.alert('Error', errorMessage);
+            }
+          },
+        },
+      ]
+    );
   };
 
   const getGroupAvatarInitials = (groupName: string | null | undefined) => {
@@ -198,14 +363,77 @@ export default function GroupInfoScreen() {
       </View>
 
       {/* Role Badge */}
-      {item.id === groupInfo?.owner_id && (
+      {item.id === groupInfo?.owner_id ? (
         <View className="bg-yellow-100 dark:bg-yellow-900/20 px-2 py-1 rounded">
           <Text className="text-yellow-800 dark:text-yellow-200 text-xs font-medium">
             Owner
           </Text>
         </View>
+      ) : (
+        /* Remove Member Button (only shown to admins/owners and not for the owner) */
+        (isAdmin || isOwner) && (
+          <TouchableOpacity 
+            onPress={() => handleRemoveMember(item.id)}
+            className="bg-red-100 dark:bg-red-900/20 p-2 rounded"
+          >
+            <MaterialCommunityIcons name="account-remove" size={20} color="#EF4444" />
+          </TouchableOpacity>
+        )
       )}
     </View>
+  );
+  
+  const renderAvailableUser = ({ item }: { item: any }) => (
+    <TouchableOpacity 
+      onPress={() => {
+        if (selectedUsers.includes(item.id)) {
+          setSelectedUsers(selectedUsers.filter(id => id !== item.id));
+        } else {
+          setSelectedUsers([...selectedUsers, item.id]);
+        }
+      }}
+      className={`flex-row items-center p-4 border-b ${
+        isDark ? 'bg-gray-800 border-gray-700' : 'bg-white border-gray-200'
+      } ${selectedUsers.includes(item.id) ? 'bg-blue-50 dark:bg-blue-900/20' : ''}`}
+    >
+      {/* User Avatar */}
+      <View className="mr-4">
+        <UserAvatar
+          avatarUrl={item.avatar_url}
+          name={item.name}
+          size={40}
+        />
+      </View>
+
+      {/* User Info */}
+      <View className="flex-1">
+        <Text
+          className={`font-semibold text-base ${
+            isDark ? 'text-white' : 'text-gray-900'
+          }`}
+        >
+          {item.name}
+        </Text>
+        <Text
+          className={`text-sm ${
+            isDark ? 'text-gray-400' : 'text-gray-600'
+          }`}
+        >
+          {item.email}
+        </Text>
+      </View>
+
+      {/* Selection Indicator */}
+      <View className={`w-6 h-6 rounded-full border-2 ${
+        selectedUsers.includes(item.id) 
+          ? 'bg-blue-500 border-blue-500' 
+          : isDark ? 'border-gray-600' : 'border-gray-300'
+      } items-center justify-center`}>
+        {selectedUsers.includes(item.id) && (
+          <MaterialCommunityIcons name="check" size={16} color="#fff" />
+        )}
+      </View>
+    </TouchableOpacity>
   );
 
   if (isLoading) {
@@ -278,13 +506,30 @@ export default function GroupInfoScreen() {
 
             {/* Group Info */}
             <View className="flex-1">
-              <Text
-                className={`text-2xl font-bold mb-1 ${
-                  isDark ? 'text-white' : 'text-gray-900'
-                }`}
-              >
-                {groupInfo.name}
-              </Text>
+              <View className="flex-row items-center justify-between">
+                <Text
+                  className={`text-2xl font-bold mb-1 ${
+                    isDark ? 'text-white' : 'text-gray-900'
+                  }`}
+                >
+                  {groupInfo.name}
+                </Text>
+                
+                {/* Edit button for admins/owners */}
+                {(isAdmin || isOwner) && (
+                  <TouchableOpacity 
+                    onPress={() => {
+                      setEditName(groupInfo.name);
+                      setEditDescription(groupInfo.description || '');
+                      setIsEditModalVisible(true);
+                    }}
+                    className="bg-blue-100 dark:bg-blue-900/20 p-2 rounded"
+                  >
+                    <MaterialCommunityIcons name="pencil" size={20} color="#3B82F6" />
+                  </TouchableOpacity>
+                )}
+              </View>
+              
               {groupInfo.description && (
                 <Text
                   className={`text-base ${
@@ -336,13 +581,32 @@ export default function GroupInfoScreen() {
 
         {/* Members Section */}
         <View className="p-4">
-          <Text
-            className={`text-lg font-semibold mb-4 ${
-              isDark ? 'text-white' : 'text-gray-900'
-            }`}
-          >
-            Members {groupInfo.users.length > 0 ? `(${groupInfo.users.length})` : ''}
-          </Text>
+          <View className="flex-row items-center justify-between mb-4">
+            <Text
+              className={`text-lg font-semibold ${
+                isDark ? 'text-white' : 'text-gray-900'
+              }`}
+            >
+              Members {groupInfo.users.length > 0 ? `(${groupInfo.users.length})` : ''}
+            </Text>
+            
+            {/* Add Members Button for admins/owners */}
+            {(isAdmin || isOwner) && (
+              <TouchableOpacity 
+                onPress={() => {
+                  setSelectedUsers([]);
+                  loadAvailableUsers();
+                  setIsAddMemberModalVisible(true);
+                }}
+                className="bg-green-100 dark:bg-green-900/20 py-2 px-3 rounded-lg flex-row items-center"
+              >
+                <MaterialCommunityIcons name="account-plus" size={18} color="#10B981" />
+                <Text className="text-green-700 dark:text-green-400 ml-1 font-medium">
+                  Add
+                </Text>
+              </TouchableOpacity>
+            )}
+          </View>
 
           {groupInfo.users.length > 0 ? (
             <FlatList
@@ -396,6 +660,184 @@ export default function GroupInfoScreen() {
           </View>
         )}
       </ScrollView>
+      
+      {/* Edit Group Modal */}
+      <Modal
+        visible={isEditModalVisible}
+        transparent={true}
+        animationType="slide"
+        onRequestClose={() => setIsEditModalVisible(false)}
+      >
+        <View className="flex-1 justify-center items-center bg-black/50">
+          <View className={`w-11/12 p-6 rounded-lg ${
+            isDark ? 'bg-gray-800' : 'bg-white'
+          }`}>
+            <Text className={`text-lg font-bold mb-4 ${
+              isDark ? 'text-white' : 'text-gray-900'
+            }`}>
+              Edit Group
+            </Text>
+            
+            <Text className={`mb-1 font-medium ${
+              isDark ? 'text-gray-300' : 'text-gray-700'
+            }`}>
+              Group Name
+            </Text>
+            <TextInput
+              value={editName}
+              onChangeText={setEditName}
+              className={`border rounded-lg p-3 mb-4 ${
+                isDark 
+                  ? 'bg-gray-700 border-gray-600 text-white' 
+                  : 'bg-white border-gray-300 text-gray-900'
+              }`}
+              placeholder="Enter group name"
+              placeholderTextColor={isDark ? '#9CA3AF' : '#6B7280'}
+            />
+            
+            <Text className={`mb-1 font-medium ${
+              isDark ? 'text-gray-300' : 'text-gray-700'
+            }`}>
+              Description (Optional)
+            </Text>
+            <TextInput
+              value={editDescription}
+              onChangeText={setEditDescription}
+              className={`border rounded-lg p-3 mb-6 ${
+                isDark 
+                  ? 'bg-gray-700 border-gray-600 text-white' 
+                  : 'bg-white border-gray-300 text-gray-900'
+              }`}
+              placeholder="Enter group description"
+              placeholderTextColor={isDark ? '#9CA3AF' : '#6B7280'}
+              multiline
+              numberOfLines={3}
+              textAlignVertical="top"
+            />
+            
+            <View className="flex-row justify-end">
+              <TouchableOpacity
+                onPress={() => setIsEditModalVisible(false)}
+                className="px-4 py-2 mr-2"
+              >
+                <Text className={isDark ? 'text-gray-300' : 'text-gray-700'}>
+                  Cancel
+                </Text>
+              </TouchableOpacity>
+              
+              <TouchableOpacity
+                onPress={handleUpdateGroup}
+                disabled={isUpdating}
+                className={`px-4 py-2 rounded-lg ${
+                  isUpdating 
+                    ? 'bg-blue-400' 
+                    : 'bg-blue-500'
+                }`}
+              >
+                {isUpdating ? (
+                  <ActivityIndicator size="small" color="#ffffff" />
+                ) : (
+                  <Text className="text-white font-medium">
+                    Save
+                  </Text>
+                )}
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
+      
+      {/* Add Members Modal */}
+      <Modal
+        visible={isAddMemberModalVisible}
+        transparent={true}
+        animationType="slide"
+        onRequestClose={() => setIsAddMemberModalVisible(false)}
+      >
+        <View className="flex-1 justify-center items-center bg-black/50">
+          <View className={`w-11/12 h-5/6 p-6 rounded-lg ${
+            isDark ? 'bg-gray-800' : 'bg-white'
+          }`}>
+            <Text className={`text-lg font-bold mb-4 ${
+              isDark ? 'text-white' : 'text-gray-900'
+            }`}>
+              Add Members
+            </Text>
+            
+            {/* Search Box */}
+            <View className={`flex-row items-center border rounded-lg p-2 mb-4 ${
+              isDark ? 'bg-gray-700 border-gray-600' : 'bg-gray-50 border-gray-300'
+            }`}>
+              <MaterialCommunityIcons 
+                name="magnify" 
+                size={20} 
+                color={isDark ? '#9CA3AF' : '#6B7280'} 
+                style={{ marginRight: 8 }}
+              />
+              <TextInput
+                value={searchQuery}
+                onChangeText={setSearchQuery}
+                className={isDark ? 'text-white flex-1' : 'text-gray-900 flex-1'}
+                placeholder="Search users"
+                placeholderTextColor={isDark ? '#9CA3AF' : '#6B7280'}
+              />
+            </View>
+            
+            {/* User List */}
+            {availableUsers.length > 0 ? (
+              <FlatList
+                data={availableUsers.filter(user => 
+                  user.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
+                  user.email.toLowerCase().includes(searchQuery.toLowerCase())
+                )}
+                renderItem={renderAvailableUser}
+                keyExtractor={(item) => item.id.toString()}
+                className="flex-1 mb-4"
+              />
+            ) : (
+              <View className="flex-1 justify-center items-center">
+                {isAddingMembers ? (
+                  <ActivityIndicator size="large" color="#3B82F6" />
+                ) : (
+                  <Text className={isDark ? 'text-gray-400' : 'text-gray-600'}>
+                    No users available to add
+                  </Text>
+                )}
+              </View>
+            )}
+            
+            {/* Action Buttons */}
+            <View className="flex-row justify-end">
+              <TouchableOpacity
+                onPress={() => setIsAddMemberModalVisible(false)}
+                className="px-4 py-2 mr-2"
+              >
+                <Text className={isDark ? 'text-gray-300' : 'text-gray-700'}>
+                  Cancel
+                </Text>
+              </TouchableOpacity>
+              
+              <TouchableOpacity
+                onPress={handleAddMembers}
+                disabled={isAddingMembers || selectedUsers.length === 0}
+                className={`px-4 py-2 rounded-lg ${
+                  isAddingMembers || selectedUsers.length === 0
+                    ? 'bg-blue-400' 
+                    : 'bg-blue-500'
+                }`}
+              >
+                {isAddingMembers ? (
+                  <ActivityIndicator size="small" color="#ffffff" />
+                ) : (
+                  <Text className="text-white font-medium">
+                    Add Selected ({selectedUsers.length})
+                  </Text>
+                )}
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
     </SafeAreaView>
   );
 } 
