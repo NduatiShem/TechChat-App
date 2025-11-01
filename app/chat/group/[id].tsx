@@ -257,9 +257,16 @@ export default function GroupChatScreen() {
     try {
       let formData = new FormData();
       
-      // Add text message if present
-      if (input.trim()) {
-        formData.append('message', input.trim());
+      // Handle file/image attachment
+      let messageText = input.trim();
+      
+      // If attachment exists and no text, add marker similar to voice messages
+      if (attachment && !messageText) {
+        if (attachment.type?.startsWith('image/') || attachment.isImage) {
+          messageText = '[IMAGE]';
+        } else {
+          messageText = '[FILE]';
+        }
       }
       
       formData.append('group_id', id as string);
@@ -278,10 +285,15 @@ export default function GroupChatScreen() {
         });
       }
       
+      // Add text message if present (or marker for attachment)
+      if (messageText && !voiceRecording) {
+        formData.append('message', messageText);
+      }
+      
       // Handle voice recording - attach file + keep marker text
       if (voiceRecording) {
         const voiceMessage = `[VOICE_MESSAGE:${voiceRecording.duration}]`;
-        const combinedMessage = input.trim() ? `${input.trim()} ${voiceMessage}` : voiceMessage;
+        const combinedMessage = messageText ? `${messageText} ${voiceMessage}` : voiceMessage;
         formData.append('message', combinedMessage);
 
         // Important: send as attachments[] so Laravel sees an array
@@ -497,6 +509,14 @@ export default function GroupChatScreen() {
     let isVoiceMessage = false;
     let messageText = null;
     
+    // Helper function to clean message text by removing markers
+    const cleanMessageText = (text: string | null | undefined): string | null => {
+      if (!text) return null;
+      // Remove [IMAGE] and [FILE] markers at the end
+      let cleaned = text.replace(/\s*\[IMAGE\]$/g, '').replace(/\s*\[FILE\]$/g, '').trim();
+      return cleaned || null;
+    };
+    
     // Check for voice message format first (even without attachments)
     if (item.message && item.message.match(/\[VOICE_MESSAGE:(\d+)\]$/)) {
       const voiceMatch = item.message.match(/\[VOICE_MESSAGE:(\d+)\]$/);
@@ -542,10 +562,16 @@ export default function GroupChatScreen() {
           };
           isVoiceMessage = true;
         } else {
-          // Regular message with audio attachment
-          messageText = item.message;
+          // Regular message with audio attachment - clean the text
+          messageText = cleanMessageText(item.message);
         }
+      } else {
+        // For image/file attachments, clean the message text
+        messageText = cleanMessageText(item.message);
       }
+    } else {
+      // Regular text message - clean any markers that might be present
+      messageText = cleanMessageText(item.message);
     }
 
     // If it's a voice message, render the dedicated voice bubble
@@ -806,120 +832,105 @@ export default function GroupChatScreen() {
                 }}>{timestamp}</Text>
               </View>
             ) : (
-              <TouchableOpacity 
-                style={{ 
-                  flexDirection: 'row', 
-                  alignItems: 'center', 
-                  backgroundColor: isMine ? '#25D366' : (isDark ? '#374151' : '#E5E7EB'),
-                  borderRadius: 12,
-                  padding: 8,
-                  paddingVertical: 8,
-                  borderWidth: 0,
-                  width: 'auto',
-                  maxWidth: 280,
-                  minHeight: 0,
-                  shadowColor: '#000',
-                  shadowOffset: { width: 0, height: 1 },
-                  shadowOpacity: 0.2,
-                  shadowRadius: 2,
-                  elevation: 2,
-                }}
-                onPress={async () => {
-                  const fileUrl = item.attachments[0].url || item.attachments[0].path || item.attachments[0].uri;
-                  let downloadUrl = fileUrl;
-                  if (fileUrl && !fileUrl.startsWith('http')) {
-                    const cleanUrl = fileUrl.startsWith('/') ? fileUrl.substring(1) : fileUrl;
-                    downloadUrl = `${getBaseUrl()}/${cleanUrl}`;
-                  }
-                  
-                  const fileName = item.attachments[0].name || 'download';
-                  
-                  Alert.alert('File Download', `File: ${fileName}\nURL: ${downloadUrl}`, [
-                    { text: 'OK', style: 'default' }
-                  ]);
-                }}
-              >
-                {/* File icon - using document icon with file extension */}
+              <View style={{ width: '100%', overflow: 'hidden' }}>
                 <View style={{ 
-                  backgroundColor: '#2B5DF5', 
-                  borderRadius: 6, 
-                  padding: 0,
-                  marginRight: 10,
-                  width: 32,
-                  height: 32,
-                  justifyContent: 'center',
-                  alignItems: 'center',
-                  overflow: 'hidden'
+                  flexDirection: 'row', 
+                  alignItems: 'flex-start',
+                  width: '100%',
+                  marginBottom: 4,
                 }}>
-                  <Text style={{
-                    color: 'white',
-                    fontSize: 8,
-                    fontWeight: 'bold',
-                    position: 'absolute',
-                    bottom: 1
+                  {/* File icon - Left */}
+                  <View style={{ 
+                    width: 48,
+                    height: 48,
+                    borderRadius: 8,
+                    backgroundColor: isMine 
+                      ? (isDark ? 'rgba(255, 255, 255, 0.15)' : 'rgba(255, 255, 255, 0.2)')
+                      : (isDark ? 'rgba(0, 0, 0, 0.2)' : 'rgba(0, 0, 0, 0.1)'),
+                    justifyContent: 'center',
+                    alignItems: 'center',
+                    marginRight: 12,
+                    flexShrink: 0,
                   }}>
-                    {(item.attachments[0].name || 'file').split('.').pop()?.toUpperCase() || 'FILE'}
-                  </Text>
-                  <MaterialCommunityIcons 
-                    name="file-document-outline" 
-                    size={18} 
-                    color="#fff"
-                    style={{ marginBottom: 6 }}
-                  />
+                    <MaterialCommunityIcons 
+                      name="file-document-outline" 
+                      size={24} 
+                      color={isMine ? '#fff' : (isDark ? '#fff' : '#111827')} 
+                    />
+                  </View>
+                  
+                  {/* File info container - Middle (takes most space) */}
+                  <TouchableOpacity 
+                    style={{ flex: 1, minWidth: 0, flexShrink: 1 }}
+                    onPress={async () => {
+                      const fileUrl = item.attachments[0].url || item.attachments[0].path || item.attachments[0].uri;
+                      let downloadUrl = fileUrl;
+                      if (fileUrl && !fileUrl.startsWith('http')) {
+                        const cleanUrl = fileUrl.startsWith('/') ? fileUrl.substring(1) : fileUrl;
+                        downloadUrl = `${getBaseUrl()}/${cleanUrl}`;
+                      }
+                      
+                      const fileName = item.attachments[0].name || 'download';
+                      
+                      Alert.alert('File Download', `File: ${fileName}\nURL: ${downloadUrl}`, [
+                        { text: 'OK', style: 'default' }
+                      ]);
+                    }}
+                  >
+                    {/* First row: File name */}
+                    <Text 
+                      style={{ 
+                        color: isMine ? '#fff' : (isDark ? '#fff' : '#111827'),
+                        fontSize: 14,
+                        fontWeight: '500',
+                        marginBottom: 4,
+                      }}
+                      numberOfLines={3}
+                      ellipsizeMode="tail"
+                    >
+                      {item.attachments[0].name}
+                    </Text>
+                    {/* Second row: File details with download icon */}
+                    <View style={{ flexDirection: 'row', alignItems: 'center', width: '100%' }}>
+                      <Text 
+                        style={{ 
+                          color: isMine ? '#E0E7FF' : '#6B7280',
+                          fontSize: 12,
+                          flexShrink: 1,
+                          marginRight: 8,
+                        }}
+                        numberOfLines={1}
+                        ellipsizeMode="tail"
+                      >
+                        {item.attachments[0].size ? `${(item.attachments[0].size / 1024).toFixed(0)} KB` : 'Unknown'} • {(item.attachments[0].name || 'file').split('.').pop()?.toUpperCase() || 'FILE'}
+                      </Text>
+                      <MaterialCommunityIcons 
+                        name="download" 
+                        size={18} 
+                        color={isMine ? '#E0E7FF' : '#6B7280'} 
+                        style={{ flexShrink: 0 }}
+                      />
+                    </View>
+                  </TouchableOpacity>
                 </View>
                 
-                {/* File information (improved layout) */}
-                <View style={{ flex: 1, justifyContent: 'center' }}>
+                {/* Timestamp inside bubble at bottom right */}
+                <View style={{ width: '100%', flexDirection: 'row', justifyContent: 'flex-end', marginTop: 4 }}>
                   <Text style={{ 
-                    color: isMine ? '#fff' : (isDark ? '#fff' : '#111827'),
-                    fontSize: 14,
-                    fontWeight: '600',
-                    marginBottom: 2,
-                    numberOfLines: 1,
-                    ellipsizeMode: 'middle'
-                  }}>
-                    {item.attachments[0].name}
-                  </Text>
-                  <Text style={{ 
+                    fontSize: 10, 
                     color: isMine ? '#E0E7FF' : '#6B7280',
-                    fontSize: 11
+                    marginRight: 0,
                   }}>
-                    {item.attachments[0].size ? `${(item.attachments[0].size / 1024).toFixed(0)} kB` : 'Unknown size'} • {item.attachments[0].pages ? `${item.attachments[0].pages} pages` : ''}
+                    {timestamp}
                   </Text>
                 </View>
-                
-                {/* Download button - styled as a circle */}
-                <View style={{
-                  backgroundColor: isMine ? 'rgba(255,255,255,0.2)' : 'rgba(0,0,0,0.1)',
-                  width: 28,
-                  height: 28,
-                  borderRadius: 14,
-                  justifyContent: 'center',
-                  alignItems: 'center',
-                  marginLeft: 6
-                }}>
-                  <MaterialCommunityIcons 
-                    name="download" 
-                    size={16}
-                    color={isMine ? '#fff' : '#6B7280'} 
-                  />
-                </View>
-                
-                {/* Timestamp inside file bubble */}
-                <Text style={{ 
-                  fontSize: 10, 
-                  color: isMine ? '#E0E7FF' : '#6B7280',
-                  position: 'absolute',
-                  bottom: 4,
-                  right: 8,
-                }}>{timestamp}</Text>
-              </TouchableOpacity>
+              </View>
             )
           )}
           
           {/* Message content and timestamp in a flex container */}
           <View style={{ width: '100%' }}>
-            {item.message && !isVoiceMessage && (
+            {messageText && !isVoiceMessage && (
               <Text 
                 style={{ 
                   color: isMine ? '#fff' : (isDark ? '#fff' : '#111827'),
@@ -930,11 +941,11 @@ export default function GroupChatScreen() {
                   flexShrink: 0, // Don't shrink text unnecessarily
                   flexGrow: 1,   // Allow text to grow
                   width: 'auto', // Allow text to take its natural width
-                  marginRight: item.message.length > 30 ? 0 : 40, // Only add margin for short messages
+                  marginRight: messageText.length > 30 ? 0 : 40, // Only add margin for short messages
                   wordBreak: 'break-word', // Prevent words from breaking unnecessarily
                 }}
               >
-                {item.message}
+                {messageText}
               </Text>
             )}
             

@@ -109,6 +109,48 @@ export default function LastMessagePreview({
     );
   }
   
+  // Check if this is an image message in [IMAGE] format (similar to voice messages)
+  // Matches [IMAGE] at the end, optionally with text before it
+  const imageMatch = message && message.match(/\s*\[IMAGE\]$/);
+  if (imageMatch) {
+    return (
+      <View style={styles.container}>
+        <MaterialCommunityIcons 
+          name="image" 
+          size={16} 
+          color={isDark ? '#39B54A' : '#6B7280'} 
+        />
+        <Text style={[
+          styles.attachmentText,
+          { color: isDark ? '#39B54A' : '#6B7280' }
+        ]}>
+          Photo
+        </Text>
+      </View>
+    );
+  }
+  
+  // Check if this is a file message in [FILE] format (similar to voice messages)
+  // Matches [FILE] at the end, optionally with text before it
+  const fileMatch = message && message.match(/\s*\[FILE\]$/);
+  if (fileMatch) {
+    return (
+      <View style={styles.container}>
+        <MaterialCommunityIcons 
+          name="file-document" 
+          size={16} 
+          color={isDark ? '#39B54A' : '#6B7280'} 
+        />
+        <Text style={[
+          styles.attachmentText,
+          { color: isDark ? '#39B54A' : '#6B7280' }
+        ]}>
+          File
+        </Text>
+      </View>
+    );
+  }
+  
   // Check if message contains attachment indicators (fallback for when backend doesn't send attachment data)
   if (message && (message.includes('[IMAGE]') || message.includes('[FILE]') || message.includes('[ATTACHMENT]'))) {
     if (message.includes('[IMAGE]')) {
