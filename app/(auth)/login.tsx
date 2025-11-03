@@ -126,17 +126,8 @@ export default function LoginScreen() {
       await login(email, password);
       console.log('Login successful!');
       // Wait for auth state to update, then navigate
-      setTimeout(() => {
-        // Try to dismiss any existing navigation stack first
-        try {
-          router.dismissAll();
-          router.replace('/');
-        } catch (error) {
-          console.log('Navigation error, trying alternative:', error);
-          // Alternative approach
-          router.push('/');
-        }
-      }, 300);
+      // expo-router automatically handles navigation based on auth state
+      // No need to manually navigate here as AppLayout will handle it
     } catch (error: any) {
       console.error('Login error details:', {
         message: error.message,

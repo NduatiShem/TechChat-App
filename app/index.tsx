@@ -1,4 +1,5 @@
 import LastMessagePreview from '@/components/LastMessagePreview';
+import { NotificationBadge } from '@/components/NotificationBadge';
 import UserAvatar from '@/components/UserAvatar';
 import { useAuth } from '@/context/AuthContext';
 import { useNotifications } from '@/context/NotificationContext';
@@ -31,6 +32,7 @@ interface Conversation {
   updated_at: string;
   user_id?: number; // The actual user ID for user conversations
   conversation_id?: number; // The conversation ID
+  unread_count?: number; // Unread message count for this conversation
   last_message_attachments?: Array<{
     id: number;
     name: string;
@@ -47,7 +49,7 @@ export default function ConversationsScreen() {
   const [isRefreshing, setIsRefreshing] = useState(false);
   const { user } = useAuth();
   const { currentTheme } = useTheme();
-  const { requestPermissions } = useNotifications();
+  const { requestPermissions, conversationCounts, updateUnreadCount } = useNotifications();
 
   const isDark = currentTheme === 'dark';
 
@@ -86,6 +88,14 @@ export default function ConversationsScreen() {
           conversation && conversation.id !== undefined && conversation.id !== null &&
           index === self.findIndex(c => c.id === conversation.id)
         );
+        
+        // Sync unread counts from backend to notification context
+        uniqueConversations.forEach((conversation) => {
+          if (conversation.unread_count && conversation.unread_count > 0) {
+            const conversationId = conversation.conversation_id || conversation.id;
+            updateUnreadCount(Number(conversationId), conversation.unread_count);
+          }
+        });
         
         setConversations(uniqueConversations);
         setFilteredConversations(uniqueConversations);
@@ -177,22 +187,54 @@ export default function ConversationsScreen() {
           name={item.name}
           size={48}
         />
-        {/* Add notification badge here if needed */}
+        {/* Show unread count badge on conversation item - like WhatsApp */}
+        {(() => {
+          const conversationId = item.conversation_id || item.id;
+          const unreadCount = item.unread_count || conversationCounts[conversationId] || 0;
+          if (unreadCount > 0) {
+            return (
+              <View className="absolute -top-1 -right-1 min-w-[20] h-5 px-1.5 rounded-full bg-green-500 items-center justify-center">
+                <Text className="text-white text-xs font-bold">
+                  {unreadCount > 99 ? '99+' : unreadCount.toString()}
+                </Text>
+              </View>
+            );
+          }
+          return null;
+        })()}
       </View>
 
       {/* Content */}
       <View className="flex-1">
         <View className="flex-row justify-between items-center mb-1">
-          <Text
-            className={`font-semibold text-base ${
-              isDark ? 'text-white' : 'text-gray-900'
-            }`}
-          >
-            {item.name}
-          </Text>
+          <View className="flex-1 flex-row items-center">
+            <Text
+              className={`font-semibold text-base flex-1 ${
+                isDark ? 'text-white' : 'text-gray-900'
+              }`}
+              numberOfLines={1}
+            >
+              {item.name}
+            </Text>
+            {/* Show unread count on the right side - like WhatsApp */}
+            {(() => {
+              const conversationId = item.conversation_id || item.id;
+              const unreadCount = item.unread_count || conversationCounts[conversationId] || 0;
+              if (unreadCount > 0) {
+                return (
+                  <View className="ml-2 min-w-[20] h-5 px-1.5 rounded-full bg-green-500 items-center justify-center">
+                    <Text className="text-white text-xs font-bold">
+                      {unreadCount > 99 ? '99+' : unreadCount.toString()}
+                    </Text>
+                  </View>
+                );
+              }
+              return null;
+            })()}
+          </View>
           {item.last_message_date && (
             <Text
-              className={`text-xs ${
+              className={`text-xs ml-2 ${
                 isDark ? 'text-gray-400' : 'text-gray-500'
               }`}
             >

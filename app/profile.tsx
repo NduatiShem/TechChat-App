@@ -1,20 +1,19 @@
+import { AppConfig } from '@/config/app.config';
 import { useAuth } from '@/context/AuthContext';
 import { useTheme } from '@/context/ThemeContext';
-import { authAPI } from '@/services/api';
+import { secureStorage } from '@/utils/secureStore';
 import { MaterialCommunityIcons } from '@expo/vector-icons';
 import * as ImagePicker from 'expo-image-picker';
 import React, { useState } from 'react';
 import {
-    ActivityIndicator,
-    Alert,
-    Image,
-    ScrollView,
-    Text,
-    TouchableOpacity,
-    View
+  ActivityIndicator,
+  Alert,
+  Image, Platform, ScrollView,
+  Text,
+  TouchableOpacity,
+  View
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import DirectAvatarUpload from '../components/DirectAvatarUpload';
 
 export const options = {
   title: "Profile",
@@ -63,8 +62,55 @@ export default function ProfileScreen() {
 
   const handlePickAvatar = async () => {
     try {
-      // Launch image picker
-      const result = await ImagePicker.launchImageLibraryAsync({
+      // Request permission first
+      const permissionResult = await ImagePicker.requestMediaLibraryPermissionsAsync();
+      if (!permissionResult.granted) {
+        Alert.alert(
+          'Permission Required',
+          'Please grant access to your photo library to upload an avatar.',
+          [{ text: 'OK' }]
+        );
+        return;
+      }
+
+      // Show action sheet to choose source
+      Alert.alert(
+        'Change Avatar',
+        'Choose an option',
+        [
+          {
+            text: 'Camera',
+            onPress: async () => {
+              const cameraPermission = await ImagePicker.requestCameraPermissionsAsync();
+              if (!cameraPermission.granted) {
+                Alert.alert('Permission Required', 'Please grant camera access.');
+                return;
+              }
+              await handleImagePicker(ImagePicker.launchCameraAsync);
+            },
+          },
+          {
+            text: 'Photo Library',
+            onPress: async () => {
+              await handleImagePicker(ImagePicker.launchImageLibraryAsync);
+            },
+          },
+          {
+            text: 'Cancel',
+            style: 'cancel',
+          },
+        ],
+        { cancelable: true }
+      );
+    } catch (error: any) {
+      console.error('Avatar picker error:', error);
+      Alert.alert('Error', 'Failed to open image picker');
+    }
+  };
+
+  const handleImagePicker = async (pickerFunction: typeof ImagePicker.launchImageLibraryAsync) => {
+    try {
+      const result = await pickerFunction({
         mediaTypes: ImagePicker.MediaTypeOptions.Images,
         allowsEditing: true,
         aspect: [1, 1],
@@ -78,48 +124,115 @@ export default function ProfileScreen() {
       const asset = result.assets[0];
 
       // Check file size
-      if (asset.fileSize && asset.fileSize > 2 * 1024 * 1024) {
-        Alert.alert('Error', 'Image file size must be less than 2MB');
+      if (asset.fileSize && asset.fileSize > 5 * 1024 * 1024) {
+        Alert.alert('Error', 'Image file size must be less than 5MB');
         return;
       }
 
       setAvatarUploading(true);
 
-      // Create FormData - EXACTLY like working message attachments
+      // Get authentication token
+      const token = await secureStorage.getItem('auth_token');
+      if (!token) {
+        Alert.alert('Error', 'You must be logged in to upload an avatar');
+        setAvatarUploading(false);
+        return;
+      }
+
+      // Create FormData - same format as messages which work
       const formData = new FormData();
       
-      // Ensure we have a valid file name with extension
-      const fileName = asset.fileName || `avatar_${Date.now()}.jpg`;
-      
-      // Ensure we have a valid MIME type - CRITICAL for Laravel to recognize as file
-      const fileType = asset.type || 'image/jpeg';
-      
-      console.log('Creating FormData with:', {
-        uri: asset.uri,
-        name: fileName,
-        type: fileType
-      });
-      
-      // Add file with proper content-type - EXACTLY like working message attachments
+      // Same format as messages - they use: { uri, name, type }
       formData.append('avatar', {
         uri: asset.uri,
-        name: fileName,
-        type: fileType,
+        name: asset.fileName || `avatar_${Date.now()}.jpg`,
+        type: asset.type || 'image/jpeg',
       } as any);
+      
+      console.log('FormData created with:', {
+        uri: asset.uri.substring(0, 50) + '...',
+        name: asset.fileName || 'avatar.jpg',
+        type: asset.type || 'image/jpeg',
+      });
 
-      console.log('AVATAR: About to call uploadAvatar');
+      console.log('=== AVATAR UPLOAD START ===');
+      console.log('Token exists:', !!token);
+      console.log('FormData file:', {
+        uri: asset.uri.substring(0, 50) + '...',
+        name: asset.fileName || 'avatar.jpg',
+        type: asset.type || 'image/jpeg',
+        size: asset.fileSize
+      });
       
-      // Upload
-      const response = await authAPI.uploadAvatar(formData);
+      // FINAL APPROACH: Verify the endpoint route exists first
+      // Messages use: /messages - that works
+      // Avatar should use: /user/avatar - but maybe the route is different?
+      console.log('=== AVATAR UPLOAD DEBUG ===');
       
-      console.log('AVATAR: Upload completed successfully');
+      const { default: api } = await import('@/services/api');
+      const baseURL = api.defaults.baseURL;
+      console.log('API Base URL:', baseURL);
+      console.log('Attempting endpoint:', `${baseURL}/user/avatar`);
+      
+      // QUESTION: Is the backend route /api/user/avatar or /api/users/avatar?
+      // Check your backend routes/api.php file to confirm the exact route
+      
+      // Try with exact messages pattern - messages work, so copy exactly
+      console.log('Using axios with Content-Type header (same as messages)...');
+      
+      const response = await api.post('/user/avatar', formData, {
+        headers: {
+          'Content-Type': 'multipart/form-data',
+        },
+        timeout: 60000,
+      });
+      
+      console.log('Upload success:', response.data);
       
       Alert.alert('Success', 'Avatar updated successfully!');
       await refreshUser();
 
     } catch (error: any) {
-      console.error('Avatar upload error:', error);
-      const errorMessage = error.response?.data?.error || error.response?.data?.message || error.message || 'Failed to upload avatar';
+      console.error('=== AVATAR UPLOAD ERROR ===');
+      console.error('Error type:', error?.constructor?.name || typeof error);
+      console.error('Error message:', error?.message || String(error));
+      console.error('Error response:', error?.response?.data);
+      console.error('Error status:', error?.response?.status);
+      console.error('Error config:', error?.config);
+      console.error('Full error:', error);
+      
+      // Get baseUrl for error message
+      let baseUrlForError = '';
+      try {
+        let apiUrlForError: string;
+        if (__DEV__) {
+          if (Platform.OS === 'android') {
+            apiUrlForError = AppConfig.api.development.physical;
+          } else {
+            apiUrlForError = AppConfig.api.development.ios;
+          }
+        } else {
+          apiUrlForError = AppConfig.api.production;
+        }
+        baseUrlForError = apiUrlForError.replace('/api', '');
+      } catch {
+        baseUrlForError = 'unknown';
+      }
+      
+      let errorMessage = 'Failed to upload avatar.';
+      
+      if (error.message?.includes('Network request failed')) {
+        errorMessage = `Network Error: Cannot connect to server.\n\n` +
+          `Please verify:\n` +
+          `1. Your server is running\n` +
+          `2. Your device is on the same Wi-Fi network\n` +
+          `3. The IP address ${baseUrlForError || 'unknown'} is correct\n` +
+          `4. Your firewall allows connections\n\n` +
+          `Try opening ${baseUrlForError || 'the server URL'} in your device's browser.`;
+      } else {
+        errorMessage = error.message || errorMessage;
+      }
+      
       Alert.alert('Upload Failed', errorMessage);
     } finally {
       setAvatarUploading(false);
@@ -203,11 +316,6 @@ export default function ProfileScreen() {
           </View>
         </View>
       </View>
-
-        {/* Direct Avatar Upload Component */}
-        <View className="mx-4 mt-6 mb-6 bg-gray-100 dark:bg-gray-800 rounded-lg">
-          <DirectAvatarUpload onSuccess={refreshUser} />
-        </View>
 
         {/* Settings */}
       <View className="mx-4 mt-6">

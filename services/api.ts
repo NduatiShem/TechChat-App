@@ -215,17 +215,15 @@ export const authAPI = {
   registerFcmToken: (fcmToken: string) => api.post('/user/fcm-token', { fcm_token: fcmToken }),
   
   uploadAvatar: (formData: FormData) => {
-    console.log('DEBUG: Using EXACT same pattern as working message upload');
-    
-    // Use the EXACT same approach as sendMessage which is known to work
+    // Use EXACT same pattern as messagesAPI.sendMessage
+    // If data is FormData, send it directly with multipart headers
     return api.post('/user/avatar', formData, {
       headers: {
         'Content-Type': 'multipart/form-data',
       },
-      // Increase timeout for larger files
-      timeout: 60000,
     });
   },
+  
 };
 
 // Messages API

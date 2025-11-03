@@ -6,8 +6,9 @@ import VoicePlayer from '@/components/VoicePlayer';
 import VoiceRecorder from '@/components/VoiceRecorder';
 import { AppConfig } from '@/config/app.config';
 import { useAuth } from '@/context/AuthContext';
+import { useNotifications } from '@/context/NotificationContext';
 import { useTheme } from '@/context/ThemeContext';
-import { messagesAPI } from '@/services/api';
+import { messagesAPI, usersAPI } from '@/services/api';
 import { MaterialCommunityIcons, MaterialIcons } from '@expo/vector-icons';
 import { useFocusEffect } from '@react-navigation/native';
 import { Picker } from 'emoji-mart-native';
@@ -89,7 +90,10 @@ export default function GroupChatScreen() {
   const { id } = useLocalSearchParams();
   const { currentTheme } = useTheme();
   const { user, isAuthenticated, isLoading } = useAuth();
+  const { resetUnreadCount } = useNotifications();
   const insets = useSafeAreaInsets();
+  const ENABLE_MARK_AS_READ = false; // Temporarily disable until backend route is finalized
+  const ENABLE_DELETE_MESSAGE = true; // Enable delete - route exists
   // Remove the navigation effect - let the AppLayout handle authentication state changes
   const isDark = currentTheme === 'dark';
 
@@ -116,6 +120,7 @@ export default function GroupChatScreen() {
   const [hasMoreMessages, setHasMoreMessages] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [lastScrollTrigger, setLastScrollTrigger] = useState(0);
+  const [hasScrolledToBottom, setHasScrolledToBottom] = useState(false);
 
   // Fetch messages
   const fetchMessages = async () => {
@@ -136,12 +141,23 @@ export default function GroupChatScreen() {
       setMessages(sortedMessages);
       setGroupInfo(response.data.selectedConversation);
       
-      // Scroll to bottom after initial load
-      setTimeout(() => {
-        if (flatListRef.current && sortedMessages.length > 0) {
-          flatListRef.current.scrollToEnd({ animated: false });
+      // Mark messages as read when user opens group conversation
+      const groupId = Number(id);
+      if (ENABLE_MARK_AS_READ) {
+        try {
+          await messagesAPI.markAsRead(groupId, 'group');
+          // Reset unread count for this group - this will update badge
+          resetUnreadCount(groupId);
+        } catch (error: any) {
+          // Ignore validation (422) or missing route errors in v1.0.0
+          console.log('markAsRead disabled or failed:', error?.response?.status || error?.message || error);
         }
-      }, 200);
+      }
+      
+      // Reset scroll flag when loading new conversation
+      setHasScrolledToBottom(false);
+      
+      // Scroll will be handled by useEffect and onContentSizeChange after images render
     } catch (error) {
       console.error('Failed to fetch messages:', error);
       Alert.alert('Error', 'Failed to load messages');
@@ -150,29 +166,20 @@ export default function GroupChatScreen() {
     }
   };
 
-  // Auto-scroll to bottom (newest messages) when messages change
+  // Force scroll to bottom when component first loads (after images render)
   useEffect(() => {
-    if (flatListRef.current && messages.length > 0) {
-      // Simple scroll to bottom
-      setTimeout(() => {
-        if (flatListRef.current) {
-          flatListRef.current.scrollToEnd({ animated: true });
-        }
-      }, 100);
-    }
-  }, [messages]);
-
-  // Force scroll to bottom when component first loads
-  useEffect(() => {
-    if (flatListRef.current && messages.length > 0 && !loading) {
-      // Simple scroll to bottom when loading completes
-      setTimeout(() => {
+    if (flatListRef.current && messages.length > 0 && !loading && !hasScrolledToBottom) {
+      // Wait longer for images to load and render
+      const timeoutId = setTimeout(() => {
         if (flatListRef.current) {
           flatListRef.current.scrollToEnd({ animated: false });
+          setHasScrolledToBottom(true);
         }
-      }, 200);
+      }, 500); // Increased timeout to allow images to render
+      
+      return () => clearTimeout(timeoutId);
     }
-  }, [loading, messages.length]);
+  }, [loading, messages.length, hasScrolledToBottom]);
 
   // Load more messages function
   const loadMoreMessages = async () => {
@@ -237,9 +244,8 @@ export default function GroupChatScreen() {
   useFocusEffect(
     useCallback(() => {
       const onBackPress = () => {
-        // Clear navigation stack and go to groups tab
-        router.dismissAll();
-        router.push('/groups');
+        // Navigate directly to groups tab
+        router.replace('/groups');
         return true; // Prevent default back behavior
       };
 
@@ -309,25 +315,108 @@ export default function GroupChatScreen() {
       }
       
       const res = await messagesAPI.sendMessage(formData);
+      
+      // Update last_seen_at when user sends a message (activity indicator)
+      try {
+        await usersAPI.updateLastSeen();
+      } catch (error) {
+        // Silently fail - don't block message sending if last_seen update fails
+        console.warn('Failed to update last_seen_at:', error);
+      }
+      
+      // Prepare message text to preserve what was sent
+      let messageTextToPreserve = input.trim();
+      if (voiceRecording) {
+        messageTextToPreserve = input.trim() ? `${input.trim()} [VOICE_MESSAGE:${voiceRecording.duration}]` : `[VOICE_MESSAGE:${voiceRecording.duration}]`;
+      } else if (attachment && !input.trim()) {
+        // Add marker for attachment without text
+        messageTextToPreserve = attachment.type?.startsWith('image/') || attachment.isImage ? '[IMAGE]' : '[FILE]';
+      }
+      
+      // Ensure the message has sender_id set correctly from backend response
+      const newMessage = {
+        ...res.data,
+        message: res.data.message || messageTextToPreserve, // Preserve message text
+        sender_id: res.data.sender_id || Number(user?.id), // Ensure sender_id is set
+        group_id: res.data.group_id || Number(id), // Ensure group_id is set
+        sender: res.data.sender || {
+          id: Number(user?.id),
+          name: user?.name,
+          avatar_url: user?.avatar_url
+        }
+      };
+      
+      console.log('New message sent:', {
+        id: newMessage.id,
+        message: newMessage.message,
+        originalInput: input.trim(),
+        messageTextToPreserve: messageTextToPreserve,
+        resDataMessage: res.data?.message,
+        sender_id: newMessage.sender_id,
+        user_id: user?.id,
+        isMine: newMessage.sender_id === user?.id,
+        sender: newMessage.sender,
+        fullResData: res.data
+      });
+      
       setMessages(prev => {
         // Check if message already exists to prevent duplicates
-        const messageExists = prev.some(msg => msg.id === res.data.id);
+        const messageExists = prev.some(msg => msg.id === newMessage.id);
         if (messageExists) {
           return prev;
         }
-        return [...prev, res.data];
+        const updatedMessages = [...prev, newMessage];
+        
+        // Scroll to bottom after message is added to state
+        // Use requestAnimationFrame and setTimeout to ensure state update is reflected
+        requestAnimationFrame(() => {
+          setTimeout(() => {
+            if (flatListRef.current) {
+              try {
+                flatListRef.current.scrollToEnd({ animated: true });
+              } catch (error) {
+                // If scrollToEnd fails, try scrolling to the last item by index
+                console.warn('scrollToEnd failed, trying scrollToIndex:', error);
+                try {
+                  // Wait for layout to complete, then scroll to last index
+                  setTimeout(() => {
+                    if (flatListRef.current) {
+                      const lastIndex = updatedMessages.length - 1;
+                      flatListRef.current.scrollToIndex({ 
+                        index: lastIndex, 
+                        animated: true,
+                        viewPosition: 1 // 1 means bottom (0 = top, 1 = bottom)
+                      });
+                    }
+                  }, 100);
+                } catch (scrollError) {
+                  console.warn('scrollToIndex also failed:', scrollError);
+                }
+              }
+            }
+          }, (attachment || voiceRecording) ? 300 : 100);
+        });
+        
+        // Also scroll after content size changes (for images/files)
+        requestAnimationFrame(() => {
+          setTimeout(() => {
+            if (flatListRef.current) {
+              try {
+                flatListRef.current.scrollToEnd({ animated: true });
+              } catch (error) {
+                console.warn('Second scrollToEnd failed:', error);
+              }
+            }
+          }, (attachment || voiceRecording) ? 400 : 200);
+        });
+        
+        return updatedMessages;
       });
       setInput('');
       setAttachment(null);
       setVoiceRecording(null);
       setReplyingTo(null); // Clear reply state
       setShowEmoji(false);
-      // Scroll to bottom when new message is added
-      setTimeout(() => {
-        if (flatListRef.current) {
-          flatListRef.current.scrollToEnd({ animated: true });
-        }
-      }, 100);
     } catch (e) {
       console.error('Error sending message:', e);
       console.error('Error details:', {
@@ -449,6 +538,12 @@ export default function GroupChatScreen() {
 
   // Handle delete message
   const handleDeleteMessage = async (messageId: number) => {
+    if (!ENABLE_DELETE_MESSAGE) {
+      Alert.alert('Coming Soon', 'Message deletion will be available in a future update.');
+      setShowMessageOptions(null);
+      return;
+    }
+
     Alert.alert(
       'Delete Message',
       'Are you sure you want to delete this message?',
@@ -459,12 +554,40 @@ export default function GroupChatScreen() {
           style: 'destructive',
           onPress: async () => {
             try {
-              await messagesAPI.deleteMessage(messageId);
+              console.log('Deleting message ID:', messageId);
+              const response = await messagesAPI.deleteMessage(messageId);
+              console.log('Delete response:', response.data);
+              
+              // Remove message from local state
               setMessages(prev => prev.filter(msg => msg.id !== messageId));
               setShowMessageOptions(null);
-            } catch (error) {
+              
+              // Optionally refresh messages to get updated last_message
+              // You can add this if needed
+            } catch (error: any) {
               console.error('Error deleting message:', error);
-              Alert.alert('Error', 'Failed to delete message');
+              console.error('Error response:', error?.response?.data);
+              console.error('Error status:', error?.response?.status);
+              
+              // Handle different error types
+              if (error?.response?.status === 404) {
+                // Message not found - might have been deleted already
+                Alert.alert(
+                  'Message Not Found', 
+                  'This message may have already been deleted.',
+                  [{ text: 'OK', onPress: () => {
+                    // Remove from local state anyway
+                    setMessages(prev => prev.filter(msg => msg.id !== messageId));
+                    setShowMessageOptions(null);
+                  }}]
+                );
+              } else if (error?.response?.status === 403) {
+                // Forbidden - user doesn't own this message
+                Alert.alert('Permission Denied', 'You can only delete your own messages.');
+              } else {
+                Alert.alert('Error', 'Failed to delete message. Please try again.');
+              }
+              setShowMessageOptions(null);
             }
           }
         }
@@ -498,7 +621,10 @@ export default function GroupChatScreen() {
 
   // Render message bubble
   const renderItem = ({ item, index }: { item: Message; index: number }) => {
-    const isMine = item.sender_id === user?.id;
+    // Ensure sender_id and user.id are compared as numbers
+    const senderId = Number(item.sender_id);
+    const currentUserId = Number(user?.id);
+    const isMine = senderId === currentUserId && senderId !== 0;
     const previousMessage = index > 0 ? messages[index - 1] : null;
     const showDateSeparator = shouldShowDateSeparator(item, previousMessage);
     
@@ -512,9 +638,10 @@ export default function GroupChatScreen() {
     // Helper function to clean message text by removing markers
     const cleanMessageText = (text: string | null | undefined): string | null => {
       if (!text) return null;
-      // Remove [IMAGE] and [FILE] markers at the end
+      // Remove [IMAGE] and [FILE] markers at the end, but preserve other text
       let cleaned = text.replace(/\s*\[IMAGE\]$/g, '').replace(/\s*\[FILE\]$/g, '').trim();
-      return cleaned || null;
+      // If after cleaning we have content, return it; otherwise return original if it had content
+      return cleaned || (text.trim() ? text.trim() : null);
     };
     
     // Check for voice message format first (even without attachments)
@@ -566,12 +693,40 @@ export default function GroupChatScreen() {
           messageText = cleanMessageText(item.message);
         }
       } else {
-        // For image/file attachments, clean the message text
-        messageText = cleanMessageText(item.message);
+        // For image/file attachments, check if message is ONLY [IMAGE] or [FILE]
+        // If so, don't display any text - only show the attachment
+        if (item.message) {
+          const trimmedMessage = item.message.trim();
+          // If message is ONLY [IMAGE] or [FILE] (no other text), don't display it
+          if (trimmedMessage === '[IMAGE]' || trimmedMessage === '[FILE]') {
+            messageText = null; // Don't show the marker as text
+          } else {
+            // If message has text before the marker, remove the marker and show the text
+            messageText = cleanMessageText(item.message);
+          }
+        } else {
+          messageText = null;
+        }
       }
     } else {
-      // Regular text message - clean any markers that might be present
-      messageText = cleanMessageText(item.message);
+      // Regular text message with no attachments - show the message text directly
+      // Only clean [IMAGE] and [FILE] markers if they're at the end
+      if (item.message) {
+        let text = item.message.trim();
+        // Remove [IMAGE] and [FILE] markers only if they're standalone at the end
+        if (text === '[IMAGE]' || text === '[FILE]') {
+          // Don't show anything if it's just a marker with no other content
+          messageText = null;
+        } else if (text.endsWith('[IMAGE]') || text.endsWith('[FILE]')) {
+          // Remove marker but keep the text before it
+          messageText = text.replace(/\s*\[IMAGE\]$/g, '').replace(/\s*\[FILE\]$/g, '').trim();
+        } else {
+          // Show the full message text
+          messageText = text;
+        }
+      } else {
+        messageText = null;
+      }
     }
 
     // If it's a voice message, render the dedicated voice bubble
@@ -930,23 +1085,53 @@ export default function GroupChatScreen() {
           
           {/* Message content and timestamp in a flex container */}
           <View style={{ width: '100%' }}>
-            {messageText && !isVoiceMessage && (
-              <Text 
-                style={{ 
-                  color: isMine ? '#fff' : (isDark ? '#fff' : '#111827'),
-                  fontSize: 16,
-                  lineHeight: 20,
-                  textAlign: 'left',
-                  flexWrap: 'wrap',
-                  flexShrink: 0, // Don't shrink text unnecessarily
-                  flexGrow: 1,   // Allow text to grow
-                  width: 'auto', // Allow text to take its natural width
-                  marginRight: messageText.length > 30 ? 0 : 40, // Only add margin for short messages
-                  wordBreak: 'break-word', // Prevent words from breaking unnecessarily
-                }}
-              >
-                {messageText}
-              </Text>
+            {/* Display message text - NEVER show [IMAGE] or [FILE] markers as text */}
+            {!isVoiceMessage && (
+              messageText && messageText.trim() ? (
+                <Text 
+                  style={{ 
+                    color: isMine ? '#fff' : (isDark ? '#fff' : '#111827'),
+                    fontSize: 16,
+                    lineHeight: 20,
+                    textAlign: 'left',
+                    flexWrap: 'wrap',
+                    flexShrink: 0, // Don't shrink text unnecessarily
+                    flexGrow: 1,   // Allow text to grow
+                    width: 'auto', // Allow text to take its natural width
+                    marginRight: messageText.length > 30 ? 0 : 40, // Only add margin for short messages
+                    wordBreak: 'break-word', // Prevent words from breaking unnecessarily
+                  }}
+                >
+                  {messageText}
+                </Text>
+              ) : (!item.attachments || item.attachments.length === 0) && item.message ? (
+                // If message exists but messageText is null, show original message
+                // BUT filter out [IMAGE] and [FILE] markers
+                (() => {
+                  const rawMessage = item.message.trim();
+                  // Don't show if message is ONLY a marker
+                  if (rawMessage === '[IMAGE]' || rawMessage === '[FILE]') {
+                    return null;
+                  }
+                  // Remove markers and show remaining text
+                  const cleaned = rawMessage.replace(/\s*\[IMAGE\]$/g, '').replace(/\s*\[FILE\]$/g, '').trim();
+                  if (cleaned) {
+                    return (
+                      <Text 
+                        style={{ 
+                          color: isMine ? '#fff' : (isDark ? '#fff' : '#111827'),
+                          fontSize: 16,
+                          lineHeight: 20,
+                          textAlign: 'left',
+                        }}
+                      >
+                        {cleaned}
+                      </Text>
+                    );
+                  }
+                  return null;
+                })()
+              ) : null
             )}
             
             {/* Timestamp for text messages */}
@@ -1033,45 +1218,44 @@ export default function GroupChatScreen() {
   }, [id]);
 
   // Format message date for separators
-  const formatMessageDate = (dateString: string) => {
-    try {
-      // Handle invalid or empty date strings
-      if (!dateString || dateString === 'Invalid Date' || dateString === 'null' || dateString === 'undefined') {
-        return 'Today';
-      }
-      
-      const messageDate = new Date(dateString);
-      
-      // Check if the date is valid
-      if (isNaN(messageDate.getTime())) {
-        console.warn('Invalid date string:', dateString);
-        return 'Today';
-      }
-      
-      const today = new Date();
-      const yesterday = new Date(today);
-      yesterday.setDate(yesterday.getDate() - 1);
-      
-      // Reset time to compare only dates
-      const messageDateOnly = new Date(messageDate.getFullYear(), messageDate.getMonth(), messageDate.getDate());
-      const todayOnly = new Date(today.getFullYear(), today.getMonth(), today.getDate());
-      const yesterdayOnly = new Date(yesterday.getFullYear(), yesterday.getMonth(), yesterday.getDate());
-      
-      if (messageDateOnly.getTime() === todayOnly.getTime()) {
-        return 'Today';
-      } else if (messageDateOnly.getTime() === yesterdayOnly.getTime()) {
-        return 'Yesterday';
-      } else {
+  const formatMessageDate = (dateString: string | null | undefined) => {
+    // Validate date string
+    if (!dateString) return 'Today';
+    
+    const messageDate = new Date(dateString);
+    
+    // Check if date is invalid
+    if (isNaN(messageDate.getTime())) {
+      console.warn('Invalid date string for formatMessageDate:', dateString);
+      return 'Today'; // Default to "Today" for invalid dates
+    }
+    
+    const today = new Date();
+    const yesterday = new Date(today);
+    yesterday.setDate(yesterday.getDate() - 1);
+    
+    // Reset time to compare only dates
+    const messageDateOnly = new Date(messageDate.getFullYear(), messageDate.getMonth(), messageDate.getDate());
+    const todayOnly = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+    const yesterdayOnly = new Date(yesterday.getFullYear(), yesterday.getMonth(), yesterday.getDate());
+    
+    if (messageDateOnly.getTime() === todayOnly.getTime()) {
+      return 'Today';
+    } else if (messageDateOnly.getTime() === yesterdayOnly.getTime()) {
+      return 'Yesterday';
+    } else {
+      // Ensure date is valid before formatting
+      try {
         return messageDate.toLocaleDateString('en-US', { 
           weekday: 'long', 
           year: 'numeric', 
           month: 'long', 
           day: 'numeric' 
         });
+      } catch (error) {
+        console.warn('Error formatting date:', error, dateString);
+        return 'Today'; // Default fallback
       }
-    } catch (error) {
-      console.error('Error formatting message date:', error, 'Date string:', dateString);
-      return 'Today';
     }
   };
 
@@ -1116,8 +1300,22 @@ export default function GroupChatScreen() {
   const shouldShowDateSeparator = (currentMessage: any, previousMessage: any) => {
     if (!previousMessage) return true;
     
+    // Validate dates before parsing
+    if (!currentMessage?.created_at || !previousMessage?.created_at) {
+      return false; // Don't show separator if dates are invalid
+    }
+    
     const currentDate = new Date(currentMessage.created_at);
     const previousDate = new Date(previousMessage.created_at);
+    
+    // Check if dates are valid
+    if (isNaN(currentDate.getTime()) || isNaN(previousDate.getTime())) {
+      console.warn('Invalid date in shouldShowDateSeparator:', {
+        current: currentMessage.created_at,
+        previous: previousMessage.created_at
+      });
+      return false; // Don't show separator for invalid dates
+    }
     
     // Compare only dates (not time)
     const currentDateOnly = new Date(currentDate.getFullYear(), currentDate.getMonth(), currentDate.getDate());
@@ -1140,9 +1338,8 @@ export default function GroupChatScreen() {
         {/* Main Header */}
         <View className="flex-row items-center p-4 pt-12">
           <TouchableOpacity onPress={() => {
-            // Clear navigation stack and go to groups tab
-            router.dismissAll();
-            router.push('/groups');
+            // Navigate directly to groups tab
+            router.replace('/groups');
           }} className="mr-3">
             <MaterialCommunityIcons name="arrow-left" size={24} color={isDark ? '#fff' : '#000'} />
           </TouchableOpacity>
@@ -1303,14 +1500,36 @@ export default function GroupChatScreen() {
                   </View>
                 ) : null
               }
-              onContentSizeChange={() => {
+              onContentSizeChange={(contentWidth, contentHeight) => {
                 if (flatListRef.current && messages.length > 0) {
-                  flatListRef.current.scrollToEnd({ animated: true });
+                  // On initial load, always scroll to bottom
+                  // For subsequent changes, scroll if:
+                  // 1. Not loading more (new messages added to bottom)
+                  // 2. Or initial load hasn't scrolled yet
+                  if (!loadingMore || !hasScrolledToBottom) {
+                    // Use requestAnimationFrame to ensure layout is complete
+                    requestAnimationFrame(() => {
+                      setTimeout(() => {
+                        if (flatListRef.current) {
+                          flatListRef.current.scrollToEnd({ animated: hasScrolledToBottom });
+                          if (!hasScrolledToBottom) {
+                            setHasScrolledToBottom(true);
+                          }
+                        }
+                      }, 100);
+                    });
+                  }
                 }
               }}
               onLayout={() => {
-                if (flatListRef.current && messages.length > 0) {
-                  flatListRef.current.scrollToEnd({ animated: true });
+                if (flatListRef.current && messages.length > 0 && !hasScrolledToBottom && !loading) {
+                  // Wait for images to render before scrolling
+                  setTimeout(() => {
+                    if (flatListRef.current) {
+                      flatListRef.current.scrollToEnd({ animated: false });
+                      setHasScrolledToBottom(true);
+                    }
+                  }, 300);
                 }
               }}
             />

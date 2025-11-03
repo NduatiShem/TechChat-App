@@ -1,126 +1,133 @@
+/**
+ * Network Connectivity Test Component
+ * Use this to verify your device can reach the backend server
+ */
+import { secureStorage } from '@/utils/secureStore';
 import { AppConfig } from '@/config/app.config';
-import { useTheme } from '@/context/ThemeContext';
-import { Device } from 'expo-device';
-import React, { useState } from 'react';
-import { Alert, Platform, Text, TouchableOpacity, View } from 'react-native';
+import { Platform } from 'react-native';
+import { useState } from 'react';
+import { Alert, Text, TouchableOpacity, View, ActivityIndicator } from 'react-native';
 
-export default function NetworkTest() {
-  const { currentTheme } = useTheme();
-  const [isLoading, setIsLoading] = useState(false);
-  const isDark = currentTheme === 'dark';
+export const NetworkTest = () => {
+  const [testing, setTesting] = useState(false);
+  const [results, setResults] = useState<string>('');
 
-  const testNetworkConnection = async () => {
-    setIsLoading(true);
-    
-    // Use different URLs based on device type
-    let testUrl;
-    if (Device && Device.isDevice) {
-      // Physical device - use the physical IP
-      testUrl = AppConfig.api.development.physical.replace('/api', '/api/test');
-    } else {
-      // Simulator/Emulator - use platform-specific URLs
-      if (Platform.OS === 'ios') {
-        testUrl = AppConfig.api.development.ios.replace('/api', '/api/test');
-      } else {
-        testUrl = AppConfig.api.development.android.replace('/api', '/api/test');
-      }
-    }
-    
+  const testNetwork = async () => {
+    setTesting(true);
+    setResults('Testing...\n');
+
     try {
-      // Test basic connectivity
-      const response = await fetch(testUrl, {
-        method: 'GET',
-        headers: {
-          'Content-Type': 'application/json',
-          'Accept': 'application/json',
-        },
-        timeout: 10000,
-      });
-      
-      if (response.ok) {
-        const data = await response.json();
-        Alert.alert('✅ Success', `Network connection working!\n\nResponse: ${JSON.stringify(data, null, 2)}`);
+      // Get API URL
+      let apiUrl: string;
+      if (__DEV__) {
+        if (Platform.OS === 'android') {
+          apiUrl = AppConfig.api.development.physical;
+        } else {
+          apiUrl = AppConfig.api.development.ios;
+        }
       } else {
-        Alert.alert('❌ Error', `HTTP ${response.status}: ${response.statusText}`);
+        apiUrl = AppConfig.api.production;
       }
-    } catch (error) {
-      console.error('Network test error:', error);
-      Alert.alert('❌ Network Error', `Failed to connect: ${error.message}`);
-    } finally {
-      setIsLoading(false);
-    }
-  };
 
-  const testLoginEndpoint = async () => {
-    setIsLoading(true);
-    
-    // Use different URLs based on platform
-    const loginUrl = Platform.OS === 'ios' 
-      ? AppConfig.api.development.ios.replace('/api', '/api/auth/login')  // iOS Simulator
-      : AppConfig.api.development.physical.replace('/api', '/api/auth/login');  // Physical devices (Android/iOS)
-    
-    try {
-      const response = await fetch(loginUrl, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Accept': 'application/json',
-        },
-        body: JSON.stringify({
-          email: 'super.admin@healthclassique.com',
-          password: 'Nairobi@123'
-        }),
-        timeout: 10000,
-      });
-      
-      if (response.ok) {
-        const data = await response.json();
-        Alert.alert('✅ Login Test Success', `Login endpoint working!\n\nResponse: ${JSON.stringify(data, null, 2)}`);
-      } else {
-        const errorData = await response.text();
-        Alert.alert('❌ Login Error', `HTTP ${response.status}: ${response.statusText}\n\nResponse: ${errorData}`);
+      const baseUrl = apiUrl.replace('/api', '');
+      const testUrl = `${baseUrl}/api/conversations`;
+
+      let log = `Testing: ${testUrl}\n`;
+      log += `Platform: ${Platform.OS}\n\n`;
+      setResults(log);
+
+      // Get token
+      const token = await secureStorage.getItem('auth_token');
+      log += `Token: ${token ? 'Found (' + token.length + ' chars)' : 'NOT FOUND'}\n\n`;
+      setResults(log);
+
+      // Test 1: Basic connectivity
+      log += 'TEST 1: Basic Connectivity...\n';
+      setResults(log);
+      try {
+        const response = await fetch(testUrl, {
+          method: 'GET',
+          headers: {
+            'Authorization': `Bearer ${token || ''}`,
+            'Accept': 'application/json',
+          },
+          timeout: 5000,
+        } as any);
+        log += `✓ Server reachable! Status: ${response.status}\n\n`;
+        setResults(log);
+      } catch (e: any) {
+        log += `✗ FAILED: ${e.message}\n\n`;
+        setResults(log);
+        throw e;
       }
-    } catch (error) {
-      console.error('Login test error:', error);
-      Alert.alert('❌ Login Network Error', `Failed to connect: ${error.message}`);
+
+      // Test 2: Try avatar endpoint (OPTIONS)
+      const avatarUrl = `${baseUrl}/api/user/avatar`;
+      log += `TEST 2: Avatar Endpoint (${avatarUrl})...\n`;
+      setResults(log);
+      try {
+        const response = await fetch(avatarUrl, {
+          method: 'OPTIONS',
+          headers: {
+            'Authorization': `Bearer ${token || ''}`,
+            'Accept': 'application/json',
+          },
+        });
+        log += `✓ Endpoint exists! Status: ${response.status}\n\n`;
+        setResults(log);
+      } catch (e: any) {
+        log += `⚠ Warning: ${e.message}\n\n`;
+        setResults(log);
+      }
+
+      // Test 3: Direct IP ping (if possible)
+      log += 'TEST 3: URL Analysis...\n';
+      try {
+        const urlObj = new URL(testUrl);
+        log += `Host: ${urlObj.host}\n`;
+        log += `Protocol: ${urlObj.protocol}\n`;
+        log += `Port: ${urlObj.port || 'default'}\n`;
+        log += `Path: ${urlObj.pathname}\n`;
+      } catch (e) {
+        log += `Could not parse URL\n`;
+      }
+
+      Alert.alert('Network Test Complete', 'Check results below');
+    } catch (error: any) {
+      const errorMsg = `Network test failed:\n${error.message}`;
+      setResults(prev => prev + `\n✗ ${errorMsg}`);
+      Alert.alert('Test Failed', errorMsg);
     } finally {
-      setIsLoading(false);
+      setTesting(false);
     }
   };
 
   return (
-    <View className={`p-4 ${isDark ? 'bg-gray-800' : 'bg-gray-100'} rounded-lg mb-4`}>
-      <Text className={`text-lg font-semibold mb-4 ${isDark ? 'text-white' : 'text-black'}`}>
-        Network Connectivity Test
-      </Text>
-      
-      <Text className={`text-sm mb-4 ${isDark ? 'text-gray-300' : 'text-gray-600'}`}>
-        Testing connection to: {Platform.OS === 'ios' ? AppConfig.api.development.ios : AppConfig.api.development.physical}
-      </Text>
-      
+    <View style={{ padding: 20, backgroundColor: '#f5f5f5', margin: 10, borderRadius: 8 }}>
       <TouchableOpacity
-        onPress={testNetworkConnection}
-        disabled={isLoading}
-        className={`p-3 rounded-lg mb-2 ${
-          isLoading ? 'bg-gray-400' : 'bg-green-500'
-        }`}
+        onPress={testNetwork}
+        disabled={testing}
+        style={{
+          backgroundColor: '#007AFF',
+          padding: 15,
+          borderRadius: 8,
+          marginBottom: 10,
+        }}
       >
-        <Text className="text-white text-center font-semibold">
-          {isLoading ? 'Testing...' : 'Test Basic Connection'}
-        </Text>
+        {testing ? (
+          <ActivityIndicator color="white" />
+        ) : (
+          <Text style={{ color: 'white', textAlign: 'center', fontWeight: 'bold' }}>
+            Test Network Connectivity
+          </Text>
+        )}
       </TouchableOpacity>
-      
-      <TouchableOpacity
-        onPress={testLoginEndpoint}
-        disabled={isLoading}
-        className={`p-3 rounded-lg ${
-          isLoading ? 'bg-gray-400' : 'bg-blue-500'
-        }`}
-      >
-        <Text className="text-white text-center font-semibold">
-          {isLoading ? 'Testing...' : 'Test Login Endpoint'}
-        </Text>
-      </TouchableOpacity>
+
+      {results ? (
+        <View style={{ backgroundColor: 'white', padding: 10, borderRadius: 8, marginTop: 10 }}>
+          <Text style={{ fontFamily: 'monospace', fontSize: 12 }}>{results}</Text>
+        </View>
+      ) : null}
     </View>
   );
-}
+};

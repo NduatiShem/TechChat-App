@@ -33,7 +33,7 @@ export const NotificationBadge: React.FC<NotificationBadgeProps> = ({
 
   return (
     <View
-      className={`${sizeClasses[size]} rounded-full bg-red-500 items-center justify-center absolute -top-1 -right-1`}
+      className={`${sizeClasses[size]} rounded-full bg-green-500 items-center justify-center absolute -top-1 -right-1`}
     >
       <Text className={`${textSizes[size]} text-white font-bold`}>
         {count > 99 ? '99+' : count.toString()}

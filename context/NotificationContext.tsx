@@ -221,16 +221,23 @@ export const NotificationProvider: React.FC<NotificationProviderProps> = ({ chil
       console.log('Notification received:', notification);
       console.log('Current app state:', appState);
       
-      // Update badge when notification is received
-      await badgeService.handleNotificationReceived(notification);
-      
       // Check if this is a new message notification
       const data = notification.request.content.data;
       if (data?.type === 'new_message') {
         // Update unread count for the conversation
         const conversationId = data.conversation_id || data.conversationId;
         if (conversationId) {
-          updateUnreadCount(conversationId, (conversationCounts[conversationId] || 0) + 1);
+          // Increment unread count
+          const newCount = (conversationCounts[conversationId] || 0) + 1;
+          updateUnreadCount(conversationId, newCount);
+          
+          // Update badge count - use total unread count
+          const totalUnread = Object.values({ ...conversationCounts, [conversationId]: newCount })
+            .reduce((sum, count) => sum + count, 0);
+          await badgeService.setBadgeCount(totalUnread);
+        } else {
+          // If no conversation ID, increment badge anyway
+          await badgeService.incrementBadge();
         }
         
         // Always show notification, regardless of app state
@@ -255,8 +262,9 @@ export const NotificationProvider: React.FC<NotificationProviderProps> = ({ chil
         // You can add navigation logic here
         console.log('Navigate to conversation:', conversationId);
       }
-      // Clear badge when user taps notification
-      await badgeService.handleNotificationResponse(response);
+      // DON'T clear badge immediately when user taps notification
+      // Badge will be cleared when user actually reads the messages (via markAsRead)
+      // This allows the badge to persist if user taps notification but doesn't read messages
     });
 
     return () => {
