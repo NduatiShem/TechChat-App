@@ -10,7 +10,7 @@
     "splash": {
       "image": "./assets/splash_screens/icon.png",
       "resizeMode": "contain",
-      "backgroundColor": "#283891"
+      "backgroundColor": "#FFFFFF"
     },
     "assetBundlePatterns": [
       "**/*"
@@ -34,7 +34,8 @@
         "RECEIVE_BOOT_COMPLETED",
         "VIBRATE",
         "WAKE_LOCK"
-      ]
+      ],
+      "softwareKeyboardLayoutMode": "adjustResize"
     },
     "web": {
       "favicon": "./assets/icons/Icon-48.png"
@@ -43,6 +44,7 @@
     "plugins": [
       "expo-router",
       "expo-dev-client",
+      "./plugins/withAndroidKeyboard.js",
       [
         "expo-notifications",
         {
@@ -64,9 +66,9 @@
     "extra": {
       "router": {},
       "eas": {
-        "projectId": "da2b4840-030b-49e4-b16d-21748aec572c"
+        "projectId": "ff808b2d-601c-4c49-9969-b884cfb8b1e7"
       }
     },
-    "owner": "shemnduati"
+    "owner": "shemnd"
   }
 }

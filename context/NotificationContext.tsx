@@ -127,12 +127,32 @@ export const NotificationProvider: React.FC<NotificationProviderProps> = ({ chil
         return null;
       }
 
-      // Get Expo push token
-      const token = await Notifications.getExpoPushTokenAsync({
-        projectId: projectId,
-      });
+      // Get Expo push token with error handling for Firebase/FCM
+      let token;
+      try {
+        token = await Notifications.getExpoPushTokenAsync({
+          projectId: projectId,
+        });
+      } catch (error: any) {
+        // Handle Firebase/FCM initialization errors gracefully
+        const errorMessage = error?.message || String(error);
+        if (errorMessage.includes('FirebaseApp') || 
+            errorMessage.includes('FCM') || 
+            errorMessage.includes('Firebase')) {
+          console.warn('⚠️ Firebase/FCM not configured. Push notifications may not work.');
+          console.warn('💡 To enable push notifications:');
+          console.warn('   1. Follow: https://docs.expo.dev/push-notifications/fcm-credentials/');
+          console.warn('   2. Upload google-services.json to Expo using: eas credentials');
+          console.warn('   3. Rebuild the app');
+          // Don't crash the app - just return null
+          return null;
+        }
+        // Log other errors but don't crash
+        console.error('Error getting Expo push token:', error);
+        return null;
+      }
       
-      if (token.data) {
+      if (token?.data) {
         console.log('Expo Push Token:', token.data);
         setExpoPushToken(token.data);
         
@@ -205,8 +225,11 @@ export const NotificationProvider: React.FC<NotificationProviderProps> = ({ chil
   };
 
   useEffect(() => {
-    // Get Expo push token on app start
-    getExpoPushToken();
+    // Get Expo push token on app start - wrap in try-catch to prevent crashes
+    getExpoPushToken().catch(error => {
+      console.error('Error getting Expo push token on mount:', error);
+      // Don't crash if push token fails
+    });
 
     // Track app state changes
     const handleAppStateChange = (nextAppState: string) => {
@@ -218,53 +241,73 @@ export const NotificationProvider: React.FC<NotificationProviderProps> = ({ chil
 
     // Listen for notification interactions
     const notificationListener = Notifications.addNotificationReceivedListener(async notification => {
-      console.log('Notification received:', notification);
-      console.log('Current app state:', appState);
-      
-      // Check if this is a new message notification
-      const data = notification.request.content.data;
-      if (data?.type === 'new_message') {
-        // Update unread count for the conversation
-        const conversationId = data.conversation_id || data.conversationId;
-        if (conversationId) {
-          // Increment unread count
-          const newCount = (conversationCounts[conversationId] || 0) + 1;
-          updateUnreadCount(conversationId, newCount);
+      try {
+        console.log('Notification received:', notification);
+        console.log('Current app state:', appState);
+        
+        // Check if this is a new message notification
+        const data = notification.request.content.data;
+        if (data?.type === 'new_message') {
+          // Update unread count for the conversation
+          const conversationId = data.conversation_id || data.conversationId;
+          if (conversationId) {
+            try {
+              // Increment unread count
+              const newCount = (conversationCounts[conversationId] || 0) + 1;
+              updateUnreadCount(conversationId, newCount);
+              
+              // Update badge count - use total unread count
+              const totalUnread = Object.values({ ...conversationCounts, [conversationId]: newCount })
+                .reduce((sum, count) => sum + count, 0);
+              await badgeService.setBadgeCount(totalUnread);
+            } catch (badgeError) {
+              console.error('Error updating badge:', badgeError);
+            }
+          } else {
+            try {
+              // If no conversation ID, increment badge anyway
+              await badgeService.incrementBadge();
+            } catch (badgeError) {
+              console.error('Error incrementing badge:', badgeError);
+            }
+          }
           
-          // Update badge count - use total unread count
-          const totalUnread = Object.values({ ...conversationCounts, [conversationId]: newCount })
-            .reduce((sum, count) => sum + count, 0);
-          await badgeService.setBadgeCount(totalUnread);
-        } else {
-          // If no conversation ID, increment badge anyway
-          await badgeService.incrementBadge();
+          // Always show notification, regardless of app state
+          // This ensures users see notifications even when the app is open
+          const title = data.sender_name || 'New Message';
+          const body = notification.request.content.body || 'You have a new message';
+          
+          console.log('Showing notification for new message:', { title, body, appState });
+          
+          // Small delay to ensure the notification shows
+          setTimeout(() => {
+            showForegroundNotification(title, body, data).catch(err => {
+              console.error('Error showing foreground notification:', err);
+            });
+          }, 100);
         }
-        
-        // Always show notification, regardless of app state
-        // This ensures users see notifications even when the app is open
-        const title = data.sender_name || 'New Message';
-        const body = notification.request.content.body || 'You have a new message';
-        
-        console.log('Showing notification for new message:', { title, body, appState });
-        
-        // Small delay to ensure the notification shows
-        setTimeout(() => {
-          showForegroundNotification(title, body, data);
-        }, 100);
+      } catch (error) {
+        console.error('Error in notification listener:', error);
+        // Don't let notification errors crash the app
       }
     });
 
     const responseListener = Notifications.addNotificationResponseReceivedListener(async response => {
-      console.log('Notification response:', response);
-      // Handle notification tap - navigate to conversation
-      const conversationId = response.notification.request.content.data?.conversationId;
-      if (conversationId) {
-        // You can add navigation logic here
-        console.log('Navigate to conversation:', conversationId);
+      try {
+        console.log('Notification response:', response);
+        // Handle notification tap - navigate to conversation
+        const conversationId = response.notification.request.content.data?.conversationId;
+        if (conversationId) {
+          // You can add navigation logic here
+          console.log('Navigate to conversation:', conversationId);
+        }
+        // DON'T clear badge immediately when user taps notification
+        // Badge will be cleared when user actually reads the messages (via markAsRead)
+        // This allows the badge to persist if user taps notification but doesn't read messages
+      } catch (error) {
+        console.error('Error in notification response listener:', error);
+        // Don't let notification response errors crash the app
       }
-      // DON'T clear badge immediately when user taps notification
-      // Badge will be cleared when user actually reads the messages (via markAsRead)
-      // This allows the badge to persist if user taps notification but doesn't read messages
     });
 
     return () => {

@@ -1,22 +1,32 @@
 {
   "cli": {
-    "version": ">= 12.0.0"
+    "version": ">= 12.0.0",
+    "appVersionSource": "remote"
   },
   "build": {
     "development": {
       "developmentClient": true,
       "distribution": "internal",
+      "android": {
+        "buildType": "apk"
+      },
       "ios": {
         "resourceClass": "m-medium"
       }
     },
     "preview": {
       "distribution": "internal",
+      "android": {
+        "buildType": "apk"
+      },
       "ios": {
         "resourceClass": "m-medium"
       }
     },
     "production": {
+      "android": {
+        "buildType": "apk"
+      },
       "ios": {
         "resourceClass": "m-medium"
       }
@@ -25,4 +35,4 @@
   "submit": {
     "production": {}
   }
-} 
+}

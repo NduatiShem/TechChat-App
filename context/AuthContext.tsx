@@ -43,17 +43,36 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       const token = await secureStorage.getItem('auth_token');
       console.log('AuthContext: Checking auth, token exists:', !!token);
       if (token) {
-        const response = await authAPI.getProfile();
-        console.log('AuthContext: Profile response:', response.data);
-        setUser(response.data.data);
-        console.log('AuthContext: User set successfully');
+        try {
+          const response = await authAPI.getProfile();
+          console.log('AuthContext: Profile response:', response.data);
+          // Handle different response structures safely
+          const userData = response.data?.data || response.data?.user || response.data;
+          if (userData) {
+            setUser(userData);
+            console.log('AuthContext: User set successfully');
+          } else {
+            console.warn('AuthContext: No user data in response');
+            await secureStorage.deleteItem('auth_token');
+          }
+        } catch (profileError: any) {
+          // If profile fetch fails (401, network error, etc.), clear token
+          console.error('AuthContext: Profile fetch failed:', profileError?.message || profileError);
+          await secureStorage.deleteItem('auth_token');
+          setUser(null);
+        }
       } else {
         console.log('AuthContext: No token found, user not authenticated');
       }
-    } catch (error) {
-      console.error('Auth check failed:', error);
+    } catch (error: any) {
+      console.error('AuthContext: Auth check failed:', error?.message || error);
       // Safely delete the token with error handling
-      await secureStorage.deleteItem('auth_token');
+      try {
+        await secureStorage.deleteItem('auth_token');
+      } catch (deleteError) {
+        console.error('AuthContext: Failed to delete token:', deleteError);
+      }
+      setUser(null);
     } finally {
       setIsLoading(false);
     }

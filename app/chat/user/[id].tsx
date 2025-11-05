@@ -16,7 +16,7 @@ import * as DocumentPicker from 'expo-document-picker';
 import * as ImagePicker from 'expo-image-picker';
 import { router, useLocalSearchParams } from 'expo-router';
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { ActivityIndicator, Alert, BackHandler, FlatList, Image, Keyboard, Modal, Platform, StatusBar, Text, TextInput, TouchableOpacity, View } from 'react-native';
+import { ActivityIndicator, Alert, BackHandler, FlatList, Image, InteractionManager, Keyboard, Modal, Platform, StatusBar, Text, TextInput, TouchableOpacity, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 export const options = ({ params }) => ({
@@ -82,6 +82,7 @@ export default function UserChatScreen() {
     let isMounted = true;
     const fetchMessages = async () => {
       setLoading(true);
+      setHasScrolledToBottom(false); // Reset scroll flag when fetching new messages
       try {
         const res = await messagesAPI.getByUser(id, 1, 10);
         
@@ -105,12 +106,80 @@ export default function UserChatScreen() {
         
         setHasMoreMessages(hasMore);
         
+        // Debug: Log messages with reply_to_id to check backend response
+        const messagesWithReply = messagesData.filter((msg: any) => msg.reply_to_id);
+        if (messagesWithReply.length > 0) {
+          console.log('Messages with reply_to_id:', messagesWithReply.map((msg: any) => ({
+            id: msg.id,
+            message: msg.message,
+            reply_to_id: msg.reply_to_id,
+            has_reply_to_object: !!msg.reply_to,
+            reply_to: msg.reply_to
+          })));
+        }
+        
+        // Process messages to ensure reply_to data is properly structured
+        // If a message has reply_to_id but no reply_to object, we need to find the original message
+        const processedMessages = messagesData.map((msg: any) => {
+          // If message already has reply_to object, use it (backend loaded it correctly)
+          if (msg.reply_to) {
+            console.log('Message has reply_to from backend:', msg.id, msg.reply_to);
+            return msg;
+          }
+          
+          // If message has reply_to_id but no reply_to object, try to find it in the messages list
+          if (msg.reply_to_id) {
+            console.log('Message has reply_to_id but no reply_to object, searching in messages list:', msg.id, msg.reply_to_id);
+            const repliedMessage = messagesData.find((m: any) => m.id === msg.reply_to_id);
+            if (repliedMessage) {
+              // Construct reply_to object from the found message
+              msg.reply_to = {
+                id: repliedMessage.id,
+                message: repliedMessage.message,
+                sender: repliedMessage.sender || {
+                  id: repliedMessage.sender_id,
+                  name: repliedMessage.sender?.name || 'Unknown User'
+                },
+                attachments: repliedMessage.attachments || []
+              };
+              console.log('Constructed reply_to from local messages:', msg.id, msg.reply_to);
+            } else {
+              console.warn('Could not find replied message in current batch:', msg.id, 'replying to:', msg.reply_to_id);
+            }
+          }
+          
+          return msg;
+        });
+        
         // Sort messages by created_at in ascending order (oldest first)
-        const sortedMessages = messagesData.sort((a, b) => 
+        const sortedMessages = processedMessages.sort((a, b) => 
           new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
         );
         setMessages(sortedMessages);
         setUserInfo(res.data.selectedConversation);
+        
+        // Immediately try to scroll to bottom after messages are set
+        // This helps ensure we scroll even if other handlers fail
+        if (sortedMessages.length > 0) {
+          setTimeout(() => {
+            if (flatListRef.current) {
+              try {
+                const lastIndex = sortedMessages.length - 1;
+                if (lastIndex >= 0) {
+                  flatListRef.current.scrollToIndex({ 
+                    index: lastIndex, 
+                    animated: false,
+                    viewPosition: 1
+                  });
+                  console.log('Immediate scroll after setMessages');
+                }
+              } catch (error) {
+                // Ignore - will be handled by other scroll handlers
+                console.log('Immediate scroll failed (will retry):', error);
+              }
+            }
+          }, 100);
+        }
         
         // Mark messages as read when user opens conversation
         // Get conversation ID - for user chats, it's typically the user ID or conversation ID
@@ -237,15 +306,56 @@ export default function UserChatScreen() {
   // Force scroll to bottom when component first loads (after images render)
   useEffect(() => {
     if (flatListRef.current && messages.length > 0 && !loading && !hasScrolledToBottom) {
-      // Wait longer for images to load and render
-      const timeoutId = setTimeout(() => {
-        if (flatListRef.current) {
-          flatListRef.current.scrollToEnd({ animated: false });
-          setHasScrolledToBottom(true);
-        }
-      }, 500); // Increased timeout to allow images to render
+      // Check if last message has images - if so, wait longer
+      const lastMessage = messages[messages.length - 1];
+      const hasImages = lastMessage?.attachments?.some((att: any) => 
+        att.mime?.startsWith('image/') || att.type?.startsWith('image/')
+      );
       
-      return () => clearTimeout(timeoutId);
+      // Use InteractionManager to wait for all interactions to complete
+      const interactionHandle = InteractionManager.runAfterInteractions(() => {
+        // Multiple scroll attempts with increasing delays to ensure it works
+        const delays = hasImages ? [200, 500, 1000] : [100, 300, 600];
+        
+        delays.forEach((delay, index) => {
+          setTimeout(() => {
+            if (flatListRef.current && messages.length > 0 && !hasScrolledToBottom) {
+              try {
+                // Use scrollToEnd as primary method - it's more reliable for scrolling to bottom
+                flatListRef.current.scrollToEnd({ animated: index === 0 ? false : false });
+                if (index === delays.length - 1) {
+                  // Only set flag on last attempt to avoid premature flag setting
+                  setHasScrolledToBottom(true);
+                  console.log(`Initial scroll to bottom completed via scrollToEnd (attempt ${index + 1})`);
+                }
+              } catch (error) {
+                console.warn(`Scroll attempt ${index + 1} failed:`, error);
+                // Last resort: try scrollToIndex
+                if (index === delays.length - 1) {
+                  try {
+                    const lastIndex = messages.length - 1;
+                    if (lastIndex >= 0) {
+                      flatListRef.current.scrollToIndex({ 
+                        index: lastIndex, 
+                        animated: false,
+                        viewPosition: 1
+                      });
+                      setHasScrolledToBottom(true);
+                      console.log('Initial scroll to bottom completed via scrollToIndex (fallback)');
+                    }
+                  } catch (scrollError) {
+                    console.warn('All scroll attempts failed:', scrollError);
+                  }
+                }
+              }
+            }
+          }, delay);
+        });
+      });
+      
+      return () => {
+        interactionHandle.cancel();
+      };
     }
   }, [loading, messages.length, hasScrolledToBottom]);
 
@@ -281,15 +391,46 @@ export default function UserChatScreen() {
         return;
       }
       
+      // Process messages to ensure reply_to data is properly structured
+      // If a message has reply_to_id but no reply_to object, we need to find the original message
+      const processedNewMessages = newMessages.map((msg: any) => {
+        // If message already has reply_to object, use it
+        if (msg.reply_to) {
+          return msg;
+        }
+        
+        // If message has reply_to_id but no reply_to object, we'll resolve it after combining with existing messages
+        return msg;
+      });
+      
       // Sort new messages by created_at in ascending order (oldest first)
-      const sortedNewMessages = newMessages.sort((a, b) => 
+      const sortedNewMessages = processedNewMessages.sort((a, b) => 
         new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
       );
       
       // Prepend new messages to existing messages (older messages go at the beginning)
+      // Also process all messages to ensure reply_to references are resolved
       setMessages(prev => {
-        const combined = [...sortedNewMessages, ...prev];
-        return combined;
+        const allMessages = [...sortedNewMessages, ...prev];
+        // Process all messages to resolve reply_to references
+        return allMessages.map((msg: any) => {
+          // If message has reply_to_id but no reply_to object, find it in all messages
+          if (msg.reply_to_id && !msg.reply_to) {
+            const repliedMessage = allMessages.find((m: any) => m.id === msg.reply_to_id);
+            if (repliedMessage) {
+              msg.reply_to = {
+                id: repliedMessage.id,
+                message: repliedMessage.message,
+                sender: repliedMessage.sender || {
+                  id: repliedMessage.sender_id,
+                  name: repliedMessage.sender?.name || 'Unknown User'
+                },
+                attachments: repliedMessage.attachments || []
+              };
+            }
+          }
+          return msg;
+        });
       });
       setCurrentPage(nextPage);
       
@@ -401,6 +542,7 @@ export default function UserChatScreen() {
       }
       
       // Ensure the message has sender_id set correctly from backend response
+      // Also preserve reply_to data if it exists in response or from replyingTo state
       const newMessage = {
         ...res.data,
         message: res.data.message || messageTextToPreserve, // Preserve message text
@@ -410,7 +552,17 @@ export default function UserChatScreen() {
           id: Number(user?.id),
           name: user?.name,
           avatar_url: user?.avatar_url
-        }
+        },
+        // Preserve reply_to from backend response, or construct from replyingTo state
+        reply_to: res.data.reply_to || (replyingTo ? {
+          id: replyingTo.id,
+          message: replyingTo.message,
+          sender: replyingTo.sender || {
+            id: replyingTo.sender_id,
+            name: replyingTo.sender?.name || 'Unknown User'
+          },
+          attachments: replyingTo.attachments || []
+        } : undefined)
       };
       
       console.log('New message sent (individual):', {
@@ -1301,10 +1453,10 @@ export default function UserChatScreen() {
       className={isDark ? 'bg-gray-900' : 'bg-white'}
       style={{ flex: 1 }}
     >
-      <StatusBar 
-        barStyle={isDark ? 'light-content' : 'dark-content'} 
-        backgroundColor={isDark ? '#111827' : '#FFFFFF'} 
-      />
+        <StatusBar 
+          barStyle={isDark ? 'light-content' : 'dark-content'} 
+          backgroundColor={isDark ? '#111827' : '#FFFFFF'} 
+        />
       {/* Header */}
       <View className={`flex-row items-center p-4 pt-12 border-b ${isDark ? 'bg-gray-800 border-gray-700' : 'bg-white border-gray-200'}`}>
         {/* User Avatar and Info with Back Button */}
@@ -1386,7 +1538,6 @@ export default function UserChatScreen() {
               contentContainerStyle={{ 
                 padding: 16, 
                 paddingBottom: keyboardHeight > 0 ? 20 : 0,
-                flexGrow: 1
               }}
               inverted={false} // Make sure it's not inverted
               onScroll={({ nativeEvent }) => {
@@ -1424,35 +1575,79 @@ export default function UserChatScreen() {
                 ) : null
               }
               onContentSizeChange={(contentWidth, contentHeight) => {
-                if (flatListRef.current && messages.length > 0) {
-                  // On initial load, always scroll to bottom
-                  // For subsequent changes, scroll if:
-                  // 1. Not loading more (new messages added to bottom)
-                  // 2. Or initial load hasn't scrolled yet
-                  if (!loadingMore || !hasScrolledToBottom) {
-                    // Use requestAnimationFrame to ensure layout is complete
-                    requestAnimationFrame(() => {
-                      setTimeout(() => {
-                        if (flatListRef.current) {
-                          flatListRef.current.scrollToEnd({ animated: hasScrolledToBottom });
+                // Only scroll if we haven't scrolled yet (initial load) or if not loading more (new messages)
+                if (flatListRef.current && messages.length > 0 && (!hasScrolledToBottom || !loadingMore)) {
+                  requestAnimationFrame(() => {
+                    setTimeout(() => {
+                      if (flatListRef.current && messages.length > 0) {
+                        try {
+                          // Use scrollToEnd as primary method - it's more reliable for scrolling to bottom
+                          flatListRef.current.scrollToEnd({ animated: false });
                           if (!hasScrolledToBottom) {
                             setHasScrolledToBottom(true);
+                            console.log('Scrolled to bottom via onContentSizeChange');
+                          }
+                        } catch (error) {
+                          console.warn('onContentSizeChange scrollToEnd failed:', error);
+                          // Fallback: try scrollToIndex
+                          if (!hasScrolledToBottom) {
+                            try {
+                              const lastIndex = messages.length - 1;
+                              if (lastIndex >= 0) {
+                                flatListRef.current.scrollToIndex({ 
+                                  index: lastIndex, 
+                                  animated: false,
+                                  viewPosition: 1
+                                });
+                                setHasScrolledToBottom(true);
+                                console.log('Scrolled to bottom via onContentSizeChange (scrollToIndex fallback)');
+                              }
+                            } catch (scrollError) {
+                              console.warn('onContentSizeChange scroll failed:', scrollError);
+                            }
                           }
                         }
-                      }, 100);
-                    });
-                  }
+                      }
+                    }, 100);
+                  });
                 }
               }}
               onLayout={() => {
+                // Only scroll on initial layout if we haven't scrolled yet
                 if (flatListRef.current && messages.length > 0 && !hasScrolledToBottom && !loading) {
-                  // Wait for images to render before scrolling
+                  const lastMessage = messages[messages.length - 1];
+                  const hasImages = lastMessage?.attachments?.some((att: any) => 
+                    att.mime?.startsWith('image/') || att.type?.startsWith('image/')
+                  );
+                  const delay = hasImages ? 600 : 200;
+                  
                   setTimeout(() => {
-                    if (flatListRef.current) {
-                      flatListRef.current.scrollToEnd({ animated: false });
-                      setHasScrolledToBottom(true);
+                    if (flatListRef.current && messages.length > 0 && !hasScrolledToBottom) {
+                      try {
+                        // Use scrollToEnd as primary method - it's more reliable for scrolling to bottom
+                        flatListRef.current.scrollToEnd({ animated: false });
+                        setHasScrolledToBottom(true);
+                        console.log('Scrolled to bottom via onLayout');
+                      } catch (error) {
+                        console.warn('onLayout scrollToEnd failed:', error);
+                        // Fallback: try scrollToIndex
+                        try {
+                          const lastIndex = messages.length - 1;
+                          if (lastIndex >= 0) {
+                            flatListRef.current.scrollToIndex({ 
+                              index: lastIndex, 
+                              animated: false,
+                              viewPosition: 1
+                            });
+                            setHasScrolledToBottom(true);
+                            console.log('Scrolled to bottom via onLayout (scrollToIndex fallback)');
+                          }
+                        } catch (scrollError) {
+                          console.warn('onLayout scroll failed:', scrollError);
+                        }
+                      }
                     }
-                  }, 300);
+                  }, delay);
                 }
               }}
               ListEmptyComponent={() => (

@@ -1,3 +1,4 @@
+import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { NotificationBadge } from "@/components/NotificationBadge";
 import { AuthProvider, useAuth } from "@/context/AuthContext";
 import { NotificationProvider, useNotifications } from "@/context/NotificationContext";
@@ -67,55 +68,68 @@ function AppTabsLayout() {
 
   // Handle app state changes for badge management and last_seen updates
   useEffect(() => {
+    if (!isAuthenticated) return; // Don't set up if not authenticated
+    
     const handleAppStateChange = (nextAppState: string) => {
-      if (nextAppState === 'active') {
-        // App came to foreground - sync unread count from backend
-        // DON'T clear badge - let user see how many unread messages they have
-        // Badge will be updated based on actual unread count from backend
-        updateLastSeen();
-        syncUnreadCount();
-        
-        // Set up periodic updates every 2 minutes while app is active
-        if (lastSeenIntervalRef.current) {
-          clearInterval(lastSeenIntervalRef.current);
+      try {
+        if (nextAppState === 'active') {
+          // App came to foreground - sync unread count from backend
+          // DON'T clear badge - let user see how many unread messages they have
+          // Badge will be updated based on actual unread count from backend
+          updateLastSeen().catch(err => console.error('updateLastSeen error:', err));
+          syncUnreadCount().catch(err => console.error('syncUnreadCount error:', err));
+          
+          // Set up periodic updates every 2 minutes while app is active
+          if (lastSeenIntervalRef.current) {
+            clearInterval(lastSeenIntervalRef.current);
+          }
+          lastSeenIntervalRef.current = setInterval(() => {
+            updateLastSeen().catch(err => console.error('Interval updateLastSeen error:', err));
+          }, 2 * 60 * 1000); // Update every 2 minutes
+        } else {
+          // App went to background - badge should persist on app icon
+          // The badge count is already updated via notifications when messages arrive
+          // When app goes to background, the badge will show unread count on app icon
+          console.log('App went to background - badge count will persist on app icon');
+          
+          // Clear interval
+          if (lastSeenIntervalRef.current) {
+            clearInterval(lastSeenIntervalRef.current);
+            lastSeenIntervalRef.current = null;
+          }
         }
-        lastSeenIntervalRef.current = setInterval(() => {
-          updateLastSeen();
-        }, 2 * 60 * 1000); // Update every 2 minutes
-      } else {
-        // App went to background - badge should persist on app icon
-        // The badge count is already updated via notifications when messages arrive
-        // When app goes to background, the badge will show unread count on app icon
-        console.log('App went to background - badge count will persist on app icon');
-        
-        // Clear interval
-        if (lastSeenIntervalRef.current) {
-          clearInterval(lastSeenIntervalRef.current);
-          lastSeenIntervalRef.current = null;
-        }
+      } catch (error) {
+        console.error('Error in handleAppStateChange:', error);
       }
     };
 
     // Update immediately when component mounts if authenticated
-    if (isAuthenticated) {
-      updateLastSeen();
+    try {
+      updateLastSeen().catch(err => console.error('Initial updateLastSeen error:', err));
       // Sync unread count and badge when app starts
-      syncUnreadCount();
+      syncUnreadCount().catch(err => console.error('Initial syncUnreadCount error:', err));
       // Set up periodic updates
       lastSeenIntervalRef.current = setInterval(() => {
-        updateLastSeen();
+        updateLastSeen().catch(err => console.error('Interval updateLastSeen error:', err));
       }, 2 * 60 * 1000); // Update every 2 minutes
+    } catch (error) {
+      console.error('Error setting up app state listeners:', error);
     }
 
     const subscription = AppState.addEventListener('change', handleAppStateChange);
     
     return () => {
-      subscription?.remove();
-      if (lastSeenIntervalRef.current) {
-        clearInterval(lastSeenIntervalRef.current);
+      try {
+        subscription?.remove();
+        if (lastSeenIntervalRef.current) {
+          clearInterval(lastSeenIntervalRef.current);
+          lastSeenIntervalRef.current = null;
+        }
+      } catch (error) {
+        console.error('Error cleaning up app state listeners:', error);
       }
     };
-  }, [resetAllCounts, isAuthenticated, updateUnreadCount]);
+  }, [isAuthenticated]); // Removed updateUnreadCount and resetAllCounts from dependencies to prevent infinite loops
 
   return (
     <>
@@ -254,14 +268,16 @@ function AppLayout() {
 
 export default function RootLayout() {
   return (
-    <SafeAreaProvider>
-      <AuthProvider>
-        <ThemeProvider>
-          <NotificationProvider>
-            <AppLayout />
-          </NotificationProvider>
-        </ThemeProvider>
-      </AuthProvider>
-    </SafeAreaProvider>
+    <ErrorBoundary>
+      <SafeAreaProvider>
+        <AuthProvider>
+          <ThemeProvider>
+            <NotificationProvider>
+              <AppLayout />
+            </NotificationProvider>
+          </ThemeProvider>
+        </AuthProvider>
+      </SafeAreaProvider>
+    </ErrorBoundary>
   );
 }
