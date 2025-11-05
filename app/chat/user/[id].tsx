@@ -83,6 +83,7 @@ export default function UserChatScreen() {
     const fetchMessages = async () => {
       setLoading(true);
       setHasScrolledToBottom(false); // Reset scroll flag when fetching new messages
+      setInitialScrollIndex(undefined); // Reset initial scroll index when fetching new messages
       try {
         const res = await messagesAPI.getByUser(id, 1, 10);
         
@@ -155,30 +156,61 @@ export default function UserChatScreen() {
         const sortedMessages = processedMessages.sort((a, b) => 
           new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
         );
+        
+        // Find the newest message index for initial scroll
+        const newestMessageId = pagination.newest_message_id;
+        let lastIndex = sortedMessages.length - 1;
+        
+        // If we have newest_message_id, find its index after sorting
+        if (newestMessageId) {
+          const newestIndex = sortedMessages.findIndex(msg => msg.id === newestMessageId);
+          if (newestIndex >= 0) {
+            lastIndex = newestIndex;
+            console.log('Found newest message at index:', newestIndex, 'ID:', newestMessageId);
+          } else {
+            console.log('Newest message ID not found in sorted messages, using last index');
+          }
+        }
+        
         setMessages(sortedMessages);
+        
+        // Set initial scroll index AFTER setting messages
+        // This ensures FlatList has the data before trying to scroll
+        if (lastIndex >= 0 && sortedMessages.length > 0) {
+          // Use setTimeout to ensure state update happens after messages are set
+          setTimeout(() => {
+            setInitialScrollIndex(lastIndex);
+            console.log('Setting initialScrollIndex to:', lastIndex);
+          }, 0);
+        }
         setUserInfo(res.data.selectedConversation);
         
+        // Set loading to false BEFORE scroll attempts so scroll handlers can work
+        setLoading(false);
+        
+        // Reset scroll flag to allow initial scroll
+        setHasScrolledToBottom(false);
+        
         // Immediately try to scroll to bottom after messages are set
-        // This helps ensure we scroll even if other handlers fail
+        // Use multiple attempts with increasing delays to ensure it works
         if (sortedMessages.length > 0) {
-          setTimeout(() => {
-            if (flatListRef.current) {
-              try {
-                const lastIndex = sortedMessages.length - 1;
-                if (lastIndex >= 0) {
-                  flatListRef.current.scrollToIndex({ 
-                    index: lastIndex, 
-                    animated: false,
-                    viewPosition: 1
-                  });
-                  console.log('Immediate scroll after setMessages');
+          // Multiple scroll attempts with increasing delays
+          const scrollAttempts = [100, 300, 500, 800, 1200];
+          scrollAttempts.forEach((delay, index) => {
+            setTimeout(() => {
+              if (flatListRef.current && sortedMessages.length > 0) {
+                try {
+                  // Try scrollToEnd first (most reliable)
+                  flatListRef.current.scrollToEnd({ animated: false });
+                  console.log(`Scroll attempt ${index + 1} (scrollToEnd) at ${delay}ms`);
+                  
+                  // scrollToEnd should be sufficient, but we'll keep trying
+                } catch (error) {
+                  console.log(`Scroll attempt ${index + 1} failed:`, error);
                 }
-              } catch (error) {
-                // Ignore - will be handled by other scroll handlers
-                console.log('Immediate scroll failed (will retry):', error);
               }
-            }
-          }, 100);
+            }, delay);
+          });
         }
         
         // Mark messages as read when user opens conversation
@@ -238,13 +270,9 @@ export default function UserChatScreen() {
           }
         }
         
-        // Reset scroll flag when loading new conversation
-        setHasScrolledToBottom(false);
-        
         // Scroll will be handled by useEffect and onContentSizeChange after images render
       } catch (e) {
         setMessages([]);
-      } finally {
         setLoading(false);
       }
     };
@@ -302,10 +330,13 @@ export default function UserChatScreen() {
 
   // Track if we've done initial scroll
   const [hasScrolledToBottom, setHasScrolledToBottom] = useState(false);
+  
+  // Track initial scroll index for FlatList
+  const [initialScrollIndex, setInitialScrollIndex] = useState<number | undefined>(undefined);
 
   // Force scroll to bottom when component first loads (after images render)
   useEffect(() => {
-    if (flatListRef.current && messages.length > 0 && !loading && !hasScrolledToBottom) {
+    if (flatListRef.current && messages.length > 0 && !loading) {
       // Check if last message has images - if so, wait longer
       const lastMessage = messages[messages.length - 1];
       const hasImages = lastMessage?.attachments?.some((att: any) => 
@@ -315,26 +346,47 @@ export default function UserChatScreen() {
       // Use InteractionManager to wait for all interactions to complete
       const interactionHandle = InteractionManager.runAfterInteractions(() => {
         // Multiple scroll attempts with increasing delays to ensure it works
-        const delays = hasImages ? [200, 500, 1000] : [100, 300, 600];
+        const delays = hasImages ? [200, 500, 1000, 1500] : [100, 300, 600, 1000];
         
         delays.forEach((delay, index) => {
           setTimeout(() => {
-            if (flatListRef.current && messages.length > 0 && !hasScrolledToBottom) {
+            if (flatListRef.current && messages.length > 0) {
               try {
                 // Use scrollToEnd as primary method - it's more reliable for scrolling to bottom
-                flatListRef.current.scrollToEnd({ animated: index === 0 ? false : false });
+                flatListRef.current.scrollToEnd({ animated: false });
+                console.log(`useEffect scroll attempt ${index + 1} (scrollToEnd) at ${delay}ms`);
+                
+                // Also try scrollToIndex as backup
+                const lastIndex = messages.length - 1;
+                if (lastIndex >= 0) {
+                  setTimeout(() => {
+                    if (flatListRef.current) {
+                      try {
+                        flatListRef.current.scrollToIndex({ 
+                          index: lastIndex, 
+                          animated: false,
+                          viewPosition: 1
+                        });
+                        console.log(`useEffect scroll attempt ${index + 1} (scrollToIndex) to index ${lastIndex}`);
+                      } catch (e) {
+                        // Ignore - scrollToEnd might have worked
+                      }
+                    }
+                  }, 50);
+                }
+                
                 if (index === delays.length - 1) {
                   // Only set flag on last attempt to avoid premature flag setting
                   setHasScrolledToBottom(true);
-                  console.log(`Initial scroll to bottom completed via scrollToEnd (attempt ${index + 1})`);
+                  console.log(`Initial scroll to bottom completed via useEffect (attempt ${index + 1})`);
                 }
               } catch (error) {
-                console.warn(`Scroll attempt ${index + 1} failed:`, error);
+                console.warn(`useEffect scroll attempt ${index + 1} failed:`, error);
                 // Last resort: try scrollToIndex
                 if (index === delays.length - 1) {
                   try {
                     const lastIndex = messages.length - 1;
-                    if (lastIndex >= 0) {
+                    if (lastIndex >= 0 && flatListRef.current) {
                       flatListRef.current.scrollToIndex({ 
                         index: lastIndex, 
                         animated: false,
@@ -357,7 +409,7 @@ export default function UserChatScreen() {
         interactionHandle.cancel();
       };
     }
-  }, [loading, messages.length, hasScrolledToBottom]);
+  }, [loading, messages.length]);
 
   // Handle mobile hardware back button
   useFocusEffect(
@@ -1540,6 +1592,20 @@ export default function UserChatScreen() {
                 paddingBottom: keyboardHeight > 0 ? 20 : 0,
               }}
               inverted={false} // Make sure it's not inverted
+              initialScrollIndex={initialScrollIndex}
+              onScrollToIndexFailed={(info) => {
+                // If scrollToIndex fails, use scrollToEnd as fallback
+                console.warn('scrollToIndex failed, using scrollToEnd:', info);
+                setTimeout(() => {
+                  if (flatListRef.current) {
+                    try {
+                      flatListRef.current.scrollToEnd({ animated: false });
+                    } catch (e) {
+                      console.warn('scrollToEnd also failed:', e);
+                    }
+                  }
+                }, 100);
+              }}
               onScroll={({ nativeEvent }) => {
                 const { contentOffset, contentSize, layoutMeasurement } = nativeEvent;
                 // Use a threshold instead of exactly 0, as FlatList might not reach exactly 0
@@ -1575,36 +1641,50 @@ export default function UserChatScreen() {
                 ) : null
               }
               onContentSizeChange={(contentWidth, contentHeight) => {
-                // Only scroll if we haven't scrolled yet (initial load) or if not loading more (new messages)
-                if (flatListRef.current && messages.length > 0 && (!hasScrolledToBottom || !loadingMore)) {
+                // Scroll whenever content size changes (initial load or new messages)
+                if (flatListRef.current && messages.length > 0 && !loadingMore) {
                   requestAnimationFrame(() => {
                     setTimeout(() => {
                       if (flatListRef.current && messages.length > 0) {
                         try {
                           // Use scrollToEnd as primary method - it's more reliable for scrolling to bottom
                           flatListRef.current.scrollToEnd({ animated: false });
+                          console.log('Scrolled to bottom via onContentSizeChange (scrollToEnd), contentHeight:', contentHeight);
+                          
+                          // Also try scrollToOffset with actual content height
+                          setTimeout(() => {
+                            if (flatListRef.current && contentHeight > 0) {
+                              try {
+                                flatListRef.current.scrollToOffset({ 
+                                  offset: contentHeight,
+                                  animated: false
+                                });
+                                console.log('Scrolled to bottom via onContentSizeChange (scrollToOffset), offset:', contentHeight);
+                              } catch (e) {
+                                // Ignore - scrollToEnd might have worked
+                              }
+                            }
+                          }, 50);
+                          
                           if (!hasScrolledToBottom) {
                             setHasScrolledToBottom(true);
-                            console.log('Scrolled to bottom via onContentSizeChange');
                           }
                         } catch (error) {
                           console.warn('onContentSizeChange scrollToEnd failed:', error);
-                          // Fallback: try scrollToIndex
-                          if (!hasScrolledToBottom) {
-                            try {
-                              const lastIndex = messages.length - 1;
-                              if (lastIndex >= 0) {
-                                flatListRef.current.scrollToIndex({ 
-                                  index: lastIndex, 
-                                  animated: false,
-                                  viewPosition: 1
-                                });
+                          // Fallback: try scrollToOffset with content height
+                          try {
+                            if (flatListRef.current && contentHeight > 0) {
+                              flatListRef.current.scrollToOffset({ 
+                                offset: contentHeight,
+                                animated: false
+                              });
+                              if (!hasScrolledToBottom) {
                                 setHasScrolledToBottom(true);
-                                console.log('Scrolled to bottom via onContentSizeChange (scrollToIndex fallback)');
                               }
-                            } catch (scrollError) {
-                              console.warn('onContentSizeChange scroll failed:', scrollError);
+                              console.log('Scrolled to bottom via onContentSizeChange (scrollToOffset fallback), offset:', contentHeight);
                             }
+                          } catch (scrollError) {
+                            console.warn('onContentSizeChange scroll failed:', scrollError);
                           }
                         }
                       }
@@ -1612,42 +1692,56 @@ export default function UserChatScreen() {
                   });
                 }
               }}
-              onLayout={() => {
-                // Only scroll on initial layout if we haven't scrolled yet
-                if (flatListRef.current && messages.length > 0 && !hasScrolledToBottom && !loading) {
+              onLayout={(event) => {
+                // Scroll on initial layout if we have messages and aren't loading
+                if (flatListRef.current && messages.length > 0 && !loading) {
+                  const { height } = event.nativeEvent.layout;
+                  console.log('FlatList onLayout, height:', height);
+                  
                   const lastMessage = messages[messages.length - 1];
                   const hasImages = lastMessage?.attachments?.some((att: any) => 
                     att.mime?.startsWith('image/') || att.type?.startsWith('image/')
                   );
                   const delay = hasImages ? 600 : 200;
                   
-                  setTimeout(() => {
-                    if (flatListRef.current && messages.length > 0 && !hasScrolledToBottom) {
-                      try {
-                        // Use scrollToEnd as primary method - it's more reliable for scrolling to bottom
-                        flatListRef.current.scrollToEnd({ animated: false });
-                        setHasScrolledToBottom(true);
-                        console.log('Scrolled to bottom via onLayout');
-                      } catch (error) {
-                        console.warn('onLayout scrollToEnd failed:', error);
-                        // Fallback: try scrollToIndex
+                  // Multiple attempts with increasing delays
+                  const layoutScrollAttempts = [delay, delay + 200, delay + 400, delay + 600];
+                  layoutScrollAttempts.forEach((attemptDelay, index) => {
+                    setTimeout(() => {
+                      if (flatListRef.current && messages.length > 0) {
                         try {
-                          const lastIndex = messages.length - 1;
-                          if (lastIndex >= 0) {
-                            flatListRef.current.scrollToIndex({ 
-                              index: lastIndex, 
-                              animated: false,
-                              viewPosition: 1
-                            });
+                          // Use scrollToEnd as primary method
+                          flatListRef.current.scrollToEnd({ animated: false });
+                          console.log(`onLayout scroll attempt ${index + 1} (scrollToEnd) at ${attemptDelay}ms`);
+                          
+                          if (index === layoutScrollAttempts.length - 1 && !hasScrolledToBottom) {
                             setHasScrolledToBottom(true);
-                            console.log('Scrolled to bottom via onLayout (scrollToIndex fallback)');
                           }
-                        } catch (scrollError) {
-                          console.warn('onLayout scroll failed:', scrollError);
+                        } catch (error) {
+                          console.warn(`onLayout scroll attempt ${index + 1} failed:`, error);
+                          // Last attempt: try scrollToIndex as fallback
+                          if (index === layoutScrollAttempts.length - 1) {
+                            try {
+                              const lastIndex = messages.length - 1;
+                              if (lastIndex >= 0 && flatListRef.current) {
+                                flatListRef.current.scrollToIndex({ 
+                                  index: lastIndex, 
+                                  animated: false,
+                                  viewPosition: 1
+                                });
+                                if (!hasScrolledToBottom) {
+                                  setHasScrolledToBottom(true);
+                                }
+                                console.log('Scrolled to bottom via onLayout (scrollToIndex fallback)');
+                              }
+                            } catch (scrollError) {
+                              console.warn('onLayout scroll failed:', scrollError);
+                            }
+                          }
                         }
                       }
-                    }
-                  }, delay);
+                    }, attemptDelay);
+                  });
                 }
               }}
               ListEmptyComponent={() => (

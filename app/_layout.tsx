@@ -7,10 +7,14 @@ import { usersAPI } from "@/services/api";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import { Stack, Tabs, usePathname } from "expo-router";
 import { StatusBar } from "expo-status-bar";
+import * as SplashScreen from "expo-splash-screen";
 import { useEffect, useRef } from "react";
 import { ActivityIndicator, AppState, View } from "react-native";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 import "../global.css";
+
+// Prevent splash screen from auto-hiding
+SplashScreen.preventAutoHideAsync();
 
 function AppTabsLayout() {
   const { currentTheme } = useTheme();
@@ -246,6 +250,29 @@ function AppLayout() {
 
   console.log('AppLayout: isLoading:', isLoading, 'isAuthenticated:', isAuthenticated, 'user:', user?.name);
 
+  // Hide splash screen once app is ready
+  useEffect(() => {
+    if (!isLoading) {
+      // App initialization is complete, hide splash screen
+      const hideSplash = async () => {
+        try {
+          await SplashScreen.hideAsync();
+          console.log('Splash screen hidden');
+        } catch (error) {
+          console.error('Error hiding splash screen:', error);
+          // Don't crash if hiding splash fails
+        }
+      };
+      
+      // Small delay to ensure smooth transition
+      const timer = setTimeout(() => {
+        hideSplash();
+      }, 100);
+      
+      return () => clearTimeout(timer);
+    }
+  }, [isLoading]);
+
   // Show loading screen while checking authentication
   if (isLoading) {
     return (
@@ -267,6 +294,21 @@ function AppLayout() {
 }
 
 export default function RootLayout() {
+  // Ensure splash screen hides even if there's an error
+  useEffect(() => {
+    // Fallback: Hide splash screen after 5 seconds max (in case of errors)
+    const fallbackTimer = setTimeout(async () => {
+      try {
+        await SplashScreen.hideAsync();
+        console.log('Splash screen hidden (fallback)');
+      } catch (error) {
+        console.error('Error hiding splash screen (fallback):', error);
+      }
+    }, 5000);
+
+    return () => clearTimeout(fallbackTimer);
+  }, []);
+
   return (
     <ErrorBoundary>
       <SafeAreaProvider>

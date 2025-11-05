@@ -11,7 +11,7 @@ export const AppConfig = {
       android: 'http://10.0.2.2:8000/api',     // For Android Emulator
       physical: 'http://192.168.100.65:8000/api', // For physical devices (your computer's IP)
     },
-    production: 'https://your-healtclassique-domain.com/api',
+    production: 'https://healthclassique.tech-bridge.app/api',
   },
   
   // Feature Flags

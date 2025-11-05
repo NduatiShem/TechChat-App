@@ -225,25 +225,57 @@ export const NotificationProvider: React.FC<NotificationProviderProps> = ({ chil
   };
 
   useEffect(() => {
-    // Get Expo push token on app start - wrap in try-catch to prevent crashes
-    getExpoPushToken().catch(error => {
-      console.error('Error getting Expo push token on mount:', error);
-      // Don't crash if push token fails
-    });
+    // Initialize notifications with better error handling
+    let mounted = true;
+    
+    const initializeNotifications = async () => {
+      try {
+        // Add small delay to ensure everything is initialized
+        await new Promise(resolve => setTimeout(resolve, 100));
+        
+        // Get Expo push token on app start - wrap in try-catch to prevent crashes
+        if (mounted) {
+          getExpoPushToken().catch(error => {
+            console.error('Error getting Expo push token on mount:', error);
+            // Don't crash if push token fails - app can work without push notifications
+          });
+        }
+      } catch (error) {
+        console.error('Error initializing notifications:', error);
+        // Don't crash - notifications are optional
+      }
+    };
+    
+    initializeNotifications();
 
-    // Track app state changes
+    // Track app state changes with error handling
     const handleAppStateChange = (nextAppState: string) => {
-      console.log('App state changed from', appState, 'to', nextAppState);
-      setAppState(nextAppState);
+      try {
+        console.log('App state changed from', appState, 'to', nextAppState);
+        if (mounted) {
+          setAppState(nextAppState);
+        }
+      } catch (error) {
+        console.error('Error handling app state change:', error);
+      }
     };
 
-    const appStateSubscription = AppState.addEventListener('change', handleAppStateChange);
+    let appStateSubscription: any = null;
+    try {
+      appStateSubscription = AppState.addEventListener('change', handleAppStateChange);
+    } catch (error) {
+      console.error('Error setting up app state listener:', error);
+    }
 
-    // Listen for notification interactions
-    const notificationListener = Notifications.addNotificationReceivedListener(async notification => {
-      try {
-        console.log('Notification received:', notification);
-        console.log('Current app state:', appState);
+    // Listen for notification interactions with error handling
+    let notificationListener: any = null;
+    let responseListener: any = null;
+    
+    try {
+      notificationListener = Notifications.addNotificationReceivedListener(async notification => {
+        try {
+          console.log('Notification received:', notification);
+          console.log('Current app state:', appState);
         
         // Check if this is a new message notification
         const data = notification.request.content.data;
@@ -286,15 +318,15 @@ export const NotificationProvider: React.FC<NotificationProviderProps> = ({ chil
             });
           }, 100);
         }
-      } catch (error) {
-        console.error('Error in notification listener:', error);
-        // Don't let notification errors crash the app
-      }
-    });
+        } catch (error) {
+          console.error('Error in notification listener:', error);
+          // Don't let notification errors crash the app
+        }
+      });
 
-    const responseListener = Notifications.addNotificationResponseReceivedListener(async response => {
-      try {
-        console.log('Notification response:', response);
+      responseListener = Notifications.addNotificationResponseReceivedListener(async response => {
+        try {
+          console.log('Notification response:', response);
         // Handle notification tap - navigate to conversation
         const conversationId = response.notification.request.content.data?.conversationId;
         if (conversationId) {
@@ -304,16 +336,26 @@ export const NotificationProvider: React.FC<NotificationProviderProps> = ({ chil
         // DON'T clear badge immediately when user taps notification
         // Badge will be cleared when user actually reads the messages (via markAsRead)
         // This allows the badge to persist if user taps notification but doesn't read messages
-      } catch (error) {
-        console.error('Error in notification response listener:', error);
-        // Don't let notification response errors crash the app
-      }
-    });
+        } catch (error) {
+          console.error('Error in notification response listener:', error);
+          // Don't let notification response errors crash the app
+        }
+      });
+
+    } catch (error) {
+      console.error('Error setting up notification listeners:', error);
+      // Don't crash - notifications are optional
+    }
 
     return () => {
-      appStateSubscription?.remove();
-      notificationListener?.remove();
-      responseListener?.remove();
+      mounted = false;
+      try {
+        appStateSubscription?.remove();
+        notificationListener?.remove();
+        responseListener?.remove();
+      } catch (error) {
+        console.error('Error cleaning up notification listeners:', error);
+      }
     };
   }, [appState, conversationCounts]);
 

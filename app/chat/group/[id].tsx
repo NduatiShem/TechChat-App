@@ -171,27 +171,75 @@ export default function GroupChatScreen() {
       setMessages(sortedMessages);
       setGroupInfo(response.data.selectedConversation);
       
+      // Set loading to false BEFORE scroll attempts so scroll handlers can work
+      setLoading(false);
+      
+      // Reset scroll flag to allow initial scroll
+      setHasScrolledToBottom(false);
+      
       // Immediately try to scroll to bottom after messages are set
-      // This helps ensure we scroll even if other handlers fail
+      // Use multiple attempts with increasing delays to ensure it works
       if (sortedMessages.length > 0) {
-        setTimeout(() => {
-          if (flatListRef.current) {
-            try {
-              const lastIndex = sortedMessages.length - 1;
-              if (lastIndex >= 0) {
-                flatListRef.current.scrollToIndex({ 
-                  index: lastIndex, 
-                  animated: false,
-                  viewPosition: 1
-                });
-                console.log('Immediate scroll after setMessages (group)');
-              }
-            } catch (error) {
-              // Ignore - will be handled by other scroll handlers
-              console.log('Immediate scroll failed (will retry):', error);
-            }
+        const newestMessageId = pagination.newest_message_id;
+        let lastIndex = sortedMessages.length - 1;
+        
+        // If we have newest_message_id, find its index after sorting
+        if (newestMessageId) {
+          const newestIndex = sortedMessages.findIndex(msg => msg.id === newestMessageId);
+          if (newestIndex >= 0) {
+            lastIndex = newestIndex;
+            console.log('Found newest message at index (group):', newestIndex, 'ID:', newestMessageId);
+          } else {
+            console.log('Newest message ID not found in sorted messages (group), using last index');
           }
-        }, 100);
+        }
+        
+        // Multiple scroll attempts with increasing delays
+        const scrollAttempts = [50, 150, 300, 500];
+        scrollAttempts.forEach((delay, index) => {
+          setTimeout(() => {
+            if (flatListRef.current && sortedMessages.length > 0) {
+              try {
+                // Try scrollToEnd first (most reliable)
+                flatListRef.current.scrollToEnd({ animated: false });
+                console.log(`Group scroll attempt ${index + 1} (scrollToEnd) at ${delay}ms`);
+                
+                // Also try scrollToIndex as backup
+                if (lastIndex >= 0) {
+                  setTimeout(() => {
+                    if (flatListRef.current) {
+                      try {
+                        flatListRef.current.scrollToIndex({ 
+                          index: lastIndex, 
+                          animated: false,
+                          viewPosition: 1
+                        });
+                        console.log(`Group scroll attempt ${index + 1} (scrollToIndex) to index ${lastIndex}`);
+                      } catch (e) {
+                        // Ignore - scrollToEnd might have worked
+                      }
+                    }
+                  }, 50);
+                }
+              } catch (error) {
+                console.log(`Group scroll attempt ${index + 1} failed:`, error);
+                // Fallback to scrollToIndex
+                if (lastIndex >= 0 && flatListRef.current) {
+                  try {
+                    flatListRef.current.scrollToIndex({ 
+                      index: lastIndex, 
+                      animated: false,
+                      viewPosition: 1
+                    });
+                    console.log(`Group scroll attempt ${index + 1} (fallback scrollToIndex) to index ${lastIndex}`);
+                  } catch (e) {
+                    console.log(`Group fallback scroll also failed:`, e);
+                  }
+                }
+              }
+            }
+          }, delay);
+        });
       }
       
       // Mark messages as read when user opens group conversation
@@ -207,14 +255,10 @@ export default function GroupChatScreen() {
         }
       }
       
-      // Reset scroll flag when loading new conversation
-      setHasScrolledToBottom(false);
-      
       // Scroll will be handled by useEffect and onContentSizeChange after images render
     } catch (error) {
       console.error('Failed to fetch messages:', error);
       Alert.alert('Error', 'Failed to load messages');
-    } finally {
       setLoading(false);
     }
   };

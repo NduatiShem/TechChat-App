@@ -40,40 +40,85 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   const checkAuth = async () => {
     try {
+      // Add small delay to ensure secureStorage is fully initialized
+      await new Promise(resolve => setTimeout(resolve, 50));
+      
       const token = await secureStorage.getItem('auth_token');
       console.log('AuthContext: Checking auth, token exists:', !!token);
+      
       if (token) {
         try {
-          const response = await authAPI.getProfile();
+          // Add timeout protection for API call
+          const profilePromise = authAPI.getProfile();
+          const timeoutPromise = new Promise((_, reject) => 
+            setTimeout(() => reject(new Error('Profile fetch timeout')), 10000)
+          );
+          
+          const response = await Promise.race([profilePromise, timeoutPromise]) as any;
+          
           console.log('AuthContext: Profile response:', response.data);
           // Handle different response structures safely
           const userData = response.data?.data || response.data?.user || response.data;
-          if (userData) {
+          if (userData && userData.id) {
             setUser(userData);
             console.log('AuthContext: User set successfully');
           } else {
             console.warn('AuthContext: No user data in response');
-            await secureStorage.deleteItem('auth_token');
+            // Don't clear token immediately - might be network issue
+            // Only clear if it's a 401 error
+            setUser(null);
           }
         } catch (profileError: any) {
-          // If profile fetch fails (401, network error, etc.), clear token
-          console.error('AuthContext: Profile fetch failed:', profileError?.message || profileError);
-          await secureStorage.deleteItem('auth_token');
-          setUser(null);
+          // If profile fetch fails, check error type
+          const errorMessage = profileError?.message || String(profileError);
+          const statusCode = profileError?.response?.status;
+          
+          console.error('AuthContext: Profile fetch failed:', errorMessage);
+          
+          // Only clear token if it's a 401 (unauthorized) or 403 (forbidden)
+          // Network errors shouldn't clear the token
+          if (statusCode === 401 || statusCode === 403) {
+            try {
+              await secureStorage.deleteItem('auth_token');
+            } catch (deleteError) {
+              console.error('AuthContext: Failed to delete token:', deleteError);
+            }
+            setUser(null);
+          } else if (statusCode === undefined) {
+            // Network error or timeout - don't clear token, just set user to null
+            console.warn('AuthContext: Network error - keeping token for retry');
+            setUser(null);
+          } else {
+            // Other errors - clear token to be safe
+            try {
+              await secureStorage.deleteItem('auth_token');
+            } catch (deleteError) {
+              console.error('AuthContext: Failed to delete token:', deleteError);
+            }
+            setUser(null);
+          }
         }
       } else {
         console.log('AuthContext: No token found, user not authenticated');
       }
     } catch (error: any) {
+      // Catch any unexpected errors and prevent app crash
       console.error('AuthContext: Auth check failed:', error?.message || error);
-      // Safely delete the token with error handling
+      // Don't crash - just set loading to false and user to null
       try {
-        await secureStorage.deleteItem('auth_token');
-      } catch (deleteError) {
-        console.error('AuthContext: Failed to delete token:', deleteError);
+        // Only try to delete token if we can access secureStorage
+        const token = await secureStorage.getItem('auth_token');
+        if (token) {
+          // If there was an error and we have a token, it might be invalid
+          // But don't clear it on unexpected errors - might be storage issue
+          console.warn('AuthContext: Unexpected error with token present - keeping token');
+        }
+      } catch (storageError) {
+        console.error('AuthContext: Cannot access secureStorage:', storageError);
       }
       setUser(null);
     } finally {
+      // Always set loading to false, even if there was an error
       setIsLoading(false);
     }
   };
@@ -155,7 +200,26 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   };
 
   useEffect(() => {
-    checkAuth();
+    // Wrap in try-catch to prevent crashes during initialization
+    let mounted = true;
+    
+    const initializeAuth = async () => {
+      try {
+        await checkAuth();
+      } catch (error) {
+        console.error('AuthContext: Initialization error:', error);
+        // Ensure loading is set to false even on error
+        if (mounted) {
+          setIsLoading(false);
+        }
+      }
+    };
+    
+    initializeAuth();
+    
+    return () => {
+      mounted = false;
+    };
   }, []);
 
   const value: AuthContextType = {

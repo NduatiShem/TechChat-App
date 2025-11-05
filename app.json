@@ -8,7 +8,7 @@
     "icon": "./assets/ic_launcher/ios/AppIcon.appiconset/ItunesArtwork@2x.png",
     "userInterfaceStyle": "automatic",
     "splash": {
-      "image": "./assets/splash_screens/icon.png",
+      "image": "./assets/images/healtclassique-icon.png",
       "resizeMode": "contain",
       "backgroundColor": "#FFFFFF"
     },
