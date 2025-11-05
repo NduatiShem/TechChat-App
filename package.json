@@ -4,6 +4,10 @@
   "version": "1.0.0",
   "scripts": {
     "start": "expo start",
+    "start:prod": "NODE_ENV=production expo start --no-dev --minify",
+    "start:prod:web": "NODE_ENV=production expo start --no-dev --minify --web",
+    "start:prod:tunnel": "NODE_ENV=production expo start --no-dev --minify --tunnel",
+    "build:web:prod": "NODE_ENV=production npx expo export:web",
     "reset-project": "node ./scripts/reset-project.js",
     "android": "expo start --android",
     "ios": "expo start --ios",
