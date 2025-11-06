@@ -8,7 +8,7 @@ import { AppConfig } from '@/config/app.config';
 import { useAuth } from '@/context/AuthContext';
 import { useNotifications } from '@/context/NotificationContext';
 import { useTheme } from '@/context/ThemeContext';
-import { messagesAPI, usersAPI } from '@/services/api';
+import { groupsAPI, messagesAPI, usersAPI } from '@/services/api';
 import { MaterialCommunityIcons, MaterialIcons } from '@expo/vector-icons';
 import { useFocusEffect } from '@react-navigation/native';
 import { Picker } from 'emoji-mart-native';
@@ -17,20 +17,20 @@ import * as ImagePicker from 'expo-image-picker';
 import { router, useLocalSearchParams } from 'expo-router';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
-    ActivityIndicator,
-    Alert,
-    BackHandler,
-    FlatList,
-    Image,
-    InteractionManager,
-    Keyboard,
-    Modal,
-    Platform,
-    StatusBar,
-    Text,
-    TextInput,
-    TouchableOpacity,
-    View
+  ActivityIndicator,
+  Alert,
+  BackHandler,
+  FlatList,
+  Image,
+  InteractionManager,
+  Keyboard,
+  Modal,
+  Platform,
+  StatusBar,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  View
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
@@ -91,9 +91,9 @@ export default function GroupChatScreen() {
   const { id } = useLocalSearchParams();
   const { currentTheme } = useTheme();
   const { user, isAuthenticated, isLoading } = useAuth();
-  const { resetUnreadCount } = useNotifications();
+  const { updateUnreadCount } = useNotifications();
   const insets = useSafeAreaInsets();
-  const ENABLE_MARK_AS_READ = false; // Temporarily disable until backend route is finalized
+  const ENABLE_MARK_AS_READ = true; // Enable mark as read functionality for groups
   const ENABLE_DELETE_MESSAGE = true; // Enable delete - route exists
   // Remove the navigation effect - let the AppLayout handle authentication state changes
   const isDark = currentTheme === 'dark';
@@ -246,12 +246,12 @@ export default function GroupChatScreen() {
       const groupId = Number(id);
       if (ENABLE_MARK_AS_READ) {
         try {
-          await messagesAPI.markAsRead(groupId, 'group');
-          // Reset unread count for this group - this will update badge
-          resetUnreadCount(groupId);
+          await groupsAPI.markMessagesAsRead(groupId);
+          // Update unread count to 0 for this group - this will update badge
+          updateUnreadCount(groupId, 0);
         } catch (error: any) {
-          // Ignore validation (422) or missing route errors in v1.0.0
-          console.log('markAsRead disabled or failed:', error?.response?.status || error?.message || error);
+          // Ignore validation (422) or missing route errors
+          console.log('markGroupMessagesAsRead failed:', error?.response?.status || error?.message || error);
         }
       }
       
@@ -318,6 +318,35 @@ export default function GroupChatScreen() {
       };
     }
   }, [loading, messages.length, hasScrolledToBottom]);
+
+  // Mark messages as read when group chat is opened
+  useFocusEffect(
+    useCallback(() => {
+      const markGroupMessagesAsRead = async () => {
+        if (!ENABLE_MARK_AS_READ || !id || !user) return;
+        
+        try {
+          // Mark all unread messages in this group as read
+          await groupsAPI.markMessagesAsRead(Number(id));
+          
+          // Update unread count to 0 for this group
+          updateUnreadCount(Number(id), 0);
+          
+          console.log('Group messages marked as read for group:', id);
+        } catch (error) {
+          console.error('Error marking group messages as read:', error);
+          // Don't show error to user - this is a background operation
+        }
+      };
+
+      // Small delay to ensure screen is fully loaded
+      const timer = setTimeout(() => {
+        markGroupMessagesAsRead();
+      }, 300);
+
+      return () => clearTimeout(timer);
+    }, [id, user, ENABLE_MARK_AS_READ, updateUnreadCount])
+  );
 
   // Load more messages function
   const loadMoreMessages = async () => {

@@ -9,9 +9,11 @@ import { AppState } from 'react-native';
 
 interface NotificationContextType {
   unreadCount: number;
+  groupUnreadCount: number; // Total unread count for groups only
   conversationCounts: Record<number, number>;
   expoPushToken: string | null;
   updateUnreadCount: (conversationId: number, count: number) => void;
+  updateGroupUnreadCount: (totalCount: number) => void; // Update total group unread count
   resetUnreadCount: (conversationId: number) => void;
   resetAllCounts: () => void;
   requestPermissions: () => Promise<boolean>;
@@ -50,6 +52,7 @@ interface NotificationProviderProps {
 
 export const NotificationProvider: React.FC<NotificationProviderProps> = ({ children }) => {
   const [unreadCount, setUnreadCount] = useState(0);
+  const [groupUnreadCount, setGroupUnreadCount] = useState(0); // Total unread count for groups only
   const [conversationCounts, setConversationCounts] = useState<Record<number, number>>({});
   const [expoPushToken, setExpoPushToken] = useState<string | null>(null);
   const [appState, setAppState] = useState(AppState.currentState);
@@ -81,9 +84,14 @@ export const NotificationProvider: React.FC<NotificationProviderProps> = ({ chil
     });
   };
 
+  const updateGroupUnreadCount = (totalCount: number) => {
+    setGroupUnreadCount(totalCount);
+  };
+
   const resetAllCounts = () => {
     setConversationCounts({});
     setUnreadCount(0);
+    setGroupUnreadCount(0);
     
     // Clear app badge
     updateAppBadge(0);
@@ -361,9 +369,11 @@ export const NotificationProvider: React.FC<NotificationProviderProps> = ({ chil
 
   const value: NotificationContextType = {
     unreadCount,
+    groupUnreadCount,
     conversationCounts,
     expoPushToken,
     updateUnreadCount,
+    updateGroupUnreadCount,
     resetUnreadCount,
     resetAllCounts,
     requestPermissions,

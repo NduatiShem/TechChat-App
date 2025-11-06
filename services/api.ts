@@ -262,6 +262,9 @@ export const messagesAPI = {
   markAsRead: (conversationId: number, type: 'individual' | 'group') => 
     api.put(`/conversations/${conversationId}/read?type=${type}`),
   
+  markMessagesAsRead: (userId: number) => 
+    api.put(`/messages/mark-read/${userId}`),
+  
   getUnreadCount: () => api.get('/messages/unread-count'),
   
   deleteMessage: (messageId: number) => api.delete(`/messages/${messageId}`),
@@ -306,6 +309,9 @@ export const groupsAPI = {
   leaveGroup: (groupId: number) => api.post(`/groups/${groupId}/leave`),
   
   delete: (groupId: number) => api.delete(`/groups/${groupId}`),
+  
+  markMessagesAsRead: (groupId: number) => 
+    api.post('/messages/mark-group-read', { groupId }),
 };
 
 export default api; 

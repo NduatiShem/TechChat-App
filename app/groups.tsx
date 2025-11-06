@@ -1,5 +1,6 @@
 import LastMessagePreview from '@/components/LastMessagePreview';
 import { useAuth } from '@/context/AuthContext';
+import { useNotifications } from '@/context/NotificationContext';
 import { useTheme } from '@/context/ThemeContext';
 import { groupsAPI } from '@/services/api';
 import { MaterialCommunityIcons } from '@expo/vector-icons';
@@ -7,14 +8,14 @@ import { useFocusEffect } from '@react-navigation/native';
 import { router } from 'expo-router';
 import React, { useEffect, useState } from 'react';
 import {
-    ActivityIndicator,
-    Alert,
-    FlatList,
-    RefreshControl,
-    Text,
-    TextInput,
-    TouchableOpacity,
-    View,
+  ActivityIndicator,
+  Alert,
+  FlatList,
+  RefreshControl,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  View,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
@@ -28,6 +29,7 @@ interface Group {
   created_at: string;
   updated_at: string;
   users?: any[];
+  unread_count?: number; // Unread message count for this group
   last_message_attachments?: Array<{
     id: number;
     name: string;
@@ -48,14 +50,30 @@ export default function GroupsScreen() {
   const [isRefreshing, setIsRefreshing] = useState(false);
   const { user } = useAuth();
   const { currentTheme } = useTheme();
+  const { updateUnreadCount, updateGroupUnreadCount } = useNotifications();
 
   const isDark = currentTheme === 'dark';
 
   const loadGroups = async () => {
     try {
       const response = await groupsAPI.getAll();
-      setGroups(response.data);
-      setFilteredGroups(response.data);
+      const groupsData = response.data;
+      
+      // Sync unread counts from backend to notification context
+      if (Array.isArray(groupsData)) {
+        let totalGroupUnread = 0;
+        groupsData.forEach((group) => {
+          const unreadCount = group.unread_count || 0;
+          totalGroupUnread += unreadCount;
+          // Update count for each group
+          updateUnreadCount(Number(group.id), unreadCount);
+        });
+        // Update total group unread count
+        updateGroupUnreadCount(totalGroupUnread);
+      }
+      
+      setGroups(groupsData);
+      setFilteredGroups(groupsData);
     } catch (error) {
       console.error('Failed to load groups:', error);
     } finally {
@@ -138,14 +156,24 @@ export default function GroupsScreen() {
       {/* Content */}
       <View className="flex-1">
         <View className="flex-row justify-between items-center mb-1">
-          <Text
-            className={`font-semibold text-base ${
-              isDark ? 'text-white' : 'text-gray-900'
-            }`}
-            numberOfLines={1}
-          >
-            {item.name}
-          </Text>
+          <View className="flex-1 flex-row items-center">
+            <Text
+              className={`font-semibold text-base flex-1 ${
+                isDark ? 'text-white' : 'text-gray-900'
+              }`}
+              numberOfLines={1}
+            >
+              {item.name}
+            </Text>
+            {/* Show unread count on the right side - like WhatsApp */}
+            {item.unread_count && item.unread_count > 0 && (
+              <View className="ml-2 min-w-[20] h-5 px-1.5 rounded-full bg-green-500 items-center justify-center">
+                <Text className="text-white text-xs font-bold">
+                  {item.unread_count > 99 ? '99+' : item.unread_count.toString()}
+                </Text>
+              </View>
+            )}
+          </View>
           <View className="flex-row items-center">
             {item.owner_id === user?.id && (
               <MaterialCommunityIcons
@@ -157,7 +185,7 @@ export default function GroupsScreen() {
             )}
             {item.last_message_date && (
               <Text
-                className={`text-xs ${
+                className={`text-xs ml-2 ${
                   isDark ? 'text-gray-400' : 'text-gray-500'
                 }`}
               >

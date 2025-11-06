@@ -10,6 +10,7 @@ import {
     TouchableOpacity,
     View,
 } from 'react-native';
+import MessageStatus from './MessageStatus';
 
 interface VoiceMessageBubbleProps {
   uri: string | null; // Allow null for voice messages without URLs
@@ -18,6 +19,7 @@ interface VoiceMessageBubbleProps {
   timestamp: string;
   senderName?: string;
   textPart?: string; // Optional text part for voice messages with text
+  readAt?: string | null; // Read receipt timestamp
 }
 
 export default function VoiceMessageBubble({ 
@@ -26,7 +28,8 @@ export default function VoiceMessageBubble({
   isMine, 
   timestamp,
   senderName,
-  textPart 
+  textPart,
+  readAt
 }: VoiceMessageBubbleProps) {
   const [sound, setSound] = useState<Audio.Sound | null>(null);
   const [isPlaying, setIsPlaying] = useState(false);
@@ -377,13 +380,23 @@ export default function VoiceMessageBubble({
         </Text>
       </View>
 
-      {/* Timestamp */}
-      <Text style={[
-        styles.timestamp,
-        { color: isMine ? '#E0E7FF' : '#6B7280' }
-      ]}>
-        {timestamp}
-      </Text>
+      {/* Timestamp and read receipt */}
+      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4 }}>
+        <Text style={[
+          styles.timestamp,
+          { color: isMine ? '#E0E7FF' : '#6B7280' }
+        ]}>
+          {timestamp}
+        </Text>
+        {/* Show read receipt only for messages we sent */}
+        {isMine && (
+          <MessageStatus 
+            readAt={readAt} 
+            isDark={isDark}
+            size={12}
+          />
+        )}
+      </View>
     </View>
   );
 }

@@ -1,21 +1,21 @@
 import LastMessagePreview from '@/components/LastMessagePreview';
-import { NotificationBadge } from '@/components/NotificationBadge';
 import UserAvatar from '@/components/UserAvatar';
 import { useAuth } from '@/context/AuthContext';
 import { useNotifications } from '@/context/NotificationContext';
 import { useTheme } from '@/context/ThemeContext';
 import { conversationsAPI } from '@/services/api';
 import { MaterialCommunityIcons } from '@expo/vector-icons';
+import { useFocusEffect } from '@react-navigation/native';
 import { router } from 'expo-router';
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import {
-    ActivityIndicator,
-    FlatList,
-    RefreshControl,
-    Text,
-    TextInput,
-    TouchableOpacity,
-    View,
+  ActivityIndicator,
+  FlatList,
+  RefreshControl,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  View,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
@@ -28,6 +28,8 @@ interface Conversation {
   is_group: boolean;
   last_message?: string;
   last_message_date?: string;
+  last_message_sender_id?: number; // ID of the sender of the last message
+  last_message_read_at?: string | null; // Read receipt timestamp for the last message
   created_at: string;
   updated_at: string;
   user_id?: number; // The actual user ID for user conversations
@@ -90,11 +92,12 @@ export default function ConversationsScreen() {
         );
         
         // Sync unread counts from backend to notification context
+        // Update all conversations (including those with 0 unread)
         uniqueConversations.forEach((conversation) => {
-          if (conversation.unread_count && conversation.unread_count > 0) {
-            const conversationId = conversation.conversation_id || conversation.id;
-            updateUnreadCount(Number(conversationId), conversation.unread_count);
-          }
+          const conversationId = conversation.conversation_id || conversation.id;
+          const unreadCount = conversation.unread_count || 0;
+          // Update count for each conversation (this will automatically calculate total)
+          updateUnreadCount(Number(conversationId), unreadCount);
         });
         
         setConversations(uniqueConversations);
@@ -137,6 +140,14 @@ export default function ConversationsScreen() {
     requestPermissions();
   }, []);
 
+  // Reload conversations when screen comes into focus (e.g., returning from chat)
+  // This ensures unread counts are updated after marking messages as read
+  useFocusEffect(
+    useCallback(() => {
+      loadConversations();
+    }, [])
+  );
+
   const formatDate = (dateString: string) => {
     const date = new Date(dateString);
     const now = new Date();
@@ -158,7 +169,11 @@ export default function ConversationsScreen() {
       name: item.name,
       is_user: item.is_user,
       is_group: item.is_group,
-      email: item.email
+      email: item.email,
+      last_message_sender_id: item.last_message_sender_id,
+      last_message_read_at: item.last_message_read_at,
+      current_user_id: user?.id,
+      isFromMe: item.last_message_sender_id === user?.id
     });
     
     return (
@@ -180,28 +195,13 @@ export default function ConversationsScreen() {
         isDark ? 'bg-gray-800 border-gray-700' : 'bg-white border-gray-200'
       }`}
     >
-      {/* Avatar with notification badge */}
+      {/* Avatar - no badge on avatar */}
       <View className="relative mr-4">
         <UserAvatar
           avatarUrl={item.avatar_url}
           name={item.name}
           size={48}
         />
-        {/* Show unread count badge on conversation item - like WhatsApp */}
-        {(() => {
-          const conversationId = item.conversation_id || item.id;
-          const unreadCount = item.unread_count || conversationCounts[conversationId] || 0;
-          if (unreadCount > 0) {
-            return (
-              <View className="absolute -top-1 -right-1 min-w-[20] h-5 px-1.5 rounded-full bg-green-500 items-center justify-center">
-                <Text className="text-white text-xs font-bold">
-                  {unreadCount > 99 ? '99+' : unreadCount.toString()}
-                </Text>
-              </View>
-            );
-          }
-          return null;
-        })()}
       </View>
 
       {/* Content */}
@@ -248,6 +248,8 @@ export default function ConversationsScreen() {
             message={item.last_message}
             isDark={isDark}
             attachments={item.last_message_attachments}
+            isFromMe={item.last_message_sender_id === user?.id}
+            readAt={item.last_message_read_at}
           />
         )}
       </View>

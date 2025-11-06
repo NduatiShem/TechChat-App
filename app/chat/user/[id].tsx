@@ -1,3 +1,4 @@
+import MessageStatus from '@/components/MessageStatus';
 import ReplyBubble from '@/components/ReplyBubble';
 import ReplyPreview from '@/components/ReplyPreview';
 import UserAvatar from '@/components/UserAvatar';
@@ -43,9 +44,9 @@ export default function UserChatScreen() {
   const { id } = useLocalSearchParams();
   const { currentTheme } = useTheme();
   const { user, isAuthenticated, isLoading } = useAuth();
-  const { resetUnreadCount } = useNotifications();
+  const { updateUnreadCount } = useNotifications();
   const insets = useSafeAreaInsets();
-  const ENABLE_MARK_AS_READ = false; // Temporarily disable until backend route is finalized
+  const ENABLE_MARK_AS_READ = true; // Enable mark as read functionality
   const ENABLE_DELETE_MESSAGE = true; // Enable delete - route exists
   
   // Remove the navigation effect - let the AppLayout handle authentication state changes
@@ -214,18 +215,15 @@ export default function UserChatScreen() {
         }
         
         // Mark messages as read when user opens conversation
-        // Get conversation ID - for user chats, it's typically the user ID or conversation ID
-        const conversationId = res.data.selectedConversation?.conversation_id || 
-                               res.data.selectedConversation?.id || 
-                               id;
+        // Use the new route: PUT /api/messages/mark-read/{userId}
         if (ENABLE_MARK_AS_READ) {
           try {
-            await messagesAPI.markAsRead(Number(conversationId), 'individual');
-            // Reset unread count for this conversation - this will update badge
-            resetUnreadCount(Number(conversationId));
+            await messagesAPI.markMessagesAsRead(Number(id));
+            // Update unread count to 0 for this conversation - this will update badge
+            updateUnreadCount(Number(id), 0);
           } catch (error: any) {
-            // Ignore validation (422) or missing route errors in v1.0.0
-            console.log('markAsRead disabled or failed:', error?.response?.status || error?.message || error);
+            // Ignore validation (422) or missing route errors
+            console.log('markMessagesAsRead failed:', error?.response?.status || error?.message || error);
           }
         }
         
@@ -410,6 +408,50 @@ export default function UserChatScreen() {
       };
     }
   }, [loading, messages.length]);
+
+  // Mark messages as read when conversation is opened
+  useFocusEffect(
+    useCallback(() => {
+      const markMessagesAsRead = async () => {
+        if (!ENABLE_MARK_AS_READ || !id || !user) return;
+        
+        try {
+          // Mark all unread messages from this user as read
+          // Use the new route: PUT /api/messages/mark-read/{userId}
+          await messagesAPI.markMessagesAsRead(Number(id));
+          
+          // Update local messages state to reflect read status
+          // Mark messages as read where sender_id === other user's id and receiver_id === current user's id
+          setMessages(prevMessages => {
+            const now = new Date().toISOString();
+            return prevMessages.map(msg => {
+              // If this message was sent by the other user to the current user and hasn't been read yet
+              if (msg.sender_id === Number(id) && msg.receiver_id === user.id && !msg.read_at) {
+                return { ...msg, read_at: now };
+              }
+              return msg;
+            });
+          });
+          
+          // Update unread count to 0 for this conversation (instead of removing it)
+          // This ensures the UI updates immediately
+          updateUnreadCount(Number(id), 0);
+          
+          console.log('Messages marked as read for conversation:', id);
+        } catch (error) {
+          console.error('Error marking messages as read:', error);
+          // Don't show error to user - this is a background operation
+        }
+      };
+
+      // Small delay to ensure screen is fully loaded
+      const timer = setTimeout(() => {
+        markMessagesAsRead();
+      }, 300);
+
+      return () => clearTimeout(timer);
+    }, [id, user, ENABLE_MARK_AS_READ, updateUnreadCount])
+  );
 
   // Handle mobile hardware back button
   useFocusEffect(
@@ -998,6 +1040,7 @@ export default function UserChatScreen() {
             isMine={isMine}
             timestamp={timestamp}
             textPart={voiceMessageData.textPart}
+            readAt={item.read_at}
           />
         </TouchableOpacity>
       );
@@ -1128,14 +1171,28 @@ export default function UserChatScreen() {
                   />
                 </TouchableOpacity>
                 
-                {/* Timestamp below image */}
-                <Text style={{ 
-                  fontSize: 10, 
-                  color: isMine ? '#E0E7FF' : '#6B7280',
+                {/* Timestamp and read receipt below image */}
+                <View style={{ 
+                  flexDirection: 'row', 
+                  alignItems: 'center', 
                   alignSelf: 'flex-end',
-                  marginTop: 2,
+                  marginTop: 4,
                   marginRight: 2,
-                }}>{timestamp}</Text>
+                  gap: 4,
+                }}>
+                  <Text style={{ 
+                    fontSize: 10, 
+                    color: isMine ? '#E0E7FF' : '#6B7280',
+                  }}>{timestamp}</Text>
+                  {/* Show read receipt only for messages we sent */}
+                  {isMine && (
+                    <MessageStatus 
+                      readAt={item.read_at} 
+                      isDark={isDark}
+                      size={12}
+                    />
+                  )}
+                </View>
               </View>
             ) : (
               <View style={{ width: '100%', overflow: 'hidden' }}>
@@ -1220,22 +1277,30 @@ export default function UserChatScreen() {
                   </TouchableOpacity>
                 </View>
                 
-                {/* Timestamp inside bubble at bottom right */}
-                <View style={{ width: '100%', flexDirection: 'row', justifyContent: 'flex-end', marginTop: 4 }}>
+                {/* Timestamp and read receipt inside bubble at bottom right */}
+                <View style={{ width: '100%', flexDirection: 'row', justifyContent: 'flex-end', alignItems: 'center', marginTop: 4 }}>
                   <Text style={{ 
                     fontSize: 10, 
                     color: isMine ? '#E0E7FF' : '#6B7280',
-                    marginRight: 0,
+                    marginRight: 4,
                   }}>
                     {timestamp}
                   </Text>
+                  {/* Show read receipt only for messages we sent */}
+                  {isMine && (
+                    <MessageStatus 
+                      readAt={item.read_at} 
+                      isDark={isDark}
+                      size={12}
+                    />
+                  )}
                 </View>
               </View>
             )
           )}
           
           {/* Message content and timestamp in a flex container */}
-          <View style={{ width: '100%' }}>
+          <View style={{ alignSelf: 'flex-start', maxWidth: '100%' }}>
             {/* Display message text - NEVER show [IMAGE] or [FILE] markers as text */}
             {!isVoiceMessage && (
               messageText && messageText.trim() ? (
@@ -1245,11 +1310,7 @@ export default function UserChatScreen() {
                     fontSize: 16,
                     lineHeight: 20,
                     textAlign: 'left',
-                    flexShrink: 0, // Don't shrink text unnecessarily
-                    flexGrow: 1,   // Allow text to grow
                     flexWrap: 'wrap', // Ensure text wraps properly
-                    width: 'auto', // Allow text to take its natural width
-                    marginRight: messageText.length > 30 ? 0 : 40, // Only add margin for short messages
                     wordBreak: 'break-word', // Prevent words from breaking unnecessarily
                   }}
                 >
@@ -1285,20 +1346,32 @@ export default function UserChatScreen() {
               ) : null
             )}
             
-            {/* Timestamp for text messages */}
-            {(!item.attachments || item.attachments.length === 0) && 
-              <Text style={{ 
-                fontSize: 10, 
-                color: isMine ? '#E0E7FF' : '#6B7280',
-                position: 'absolute',
-                bottom: 0,
-                right: 0,
+            {/* Timestamp and read receipt for text messages */}
+            {(!item.attachments || item.attachments.length === 0) && (
+              <View style={{ 
+                flexDirection: 'row',
+                alignItems: 'center',
+                justifyContent: 'flex-end',
+                marginTop: 4,
                 paddingLeft: 4,
-                paddingBottom: 0,
                 paddingRight: 2,
                 backgroundColor: 'transparent',
-              }}>{timestamp}</Text>
-            }
+              }}>
+                <Text style={{ 
+                  fontSize: 10, 
+                  color: isMine ? '#E0E7FF' : '#6B7280',
+                  marginRight: 4,
+                }}>{timestamp}</Text>
+                {/* Show read receipt only for messages we sent */}
+                {isMine && (
+                  <MessageStatus 
+                    readAt={item.read_at} 
+                    isDark={isDark}
+                    size={12}
+                  />
+                )}
+              </View>
+            )}
           </View>
         </View>
         </TouchableOpacity>

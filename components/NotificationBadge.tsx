@@ -1,41 +1,64 @@
-import React from 'react';
-import { View, Text } from 'react-native';
 import { useNotifications } from '@/context/NotificationContext';
+import React from 'react';
+import { Text, View } from 'react-native';
 
 interface NotificationBadgeProps {
   conversationId?: number;
+  count?: number; // Direct count override (for groups tab)
   size?: 'small' | 'medium' | 'large';
 }
 
 export const NotificationBadge: React.FC<NotificationBadgeProps> = ({ 
-  conversationId, 
+  conversationId,
+  count: directCount,
   size = 'medium' 
 }) => {
   const { unreadCount, conversationCounts } = useNotifications();
   
-  const count = conversationId 
-    ? conversationCounts[conversationId] || 0
-    : unreadCount;
+  // Use direct count if provided, otherwise calculate from context
+  const count = directCount !== undefined
+    ? directCount
+    : conversationId 
+      ? conversationCounts[conversationId] || 0
+      : unreadCount;
 
   if (count === 0) return null;
 
-  const sizeClasses = {
-    small: 'w-4 h-4',
-    medium: 'w-5 h-5',
-    large: 'w-6 h-6'
+  const badgeSizes = {
+    small: 16,
+    medium: 20,
+    large: 24
   };
 
   const textSizes = {
-    small: 'text-xs',
-    medium: 'text-xs',
-    large: 'text-sm'
+    small: 10,
+    medium: 11,
+    large: 12
   };
+
+  const badgeSize = badgeSizes[size];
+  const textSize = textSizes[size];
 
   return (
     <View
-      className={`${sizeClasses[size]} rounded-full bg-green-500 items-center justify-center absolute -top-1 -right-1`}
+      style={{
+        position: 'absolute',
+        top: -4,
+        right: -4,
+        minWidth: badgeSize,
+        height: badgeSize,
+        borderRadius: badgeSize / 2,
+        backgroundColor: '#10B981',
+        alignItems: 'center',
+        justifyContent: 'center',
+        paddingHorizontal: count > 99 ? 4 : 0,
+      }}
     >
-      <Text className={`${textSizes[size]} text-white font-bold`}>
+      <Text style={{
+        fontSize: textSize,
+        color: '#FFFFFF',
+        fontWeight: 'bold',
+      }}>
         {count > 99 ? '99+' : count.toString()}
       </Text>
     </View>

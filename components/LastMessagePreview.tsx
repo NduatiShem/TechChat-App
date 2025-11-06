@@ -1,6 +1,7 @@
 import { MaterialCommunityIcons } from '@expo/vector-icons';
 import React from 'react';
 import { StyleSheet, Text, View } from 'react-native';
+import MessageStatus from './MessageStatus';
 
 interface LastMessagePreviewProps {
   message: string;
@@ -12,13 +13,17 @@ interface LastMessagePreviewProps {
     mime: string;
     url: string;
   }>;
+  isFromMe?: boolean; // Whether this message is from the current user
+  readAt?: string | null; // Read receipt timestamp
 }
 
 export default function LastMessagePreview({ 
   message, 
   isDark = false, 
   maxLength = 50,
-  attachments = []
+  attachments = [],
+  isFromMe = false,
+  readAt = null
 }: LastMessagePreviewProps) {
   
   // Check if there are attachments
@@ -29,6 +34,14 @@ export default function LastMessagePreview({
     if (firstAttachment.mime?.startsWith('image/')) {
       return (
         <View style={styles.container}>
+          {/* Show read receipt on the LEFT if message is from us */}
+          {isFromMe && (
+            <MessageStatus 
+              readAt={readAt} 
+              isDark={isDark}
+              size={12}
+            />
+          )}
           <MaterialCommunityIcons 
             name="image" 
             size={16} 
@@ -49,6 +62,14 @@ export default function LastMessagePreview({
     
     return (
       <View style={styles.container}>
+        {/* Show read receipt on the LEFT if message is from us */}
+        {isFromMe && (
+          <MessageStatus 
+            readAt={readAt} 
+            isDark={isDark}
+            size={12}
+          />
+        )}
         <MaterialCommunityIcons 
           name="file-document" 
           size={16} 
@@ -71,6 +92,14 @@ export default function LastMessagePreview({
     
     return (
       <View style={styles.container}>
+        {/* Show read receipt on the LEFT if message is from us */}
+        {isFromMe && (
+          <MessageStatus 
+            readAt={readAt} 
+            isDark={isDark}
+            size={12}
+          />
+        )}
         <MaterialCommunityIcons 
           name="microphone" 
           size={16} 
@@ -94,6 +123,14 @@ export default function LastMessagePreview({
     
     return (
       <View style={styles.container}>
+        {/* Show read receipt on the LEFT if message is from us */}
+        {isFromMe && (
+          <MessageStatus 
+            readAt={readAt} 
+            isDark={isDark}
+            size={12}
+          />
+        )}
         <MaterialCommunityIcons 
           name="microphone" 
           size={16} 
@@ -115,6 +152,14 @@ export default function LastMessagePreview({
   if (imageMatch) {
     return (
       <View style={styles.container}>
+        {/* Show read receipt on the LEFT if message is from us */}
+        {isFromMe && (
+          <MessageStatus 
+            readAt={readAt} 
+            isDark={isDark}
+            size={12}
+          />
+        )}
         <MaterialCommunityIcons 
           name="image" 
           size={16} 
@@ -136,6 +181,14 @@ export default function LastMessagePreview({
   if (fileMatch) {
     return (
       <View style={styles.container}>
+        {/* Show read receipt on the LEFT if message is from us */}
+        {isFromMe && (
+          <MessageStatus 
+            readAt={readAt} 
+            isDark={isDark}
+            size={12}
+          />
+        )}
         <MaterialCommunityIcons 
           name="file-document" 
           size={16} 
@@ -156,6 +209,14 @@ export default function LastMessagePreview({
     if (message.includes('[IMAGE]')) {
       return (
         <View style={styles.container}>
+          {/* Show read receipt on the LEFT if message is from us */}
+          {isFromMe && (
+            <MessageStatus 
+              readAt={readAt} 
+              isDark={isDark}
+              size={12}
+            />
+          )}
           <MaterialCommunityIcons 
             name="image" 
             size={16} 
@@ -174,6 +235,14 @@ export default function LastMessagePreview({
     if (message.includes('[FILE]') || message.includes('[ATTACHMENT]')) {
       return (
         <View style={styles.container}>
+          {/* Show read receipt on the LEFT if message is from us */}
+          {isFromMe && (
+            <MessageStatus 
+              readAt={readAt} 
+              isDark={isDark}
+              size={12}
+            />
+          )}
           <MaterialCommunityIcons 
             name="file-document" 
             size={16} 
@@ -196,6 +265,29 @@ export default function LastMessagePreview({
     : message;
   
   //console.log('Rendering text message:', truncatedMessage);
+  
+  // If message is from us, show read receipt on the LEFT
+  if (isFromMe) {
+    return (
+      <View style={styles.messageContainer}>
+        {/* Show read receipt on the LEFT, before the message */}
+        <MessageStatus 
+          readAt={readAt} 
+          isDark={isDark}
+          size={12}
+        />
+        <Text 
+          style={[
+            styles.messageText,
+            { color: isDark ? '#D1D5DB' : '#4B5563' }
+          ]}
+          numberOfLines={1}
+        >
+          {truncatedMessage || 'No message'}
+        </Text>
+      </View>
+    );
+  }
   
   return (
     <Text 
@@ -230,6 +322,11 @@ const styles = StyleSheet.create({
     fontSize: 14,
     fontWeight: '500',
     flex: 1,
+  },
+  messageContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
   },
   messageText: {
     fontSize: 14,

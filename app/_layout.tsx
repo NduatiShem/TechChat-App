@@ -6,8 +6,8 @@ import { ThemeProvider, useTheme } from "@/context/ThemeContext";
 import { usersAPI } from "@/services/api";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import { Stack, Tabs, usePathname } from "expo-router";
-import { StatusBar } from "expo-status-bar";
 import * as SplashScreen from "expo-splash-screen";
+import { StatusBar } from "expo-status-bar";
 import { useEffect, useRef } from "react";
 import { ActivityIndicator, AppState, View } from "react-native";
 import { SafeAreaProvider } from "react-native-safe-area-context";
@@ -18,7 +18,7 @@ SplashScreen.preventAutoHideAsync();
 
 function AppTabsLayout() {
   const { currentTheme } = useTheme();
-  const { unreadCount, resetAllCounts, updateUnreadCount } = useNotifications();
+  const { unreadCount, groupUnreadCount, resetAllCounts, updateUnreadCount } = useNotifications();
   const { isAuthenticated } = useAuth();
   const pathname = usePathname();
   const isDark = currentTheme === 'dark';
@@ -64,7 +64,7 @@ function AppTabsLayout() {
           updateUnreadCount(parseInt(conversationId), count as number);
         });
       }
-    } catch (error) {
+    } catch (error: any) {
       // Ignore backend errors for unread sync in v1.0.0
       console.log('Unread count sync disabled or failed:', error?.message || error);
     }
@@ -169,7 +169,12 @@ function AppTabsLayout() {
           options={{
             title: "Groups",
             tabBarIcon: ({ color, size }) => (
-              <MaterialCommunityIcons name="account-group" size={size} color={color} />
+              <View style={{ position: 'relative', width: size, height: size }}>
+                <MaterialCommunityIcons name="account-group" size={size} color={color} />
+                {groupUnreadCount > 0 && (
+                  <NotificationBadge count={groupUnreadCount} size="small" />
+                )}
+              </View>
             ),
           }}
         />
