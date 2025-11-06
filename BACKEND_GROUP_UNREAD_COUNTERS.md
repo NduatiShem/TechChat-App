@@ -118,6 +118,12 @@ public function index()
 
 **File:** `app/Http/Controllers/Api/MessageController.php`
 
+**IMPORTANT:** Make sure you import the correct `MessageRead` model at the top of your controller:
+
+```php
+use App\Models\MessageRead; // ✅ Use the Model, not the Event
+```
+
 Add this method:
 
 ```php
@@ -153,9 +159,15 @@ public function markGroupMessagesAsRead(Request $request)
     // Create read records for all unread messages
     $unreadCount = 0;
     foreach ($unreadMessages as $message) {
-        MessageRead::updateOrCreate(
-            ['message_id' => $message->id, 'user_id' => $user->id],
-            ['group_id' => $message->group_id]
+        // ✅ IMPORTANT: Use App\Models\MessageRead (the Model), not App\Events\MessageRead (the Event)
+        \App\Models\MessageRead::updateOrCreate(
+            [
+                'message_id' => $message->id, 
+                'user_id' => $user->id
+            ],
+            [
+                'group_id' => $message->group_id
+            ]
         );
         $unreadCount++;
     }

@@ -25,6 +25,8 @@ export default function LastMessagePreview({
   isFromMe = false,
   readAt = null
 }: LastMessagePreviewProps) {
+  // Ensure message is always a string
+  const safeMessage = message || '';
   
   // Check if there are attachments
   if (attachments && attachments.length > 0) {
@@ -86,8 +88,8 @@ export default function LastMessagePreview({
   }
   
   // Check if this is a voice message (starts with 🎤 or [VOICE_MESSAGE:])
-  if (message.startsWith('🎤 ')) {
-    const duration = message.substring(2); // Remove the 🎤 and space
+  if (safeMessage.startsWith('🎤 ')) {
+    const duration = safeMessage.substring(2); // Remove the 🎤 and space
     //console.log('Rendering voice message with duration:', duration);
     
     return (
@@ -116,7 +118,7 @@ export default function LastMessagePreview({
   }
   
   // Check if this is a voice message in [VOICE_MESSAGE:duration] format
-  const voiceMatch = message.match(/^\[VOICE_MESSAGE:(\d+)\]$/);
+  const voiceMatch = safeMessage.match(/^\[VOICE_MESSAGE:(\d+)\]$/);
   if (voiceMatch) {
     const duration = parseInt(voiceMatch[1]);
     const formattedDuration = duration < 60 ? `${duration}s` : `${Math.floor(duration / 60)}:${(duration % 60).toString().padStart(2, '0')}`;
@@ -148,7 +150,7 @@ export default function LastMessagePreview({
   
   // Check if this is an image message in [IMAGE] format (similar to voice messages)
   // Matches [IMAGE] at the end, optionally with text before it
-  const imageMatch = message && message.match(/\s*\[IMAGE\]$/);
+  const imageMatch = safeMessage && safeMessage.match(/\s*\[IMAGE\]$/);
   if (imageMatch) {
     return (
       <View style={styles.container}>
@@ -177,7 +179,7 @@ export default function LastMessagePreview({
   
   // Check if this is a file message in [FILE] format (similar to voice messages)
   // Matches [FILE] at the end, optionally with text before it
-  const fileMatch = message && message.match(/\s*\[FILE\]$/);
+  const fileMatch = safeMessage && safeMessage.match(/\s*\[FILE\]$/);
   if (fileMatch) {
     return (
       <View style={styles.container}>
@@ -205,8 +207,8 @@ export default function LastMessagePreview({
   }
   
   // Check if message contains attachment indicators (fallback for when backend doesn't send attachment data)
-  if (message && (message.includes('[IMAGE]') || message.includes('[FILE]') || message.includes('[ATTACHMENT]'))) {
-    if (message.includes('[IMAGE]')) {
+  if (safeMessage && (safeMessage.includes('[IMAGE]') || safeMessage.includes('[FILE]') || safeMessage.includes('[ATTACHMENT]'))) {
+    if (safeMessage.includes('[IMAGE]')) {
       return (
         <View style={styles.container}>
           {/* Show read receipt on the LEFT if message is from us */}
@@ -232,7 +234,7 @@ export default function LastMessagePreview({
       );
     }
     
-    if (message.includes('[FILE]') || message.includes('[ATTACHMENT]')) {
+    if (safeMessage.includes('[FILE]') || safeMessage.includes('[ATTACHMENT]')) {
       return (
         <View style={styles.container}>
           {/* Show read receipt on the LEFT if message is from us */}
@@ -260,9 +262,9 @@ export default function LastMessagePreview({
   }
   
   // Regular text message - truncate if too long
-  const truncatedMessage = message && message.length > maxLength 
-    ? message.substring(0, maxLength) + '...'
-    : message;
+  const truncatedMessage = safeMessage && safeMessage.length > maxLength 
+    ? safeMessage.substring(0, maxLength) + '...'
+    : safeMessage;
   
   //console.log('Rendering text message:', truncatedMessage);
   

@@ -18,7 +18,7 @@ SplashScreen.preventAutoHideAsync();
 
 function AppTabsLayout() {
   const { currentTheme } = useTheme();
-  const { unreadCount, groupUnreadCount, resetAllCounts, updateUnreadCount } = useNotifications();
+  const { unreadCount, groupUnreadCount, updateGroupUnreadCount, resetAllCounts, updateUnreadCount } = useNotifications();
   const { isAuthenticated } = useAuth();
   const pathname = usePathname();
   const isDark = currentTheme === 'dark';
@@ -70,6 +70,32 @@ function AppTabsLayout() {
     }
   };
 
+  // Load groups to update group unread count when app starts
+  const loadGroupsForCounter = async () => {
+    if (!isAuthenticated) return;
+    
+    try {
+      const { groupsAPI } = await import('@/services/api');
+      const response = await groupsAPI.getAll();
+      const groupsData = response.data;
+      
+      // Calculate total group unread count
+      if (Array.isArray(groupsData)) {
+        let totalGroupUnread = 0;
+        groupsData.forEach((group: any) => {
+          const unreadCount = group.unread_count || 0;
+          totalGroupUnread += unreadCount;
+        });
+        
+        // Update group unread count in context
+        updateGroupUnreadCount(totalGroupUnread);
+      }
+    } catch (error: any) {
+      // Silently fail - groups counter will update when Groups tab is opened
+      console.log('Failed to load groups for counter:', error?.message || error);
+    }
+  };
+
   // Handle app state changes for badge management and last_seen updates
   useEffect(() => {
     if (!isAuthenticated) return; // Don't set up if not authenticated
@@ -82,6 +108,8 @@ function AppTabsLayout() {
           // Badge will be updated based on actual unread count from backend
           updateLastSeen().catch(err => console.error('updateLastSeen error:', err));
           syncUnreadCount().catch(err => console.error('syncUnreadCount error:', err));
+          // Load groups to update group counter when app becomes active
+          loadGroupsForCounter().catch(err => console.error('loadGroupsForCounter error:', err));
           
           // Set up periodic updates every 2 minutes while app is active
           if (lastSeenIntervalRef.current) {
@@ -112,6 +140,8 @@ function AppTabsLayout() {
       updateLastSeen().catch(err => console.error('Initial updateLastSeen error:', err));
       // Sync unread count and badge when app starts
       syncUnreadCount().catch(err => console.error('Initial syncUnreadCount error:', err));
+      // Load groups to update group counter when app starts
+      loadGroupsForCounter().catch(err => console.error('Initial loadGroupsForCounter error:', err));
       // Set up periodic updates
       lastSeenIntervalRef.current = setInterval(() => {
         updateLastSeen().catch(err => console.error('Interval updateLastSeen error:', err));

@@ -50,7 +50,7 @@ export default function GroupsScreen() {
   const [isRefreshing, setIsRefreshing] = useState(false);
   const { user } = useAuth();
   const { currentTheme } = useTheme();
-  const { updateUnreadCount, updateGroupUnreadCount } = useNotifications();
+  const { updateGroupUnreadCount } = useNotifications();
 
   const isDark = currentTheme === 'dark';
 
@@ -65,10 +65,10 @@ export default function GroupsScreen() {
         groupsData.forEach((group) => {
           const unreadCount = group.unread_count || 0;
           totalGroupUnread += unreadCount;
-          // Update count for each group
-          updateUnreadCount(Number(group.id), unreadCount);
+          // Don't call updateUnreadCount for groups - that's only for individual conversations
+          // Groups have their own counter (groupUnreadCount)
         });
-        // Update total group unread count
+        // Update total group unread count (separate from individual conversations)
         updateGroupUnreadCount(totalGroupUnread);
       }
       
@@ -111,16 +111,22 @@ export default function GroupsScreen() {
   );
 
   const formatDate = (dateString: string) => {
-    const date = new Date(dateString);
-    const now = new Date();
-    const diffInHours = (now.getTime() - date.getTime()) / (1000 * 60 * 60);
+    if (!dateString) return '';
+    try {
+      const date = new Date(dateString);
+      if (isNaN(date.getTime())) return '';
+      const now = new Date();
+      const diffInHours = (now.getTime() - date.getTime()) / (1000 * 60 * 60);
 
-    if (diffInHours < 24) {
-      return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-    } else if (diffInHours < 168) { // 7 days
-      return date.toLocaleDateString([], { weekday: 'short' });
-    } else {
-      return date.toLocaleDateString([], { month: 'short', day: 'numeric' });
+      if (diffInHours < 24) {
+        return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      } else if (diffInHours < 168) { // 7 days
+        return date.toLocaleDateString([], { weekday: 'short' });
+      } else {
+        return date.toLocaleDateString([], { month: 'short', day: 'numeric' });
+      }
+    } catch (error) {
+      return '';
     }
   };
 
@@ -163,11 +169,14 @@ export default function GroupsScreen() {
               }`}
               numberOfLines={1}
             >
-              {item.name}
+              {item.name || ''}
             </Text>
             {/* Show unread count on the right side - like WhatsApp */}
             {item.unread_count && item.unread_count > 0 && (
-              <View className="ml-2 min-w-[20] h-5 px-1.5 rounded-full bg-green-500 items-center justify-center">
+              <View 
+                className="ml-2 h-5 px-1.5 rounded-full bg-green-500 items-center justify-center"
+                style={{ minWidth: 20 }}
+              >
                 <Text className="text-white text-xs font-bold">
                   {item.unread_count > 99 ? '99+' : item.unread_count.toString()}
                 </Text>
@@ -189,7 +198,7 @@ export default function GroupsScreen() {
                   isDark ? 'text-gray-400' : 'text-gray-500'
                 }`}
               >
-                {formatDate(item.last_message_date)}
+                {formatDate(item.last_message_date) || ''}
               </Text>
             )}
           </View>
@@ -202,13 +211,13 @@ export default function GroupsScreen() {
             }`}
             numberOfLines={1}
           >
-            {item.description}
+            {item.description || ''}
           </Text>
         )}
         
         {item.last_message && (
           <LastMessagePreview
-            message={item.last_message}
+            message={item.last_message || ''}
             isDark={isDark}
             attachments={item.last_message_attachments}
           />
@@ -278,7 +287,7 @@ export default function GroupsScreen() {
                 isDark ? 'text-gray-400' : 'text-gray-600'
               }`}
             >
-              {groups.length} group{groups.length !== 1 ? 's' : ''} available
+              {groups.length || 0} group{(groups.length || 0) !== 1 ? 's' : ''} available
             </Text>
           </View>
           {isAdmin && (
