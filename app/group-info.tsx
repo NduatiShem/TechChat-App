@@ -52,6 +52,7 @@ export default function GroupInfoScreen() {
   const [isDeleting, setIsDeleting] = useState(false);
   const [isUpdating, setIsUpdating] = useState(false);
   const [isAddingMembers, setIsAddingMembers] = useState(false);
+  const [isLeaving, setIsLeaving] = useState(false);
   const [isEditModalVisible, setIsEditModalVisible] = useState(false);
   const [isAddMemberModalVisible, setIsAddMemberModalVisible] = useState(false);
   const [editName, setEditName] = useState('');
@@ -408,6 +409,65 @@ export default function GroupInfoScreen() {
       Alert.alert('Upload Failed', errorMessage);
     } finally {
       setAvatarUploading(false);
+    }
+  };
+
+  const handleLeaveGroup = () => {
+    // Don't allow owner to leave - they need to delete or transfer ownership
+    if (isOwner) {
+      Alert.alert(
+        'Cannot Leave Group',
+        'As the group owner, you cannot leave the group. You can either delete the group or transfer ownership to another member.',
+        [{ text: 'OK' }]
+      );
+      return;
+    }
+
+    Alert.alert(
+      'Leave Group',
+      `Are you sure you want to leave "${groupInfo?.name}"? You will no longer receive messages from this group.`,
+      [
+        {
+          text: 'Cancel',
+          style: 'cancel',
+        },
+        {
+          text: 'Leave',
+          style: 'destructive',
+          onPress: confirmLeaveGroup,
+        },
+      ]
+    );
+  };
+
+  const confirmLeaveGroup = async () => {
+    setIsLeaving(true);
+    try {
+      await groupsAPI.leaveGroup(Number(id));
+      Alert.alert(
+        'Success',
+        'You have left the group successfully!',
+        [
+          {
+            text: 'OK',
+            onPress: () => {
+              // Navigate back to groups list
+              router.replace('/groups');
+            },
+          },
+        ]
+      );
+    } catch (error: any) {
+      console.error('Failed to leave group:', error);
+      let errorMessage = 'Failed to leave group';
+      
+      if (error.response?.data?.message) {
+        errorMessage = error.response.data.message;
+      }
+      
+      Alert.alert('Error', errorMessage);
+    } finally {
+      setIsLeaving(false);
     }
   };
 
@@ -825,6 +885,28 @@ export default function GroupInfoScreen() {
             </View>
           )}
         </View>
+
+        {/* Leave Group Section - Visible to all members except owner */}
+        {!isOwner && (
+          <View className="p-4 border-t border-gray-200 dark:border-gray-700">
+            <TouchableOpacity
+              onPress={handleLeaveGroup}
+              disabled={isLeaving}
+              className={`flex-row items-center p-4 rounded-lg ${
+                isDark ? 'bg-orange-900/20' : 'bg-orange-50'
+              }`}
+            >
+              <MaterialCommunityIcons
+                name="exit-to-app"
+                size={24}
+                color="#F97316"
+              />
+              <Text className="ml-3 text-base text-orange-600 dark:text-orange-400 font-medium">
+                {isLeaving ? 'Leaving...' : 'Leave Group'}
+              </Text>
+            </TouchableOpacity>
+          </View>
+        )}
 
         {/* Admin Actions */}
         {(isAdmin || isOwner) && (
