@@ -171,9 +171,8 @@ export default function ProfileScreen() {
           }
         );
         fileUri = manipulated.uri;
-        console.log('Image processed via ImageManipulator:', manipulated);
       } catch (manipulatorError) {
-        console.warn('ImageManipulator failed, using original asset URI:', manipulatorError);
+        // Fallback to original URI if manipulation fails
       }
 
       const originalFileName = asset.fileName || `avatar_${Date.now()}.jpg`;
@@ -185,14 +184,6 @@ export default function ProfileScreen() {
         ? originalFileName
         : `avatar_${Date.now()}.${extension === 'jpeg' ? 'jpg' : extension}`;
 
-      console.log('Prepared avatar file:', {
-        fileUri,
-        originalUri: asset.uri,
-        fileName: normalizedFileName,
-        extension,
-        mimeType,
-      });
-
       // Build FormData payload
       const formData = new FormData();
       formData.append('avatar', {
@@ -201,56 +192,14 @@ export default function ProfileScreen() {
         type: mimeType,
       } as any);
 
-      console.log('FormData ready, starting upload...');
-
       const response = await authAPI.uploadAvatar(formData);
-      console.log('Upload success:', response.data);
       
       Alert.alert('Success', 'Avatar updated successfully!');
       await refreshUser();
       setAvatarVersion(Date.now());
 
     } catch (error: any) {
-      console.error('=== AVATAR UPLOAD ERROR ===');
-      console.error('Error type:', error?.constructor?.name || typeof error);
-      console.error('Error message:', error?.message || String(error));
-      console.error('Error response:', error?.response?.data);
-      console.error('Error status:', error?.response?.status);
-      console.error('Error config:', error?.config);
-      console.error('Full error:', error);
-      
-      // Get baseUrl for error message
-      let baseUrlForError = '';
-      try {
-        let apiUrlForError: string;
-        if (__DEV__) {
-          if (Platform.OS === 'android') {
-            apiUrlForError = AppConfig.api.development.physical;
-          } else {
-            apiUrlForError = AppConfig.api.development.ios;
-          }
-        } else {
-          apiUrlForError = AppConfig.api.production;
-        }
-        baseUrlForError = apiUrlForError.replace('/api', '');
-      } catch {
-        baseUrlForError = 'unknown';
-      }
-      
-      let errorMessage = 'Failed to upload avatar.';
-      
-      if (error.message?.includes('Network request failed')) {
-        errorMessage = `Network Error: Cannot connect to server.\n\n` +
-          `Please verify:\n` +
-          `1. Your server is running\n` +
-          `2. Your device is on the same Wi-Fi network\n` +
-          `3. The IP address ${baseUrlForError || 'unknown'} is correct\n` +
-          `4. Your firewall allows connections\n\n` +
-          `Try opening ${baseUrlForError || 'the server URL'} in your device's browser.`;
-      } else {
-        errorMessage = error.message || errorMessage;
-      }
-      
+      const errorMessage = error.message || 'Failed to upload avatar. Please try again.';
       Alert.alert('Upload Failed', errorMessage);
     } finally {
       setAvatarUploading(false);
@@ -310,11 +259,6 @@ export default function ProfileScreen() {
               <Text className={`text-base ${isDark ? 'text-gray-300' : 'text-gray-600'}`}>
               {user?.email}
             </Text>
-            {user?.avatar_url && (
-              <Text className={`text-xs mt-1 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
-                Avatar URL: <Text selectable>{user.avatar_url}</Text>
-              </Text>
-            )}
             {user?.is_admin !== undefined && (
               <View className="flex-row items-center mt-1">
                 <MaterialCommunityIcons

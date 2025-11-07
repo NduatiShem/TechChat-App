@@ -41,6 +41,12 @@ interface Conversation {
     mime: string;
     url: string;
   }>;
+  user?: {
+    id: number;
+    name: string;
+    email: string;
+    avatar_url?: string;
+  };
 }
 
 export default function ConversationsScreen() {
@@ -163,31 +169,17 @@ export default function ConversationsScreen() {
   };
 
   const renderConversation = ({ item }: { item: Conversation }) => {
-    // Debug: Log the conversation item to understand the data structure
-    console.log('Conversation item:', {
-      id: item.id,
-      name: item.name,
-      is_user: item.is_user,
-      is_group: item.is_group,
-      email: item.email,
-      last_message_sender_id: item.last_message_sender_id,
-      last_message_read_at: item.last_message_read_at,
-      current_user_id: user?.id,
-      isFromMe: item.last_message_sender_id === user?.id
-    });
+    // Get avatar URL from either flat structure or nested user object
+    const avatarUrl = item.avatar_url || item.user?.avatar_url;
     
     return (
       <TouchableOpacity
         onPress={() => {
-          console.log('Clicked conversation:', item.name, 'ID:', item.id, 'is_user:', item.is_user, 'is_group:', item.is_group);
-          console.log('Full item data:', item);
-          
           if (item.is_group) {
             router.push(`/chat/group/${item.id}`);
           } else {
             // For user conversations, use user_id if available, otherwise fall back to id
             const userId = item.user_id || item.id;
-            console.log('Navigating to user chat with ID:', userId);
             router.push(`/chat/user/${userId}`);
           }
         }}
@@ -198,7 +190,7 @@ export default function ConversationsScreen() {
       {/* Avatar - no badge on avatar */}
       <View className="relative mr-4">
         <UserAvatar
-          avatarUrl={item.avatar_url}
+          avatarUrl={avatarUrl}
           name={item.name}
           size={48}
         />

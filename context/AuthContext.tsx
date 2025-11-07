@@ -56,13 +56,10 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           
           const response = await Promise.race([profilePromise, timeoutPromise]) as any;
           
-          console.log('AuthContext: Profile response:', response.data);
           // Handle different response structures safely
           const userData = response.data?.data || response.data?.user || response.data;
           if (userData && userData.id) {
-            console.log('AuthContext: User avatar URL on load:', userData.avatar_url);
             setUser(userData);
-            console.log('AuthContext: User set successfully');
           } else {
             console.warn('AuthContext: No user data in response');
             // Don't clear token immediately - might be network issue
