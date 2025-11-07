@@ -2,13 +2,18 @@ import UserAvatar from '@/components/UserAvatar';
 import { useAuth } from '@/context/AuthContext';
 import { useTheme } from '@/context/ThemeContext';
 import { groupsAPI, usersAPI } from '@/services/api';
+import { secureStorage } from '@/utils/secureStore';
 import { MaterialCommunityIcons } from '@expo/vector-icons';
 import { router, useLocalSearchParams } from 'expo-router';
-import React, { useEffect, useState } from 'react';
+import { useFocusEffect } from '@react-navigation/native';
+import * as ImagePicker from 'expo-image-picker';
+import * as ImageManipulator from 'expo-image-manipulator';
+import React, { useEffect, useState, useCallback } from 'react';
 import {
     ActivityIndicator,
     Alert,
     FlatList,
+    Image,
     Modal,
     ScrollView,
     Text,
@@ -36,6 +41,8 @@ interface GroupInfo {
   created_at: string;
   updated_at: string;
   users: GroupMember[];
+  avatar_url?: string;
+  profile_image?: string;
 }
 
 export default function GroupInfoScreen() {
@@ -52,6 +59,8 @@ export default function GroupInfoScreen() {
   const [availableUsers, setAvailableUsers] = useState<any[]>([]);
   const [selectedUsers, setSelectedUsers] = useState<number[]>([]);
   const [searchQuery, setSearchQuery] = useState('');
+  const [avatarUploading, setAvatarUploading] = useState(false);
+  const [avatarVersion, setAvatarVersion] = useState(0);
   const { user } = useAuth();
   const { currentTheme } = useTheme();
 
@@ -74,7 +83,7 @@ export default function GroupInfoScreen() {
       const group = response.data.find((g: any) => g.id === Number(id));
       
       if (group) {
-        // Create a basic group info structure
+        // Create a basic group info structure with avatar_url
         setGroupInfo({
           id: group.id,
           name: group.name,
@@ -82,6 +91,7 @@ export default function GroupInfoScreen() {
           owner_id: group.owner_id,
           created_at: group.created_at,
           updated_at: group.updated_at,
+          avatar_url: group.avatar_url, // ✅ Include avatar_url
           users: [] // We don't have user details from getAll()
         });
       } else {
@@ -99,12 +109,26 @@ export default function GroupInfoScreen() {
     loadGroupInfo();
   }, [id, groupData]);
   
+  // Reload group info when screen comes into focus (to get updated avatar)
+  useFocusEffect(
+    useCallback(() => {
+      loadGroupInfo();
+    }, [id])
+  );
+  
   useEffect(() => {
     if (groupInfo) {
       setEditName(groupInfo.name);
       setEditDescription(groupInfo.description || '');
     }
   }, [groupInfo]);
+  
+  useEffect(() => {
+    if (groupInfo?.avatar_url) {
+      // When avatar URL changes, bump the version to bypass cache
+      setAvatarVersion(Date.now());
+    }
+  }, [groupInfo?.avatar_url]);
   
   const loadAvailableUsers = async () => {
     try {
@@ -252,6 +276,141 @@ export default function GroupInfoScreen() {
     }
   };
   
+  const handlePickGroupAvatar = async () => {
+    if (!isAdmin && !isOwner) {
+      Alert.alert('Permission Denied', 'Only administrators or group owners can update group profile picture.');
+      return;
+    }
+
+    try {
+      // Request permission first
+      const permissionResult = await ImagePicker.requestMediaLibraryPermissionsAsync();
+      if (!permissionResult.granted) {
+        Alert.alert(
+          'Permission Required',
+          'Please grant access to your photo library to upload a group avatar.',
+          [{ text: 'OK' }]
+        );
+        return;
+      }
+
+      // Show action sheet to choose source
+      Alert.alert(
+        'Change Group Avatar',
+        'Choose an option',
+        [
+          {
+            text: 'Camera',
+            onPress: async () => {
+              const cameraPermission = await ImagePicker.requestCameraPermissionsAsync();
+              if (!cameraPermission.granted) {
+                Alert.alert('Permission Required', 'Please grant camera access.');
+                return;
+              }
+              await handleImagePicker(ImagePicker.launchCameraAsync);
+            },
+          },
+          {
+            text: 'Photo Library',
+            onPress: async () => {
+              await handleImagePicker(ImagePicker.launchImageLibraryAsync);
+            },
+          },
+          {
+            text: 'Cancel',
+            style: 'cancel',
+          },
+        ],
+        { cancelable: true }
+      );
+    } catch (error: any) {
+      console.error('Avatar picker error:', error);
+      Alert.alert('Error', 'Failed to open image picker');
+    }
+  };
+
+  const handleImagePicker = async (pickerFunction: typeof ImagePicker.launchImageLibraryAsync) => {
+    try {
+      const result = await pickerFunction({
+        mediaTypes: ImagePicker.MediaTypeOptions.Images,
+        allowsEditing: true,
+        aspect: [1, 1],
+        quality: 0.8,
+      });
+
+      if (result.canceled || !result.assets || result.assets.length === 0) {
+        return;
+      }
+
+      const asset = result.assets[0];
+
+      // Check file size
+      if (asset.fileSize && asset.fileSize > 5 * 1024 * 1024) {
+        Alert.alert('Error', 'Image file size must be less than 5MB');
+        return;
+      }
+
+      setAvatarUploading(true);
+
+      // Get authentication token
+      const token = await secureStorage.getItem('auth_token');
+      if (!token) {
+        Alert.alert('Error', 'You must be logged in to upload a group avatar');
+        setAvatarUploading(false);
+        return;
+      }
+
+      // Create a stable file we can reference (manipulateAsync ensures a file:// URI)
+      let fileUri = asset.uri;
+      try {
+        const manipulated = await ImageManipulator.manipulateAsync(
+          asset.uri,
+          [],
+          {
+            compress: 0.9,
+            format: ImageManipulator.SaveFormat.JPEG,
+          }
+        );
+        fileUri = manipulated.uri;
+      } catch (manipulatorError) {
+        // Fallback to original URI if manipulation fails
+      }
+
+      const originalFileName = asset.fileName || `group_avatar_${Date.now()}.jpg`;
+      const extFromName = originalFileName.includes('.') ? originalFileName.split('.').pop() : undefined;
+      const extension = extFromName?.replace(/\s/g, '')?.toLowerCase() || 'jpg';
+      const sanitizedType = asset.type && asset.type.includes('/') ? asset.type : undefined;
+      const mimeType = asset.mimeType || sanitizedType || (extension === 'png' ? 'image/png' : 'image/jpeg');
+      const normalizedFileName = originalFileName.includes('.')
+        ? originalFileName
+        : `group_avatar_${Date.now()}.${extension === 'jpeg' ? 'jpg' : extension}`;
+
+      // Build FormData payload
+      const formData = new FormData();
+      formData.append('avatar', {
+        uri: fileUri,
+        name: normalizedFileName,
+        type: mimeType,
+      } as any);
+
+      const response = await groupsAPI.uploadAvatar(Number(id), formData);
+      
+      // Reload group info to get the updated avatar_url from backend
+      await loadGroupInfo();
+      
+      // Update avatar version for cache busting
+      setAvatarVersion(Date.now());
+      
+      Alert.alert('Success', 'Group avatar updated successfully!');
+
+    } catch (error: any) {
+      const errorMessage = error.response?.data?.message || error.message || 'Failed to upload group avatar. Please try again.';
+      Alert.alert('Upload Failed', errorMessage);
+    } finally {
+      setAvatarUploading(false);
+    }
+  };
+
   const handleRemoveMember = async (memberId: number) => {
     if (!isAdmin && !isOwner) {
       Alert.alert('Permission Denied', 'Only administrators or group owners can remove members.');
@@ -498,11 +657,48 @@ export default function GroupInfoScreen() {
         }`}>
           <View className="flex-row items-center mb-4">
             {/* Group Avatar */}
-            <View className="w-20 h-20 rounded-full bg-primary items-center justify-center mr-4">
-              <Text className="text-white font-bold text-2xl">
-                {getGroupAvatarInitials(groupInfo.name)}
-              </Text>
-            </View>
+            <TouchableOpacity 
+              onPress={handlePickGroupAvatar}
+              disabled={avatarUploading || (!isAdmin && !isOwner)}
+              className="relative"
+            >
+              {groupInfo.avatar_url ? (
+                <View className="relative">
+                  <Image
+                    source={{
+                      uri: `${groupInfo.avatar_url}${groupInfo.avatar_url.includes('?') ? '&' : '?'}v=${avatarVersion}`
+                    }}
+                    style={{ width: 80, height: 80, borderRadius: 40, marginRight: 16 }}
+                  />
+                  {(isAdmin || isOwner) && (
+                    <View className="absolute bottom-0 right-0 bg-blue-500 rounded-full p-1">
+                      <MaterialCommunityIcons name="camera" size={12} color="white" />
+                    </View>
+                  )}
+                  {avatarUploading && (
+                    <View className="absolute inset-0 bg-black/50 rounded-full items-center justify-center">
+                      <ActivityIndicator size="small" color="#fff" />
+                    </View>
+                  )}
+                </View>
+              ) : (
+                <View className="w-20 h-20 rounded-full bg-primary items-center justify-center mr-4 relative">
+                  <Text className="text-white font-bold text-2xl">
+                    {getGroupAvatarInitials(groupInfo.name)}
+                  </Text>
+                  {(isAdmin || isOwner) && (
+                    <View className="absolute bottom-0 right-0 bg-blue-500 rounded-full p-1">
+                      <MaterialCommunityIcons name="camera" size={12} color="white" />
+                    </View>
+                  )}
+                  {avatarUploading && (
+                    <View className="absolute inset-0 bg-black/50 rounded-full items-center justify-center">
+                      <ActivityIndicator size="small" color="#fff" />
+                    </View>
+                  )}
+                </View>
+              )}
+            </TouchableOpacity>
 
             {/* Group Info */}
             <View className="flex-1">

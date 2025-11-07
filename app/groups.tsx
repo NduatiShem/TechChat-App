@@ -1,4 +1,5 @@
 import LastMessagePreview from '@/components/LastMessagePreview';
+import GroupAvatar from '@/components/GroupAvatar';
 import { useAuth } from '@/context/AuthContext';
 import { useNotifications } from '@/context/NotificationContext';
 import { useTheme } from '@/context/ThemeContext';
@@ -30,6 +31,7 @@ interface Group {
   updated_at: string;
   users?: any[];
   unread_count?: number; // Unread message count for this group
+  avatar_url?: string; // Group profile picture URL
   last_message_attachments?: Array<{
     id: number;
     name: string;
@@ -150,9 +152,11 @@ export default function GroupsScreen() {
     >
       {/* Avatar */}
       <View className="relative mr-4">
-        <View className="w-12 h-12 rounded-full bg-primary items-center justify-center">
-          <MaterialCommunityIcons name="account-group" size={24} color="white" />
-        </View>
+        <GroupAvatar
+          avatarUrl={item.avatar_url}
+          name={item.name}
+          size={48}
+        />
         {/* Online indicator for active groups */}
         {item.last_message_date && (
           <View className="absolute -bottom-1 -right-1 w-4 h-4 bg-secondary rounded-full border-2 border-white"></View>

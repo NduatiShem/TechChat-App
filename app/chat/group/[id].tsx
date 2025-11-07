@@ -1,6 +1,7 @@
 import ReplyBubble from '@/components/ReplyBubble';
 import ReplyPreview from '@/components/ReplyPreview';
 import UserAvatar from '@/components/UserAvatar';
+import GroupAvatar from '@/components/GroupAvatar';
 import VoiceMessageBubble from '@/components/VoiceMessageBubble';
 import VoicePlayer from '@/components/VoicePlayer';
 import VoiceRecorder from '@/components/VoiceRecorder';
@@ -1479,11 +1480,11 @@ export default function GroupChatScreen() {
             className="flex-1 flex-row items-center"
           >
             {/* Group Avatar */}
-            <View className="w-12 h-12 rounded-full bg-primary items-center justify-center mr-3">
-              <Text className="text-white font-semibold text-lg">
-                {getGroupAvatarInitials(groupInfo?.name || `Group ${id}`)}
-              </Text>
-            </View>
+            <GroupAvatar
+              avatarUrl={groupInfo?.avatar_url}
+              name={groupInfo?.name || `Group ${id}`}
+              size={48}
+            />
             
             {/* Group Info */}
             <View className="flex-1">

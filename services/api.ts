@@ -312,6 +312,14 @@ export const groupsAPI = {
   
   markMessagesAsRead: (groupId: number) => 
     api.post('/messages/mark-group-read', { groupId }),
+  
+  uploadAvatar: (groupId: number, formData: FormData) => {
+    return api.post(`/groups/${groupId}/avatar`, formData, {
+      headers: {
+        'Content-Type': 'multipart/form-data',
+      },
+    });
+  },
 };
 
 export default api; 
