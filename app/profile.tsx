@@ -6,7 +6,7 @@ import { authAPI } from '@/services/api';
 import { MaterialCommunityIcons } from '@expo/vector-icons';
 import * as ImagePicker from 'expo-image-picker';
 import * as ImageManipulator from 'expo-image-manipulator';
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -25,6 +25,14 @@ export default function ProfileScreen() {
   const { user, logout, refreshUser } = useAuth();
   const { currentTheme, theme, setTheme } = useTheme();
   const [avatarUploading, setAvatarUploading] = useState(false);
+  const [avatarVersion, setAvatarVersion] = useState(0);
+
+  useEffect(() => {
+    if (user?.avatar_url) {
+      // When avatar URL changes, bump the version to bypass cache
+      setAvatarVersion(Date.now());
+    }
+  }, [user?.avatar_url]);
 
   const isDark = currentTheme === 'dark';
 
@@ -200,6 +208,7 @@ export default function ProfileScreen() {
       
       Alert.alert('Success', 'Avatar updated successfully!');
       await refreshUser();
+      setAvatarVersion(Date.now());
 
     } catch (error: any) {
       console.error('=== AVATAR UPLOAD ERROR ===');
@@ -271,7 +280,9 @@ export default function ProfileScreen() {
             {user?.avatar_url ? (
               <View className="relative">
                 <Image
-                    source={{ uri: user.avatar_url }}
+                    source={{
+                      uri: `${user.avatar_url}${user.avatar_url.includes('?') ? '&' : '?'}v=${avatarVersion}`
+                    }}
                   style={{ width: 64, height: 64, borderRadius: 32, marginRight: 16 }}
                 />
                 <View className="absolute bottom-0 right-0 bg-blue-500 rounded-full p-1">
@@ -299,6 +310,11 @@ export default function ProfileScreen() {
               <Text className={`text-base ${isDark ? 'text-gray-300' : 'text-gray-600'}`}>
               {user?.email}
             </Text>
+            {user?.avatar_url && (
+              <Text className={`text-xs mt-1 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
+                Avatar URL: <Text selectable>{user.avatar_url}</Text>
+              </Text>
+            )}
             {user?.is_admin !== undefined && (
               <View className="flex-row items-center mt-1">
                 <MaterialCommunityIcons
