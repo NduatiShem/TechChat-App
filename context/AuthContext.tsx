@@ -192,10 +192,16 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       const token = await secureStorage.getItem('auth_token');
       if (token) {
         const response = await authAPI.getProfile();
-        setUser(response.data.data);
+        const userData = response.data?.data || response.data?.user || response.data;
+        if (userData && userData.id) {
+          setUser(userData);
+        } else {
+          console.warn('RefreshUser: No user data returned, keeping existing user');
+        }
       }
     } catch (error) {
       console.error('Failed to refresh user data:', error);
+      // Do not force logout on refresh failures - keep existing user state
     }
   };
 

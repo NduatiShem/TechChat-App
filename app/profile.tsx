@@ -2,8 +2,10 @@ import { AppConfig } from '@/config/app.config';
 import { useAuth } from '@/context/AuthContext';
 import { useTheme } from '@/context/ThemeContext';
 import { secureStorage } from '@/utils/secureStore';
+import { authAPI } from '@/services/api';
 import { MaterialCommunityIcons } from '@expo/vector-icons';
 import * as ImagePicker from 'expo-image-picker';
+import * as ImageManipulator from 'expo-image-manipulator';
 import React, { useState } from 'react';
 import {
   ActivityIndicator,
@@ -123,6 +125,16 @@ export default function ProfileScreen() {
 
       const asset = result.assets[0];
 
+      console.log('Avatar asset selected:', {
+        uri: asset.uri,
+        mimeType: asset.mimeType,
+        type: asset.type,
+        fileName: asset.fileName,
+        fileSize: asset.fileSize,
+        width: asset.width,
+        height: asset.height,
+      });
+
       // Check file size
       if (asset.fileSize && asset.fileSize > 5 * 1024 * 1024) {
         Alert.alert('Error', 'Image file size must be less than 5MB');
@@ -139,54 +151,51 @@ export default function ProfileScreen() {
         return;
       }
 
-      // Create FormData - same format as messages which work
-      const formData = new FormData();
-      
-      // Same format as messages - they use: { uri, name, type }
-      formData.append('avatar', {
-        uri: asset.uri,
-        name: asset.fileName || `avatar_${Date.now()}.jpg`,
-        type: asset.type || 'image/jpeg',
-      } as any);
-      
-      console.log('FormData created with:', {
-        uri: asset.uri.substring(0, 50) + '...',
-        name: asset.fileName || 'avatar.jpg',
-        type: asset.type || 'image/jpeg',
+      // Create a stable file we can reference (manipulateAsync ensures a file:// URI)
+      let fileUri = asset.uri;
+      try {
+        const manipulated = await ImageManipulator.manipulateAsync(
+          asset.uri,
+          [],
+          {
+            compress: 0.9,
+            format: ImageManipulator.SaveFormat.JPEG,
+          }
+        );
+        fileUri = manipulated.uri;
+        console.log('Image processed via ImageManipulator:', manipulated);
+      } catch (manipulatorError) {
+        console.warn('ImageManipulator failed, using original asset URI:', manipulatorError);
+      }
+
+      const originalFileName = asset.fileName || `avatar_${Date.now()}.jpg`;
+      const extFromName = originalFileName.includes('.') ? originalFileName.split('.').pop() : undefined;
+      const extension = extFromName?.replace(/\s/g, '')?.toLowerCase() || 'jpg';
+      const sanitizedType = asset.type && asset.type.includes('/') ? asset.type : undefined;
+      const mimeType = asset.mimeType || sanitizedType || (extension === 'png' ? 'image/png' : 'image/jpeg');
+      const normalizedFileName = originalFileName.includes('.')
+        ? originalFileName
+        : `avatar_${Date.now()}.${extension === 'jpeg' ? 'jpg' : extension}`;
+
+      console.log('Prepared avatar file:', {
+        fileUri,
+        originalUri: asset.uri,
+        fileName: normalizedFileName,
+        extension,
+        mimeType,
       });
 
-      console.log('=== AVATAR UPLOAD START ===');
-      console.log('Token exists:', !!token);
-      console.log('FormData file:', {
-        uri: asset.uri.substring(0, 50) + '...',
-        name: asset.fileName || 'avatar.jpg',
-        type: asset.type || 'image/jpeg',
-        size: asset.fileSize
-      });
-      
-      // FINAL APPROACH: Verify the endpoint route exists first
-      // Messages use: /messages - that works
-      // Avatar should use: /user/avatar - but maybe the route is different?
-      console.log('=== AVATAR UPLOAD DEBUG ===');
-      
-      const { default: api } = await import('@/services/api');
-      const baseURL = api.defaults.baseURL;
-      console.log('API Base URL:', baseURL);
-      console.log('Attempting endpoint:', `${baseURL}/user/avatar`);
-      
-      // QUESTION: Is the backend route /api/user/avatar or /api/users/avatar?
-      // Check your backend routes/api.php file to confirm the exact route
-      
-      // Try with exact messages pattern - messages work, so copy exactly
-      console.log('Using axios with Content-Type header (same as messages)...');
-      
-      const response = await api.post('/user/avatar', formData, {
-        headers: {
-          'Content-Type': 'multipart/form-data',
-        },
-        timeout: 60000,
-      });
-      
+      // Build FormData payload
+      const formData = new FormData();
+      formData.append('avatar', {
+        uri: fileUri,
+        name: normalizedFileName,
+        type: mimeType,
+      } as any);
+
+      console.log('FormData ready, starting upload...');
+
+      const response = await authAPI.uploadAvatar(formData);
       console.log('Upload success:', response.data);
       
       Alert.alert('Success', 'Avatar updated successfully!');
