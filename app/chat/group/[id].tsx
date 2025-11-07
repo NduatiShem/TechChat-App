@@ -1214,21 +1214,33 @@ export default function GroupChatScreen() {
             {/* Display message text - NEVER show [IMAGE] or [FILE] markers as text */}
             {!isVoiceMessage && (
               messageText && messageText.trim() ? (
-                <LinkText
-                  text={messageText}
-                  textStyle={{ 
-                    color: isMine ? '#fff' : (isDark ? '#fff' : '#111827'),
-                    fontSize: 16,
-                    lineHeight: 20,
-                    textAlign: 'left',
-                  }}
-                  linkStyle={{
-                    fontSize: 16,
-                    lineHeight: 20,
-                  }}
-                  isDark={isDark}
-                  onVideoPress={(url) => setVideoUrl(url)}
-                />
+                <View>
+                  <LinkText
+                    text={messageText}
+                    textStyle={{ 
+                      color: isMine ? '#fff' : (isDark ? '#fff' : '#111827'),
+                      fontSize: 16,
+                      lineHeight: 20,
+                      textAlign: 'left',
+                    }}
+                    linkStyle={{
+                      fontSize: 16,
+                      lineHeight: 20,
+                    }}
+                    isDark={isDark}
+                    onVideoPress={(url) => setVideoUrl(url)}
+                  />
+                  {/* Timestamp below text message */}
+                  {(!item.attachments || item.attachments.length === 0) && (
+                    <View style={{ flexDirection: 'row', justifyContent: 'flex-end', marginTop: 4 }}>
+                      <Text style={{ 
+                        fontSize: 10, 
+                        color: isMine ? '#E0E7FF' : '#6B7280',
+                        paddingRight: 2,
+                      }}>{timestamp}</Text>
+                    </View>
+                  )}
+                </View>
               ) : (!item.attachments || item.attachments.length === 0) && item.message ? (
                 // If message exists but messageText is null, show original message
                 // BUT filter out [IMAGE] and [FILE] markers
@@ -1242,42 +1254,37 @@ export default function GroupChatScreen() {
                   const cleaned = rawMessage.replace(/\s*\[IMAGE\]$/g, '').replace(/\s*\[FILE\]$/g, '').trim();
                   if (cleaned) {
                     return (
-                      <LinkText
-                        text={cleaned}
-                        textStyle={{ 
-                          color: isMine ? '#fff' : (isDark ? '#fff' : '#111827'),
-                          fontSize: 16,
-                          lineHeight: 20,
-                          textAlign: 'left',
-                        }}
-                        linkStyle={{
-                          fontSize: 16,
-                          lineHeight: 20,
-                        }}
-                        isDark={isDark}
-                        onVideoPress={(url) => setVideoUrl(url)}
-                      />
+                      <View>
+                        <LinkText
+                          text={cleaned}
+                          textStyle={{ 
+                            color: isMine ? '#fff' : (isDark ? '#fff' : '#111827'),
+                            fontSize: 16,
+                            lineHeight: 20,
+                            textAlign: 'left',
+                          }}
+                          linkStyle={{
+                            fontSize: 16,
+                            lineHeight: 20,
+                          }}
+                          isDark={isDark}
+                          onVideoPress={(url) => setVideoUrl(url)}
+                        />
+                        {/* Timestamp below text message */}
+                        <View style={{ flexDirection: 'row', justifyContent: 'flex-end', marginTop: 4 }}>
+                          <Text style={{ 
+                            fontSize: 10, 
+                            color: isMine ? '#E0E7FF' : '#6B7280',
+                            paddingRight: 2,
+                          }}>{timestamp}</Text>
+                        </View>
+                      </View>
                     );
                   }
                   return null;
                 })()
               ) : null
             )}
-            
-            {/* Timestamp for text messages */}
-            {(!item.attachments || item.attachments.length === 0) && 
-              <Text style={{ 
-                fontSize: 10, 
-                color: isMine ? '#E0E7FF' : '#6B7280',
-                position: 'absolute',
-                bottom: 0,
-                right: 0,
-                paddingLeft: 4,
-                paddingBottom: 0,
-                paddingRight: 2,
-                backgroundColor: 'transparent',
-              }}>{timestamp}</Text>
-            }
           </View>
         </View>
         </TouchableOpacity>
