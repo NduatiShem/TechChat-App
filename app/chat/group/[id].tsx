@@ -4,6 +4,9 @@ import UserAvatar from '@/components/UserAvatar';
 import VoiceMessageBubble from '@/components/VoiceMessageBubble';
 import VoicePlayer from '@/components/VoicePlayer';
 import VoiceRecorder from '@/components/VoiceRecorder';
+import LinkText from '@/components/LinkText';
+import VideoPlayer from '@/components/VideoPlayer';
+import { isVideoAttachment } from '@/utils/textUtils';
 import { AppConfig } from '@/config/app.config';
 import { useAuth } from '@/context/AuthContext';
 import { useNotifications } from '@/context/NotificationContext';
@@ -112,9 +115,11 @@ export default function GroupChatScreen() {
   const [replyingTo, setReplyingTo] = useState<any>(null);
   const [showImagePreview, setShowImagePreview] = useState<string | null>(null);
   const [showMessageOptions, setShowMessageOptions] = useState<number | null>(null);
+  const [videoUrl, setVideoUrl] = useState<string | null>(null);
   const [keyboardHeight, setKeyboardHeight] = useState(0);
 
   const flatListRef = useRef<FlatList>(null);
+  const isInitialLoad = useRef(true);
   
   // Pagination state
   const [currentPage, setCurrentPage] = useState(1);
@@ -128,6 +133,7 @@ export default function GroupChatScreen() {
     try {
       setLoading(true);
       setHasScrolledToBottom(false); // Reset scroll flag when fetching new messages
+      isInitialLoad.current = true; // Reset initial load flag
       const response = await messagesAPI.getByGroup(Number(id), 1, 10);
       // Handle Laravel pagination format
       const messagesData = response.data.messages?.data || response.data.messages || [];
@@ -171,76 +177,14 @@ export default function GroupChatScreen() {
       setMessages(sortedMessages);
       setGroupInfo(response.data.selectedConversation);
       
-      // Set loading to false BEFORE scroll attempts so scroll handlers can work
+      // Set loading to false - scroll will happen after content is rendered
       setLoading(false);
       
       // Reset scroll flag to allow initial scroll
       setHasScrolledToBottom(false);
+      isInitialLoad.current = true;
       
-      // Immediately try to scroll to bottom after messages are set
-      // Use multiple attempts with increasing delays to ensure it works
-      if (sortedMessages.length > 0) {
-        const newestMessageId = pagination.newest_message_id;
-        let lastIndex = sortedMessages.length - 1;
-        
-        // If we have newest_message_id, find its index after sorting
-        if (newestMessageId) {
-          const newestIndex = sortedMessages.findIndex(msg => msg.id === newestMessageId);
-          if (newestIndex >= 0) {
-            lastIndex = newestIndex;
-            console.log('Found newest message at index (group):', newestIndex, 'ID:', newestMessageId);
-          } else {
-            console.log('Newest message ID not found in sorted messages (group), using last index');
-          }
-        }
-        
-        // Multiple scroll attempts with increasing delays
-        const scrollAttempts = [50, 150, 300, 500];
-        scrollAttempts.forEach((delay, index) => {
-          setTimeout(() => {
-            if (flatListRef.current && sortedMessages.length > 0) {
-              try {
-                // Try scrollToEnd first (most reliable)
-                flatListRef.current.scrollToEnd({ animated: false });
-                console.log(`Group scroll attempt ${index + 1} (scrollToEnd) at ${delay}ms`);
-                
-                // Also try scrollToIndex as backup
-                if (lastIndex >= 0) {
-                  setTimeout(() => {
-                    if (flatListRef.current) {
-                      try {
-                        flatListRef.current.scrollToIndex({ 
-                          index: lastIndex, 
-                          animated: false,
-                          viewPosition: 1
-                        });
-                        console.log(`Group scroll attempt ${index + 1} (scrollToIndex) to index ${lastIndex}`);
-                      } catch (e) {
-                        // Ignore - scrollToEnd might have worked
-                      }
-                    }
-                  }, 50);
-                }
-              } catch (error) {
-                console.log(`Group scroll attempt ${index + 1} failed:`, error);
-                // Fallback to scrollToIndex
-                if (lastIndex >= 0 && flatListRef.current) {
-                  try {
-                    flatListRef.current.scrollToIndex({ 
-                      index: lastIndex, 
-                      animated: false,
-                      viewPosition: 1
-                    });
-                    console.log(`Group scroll attempt ${index + 1} (fallback scrollToIndex) to index ${lastIndex}`);
-                  } catch (e) {
-                    console.log(`Group fallback scroll also failed:`, e);
-                  }
-                }
-              }
-            }
-          }, delay);
-        });
-      }
+      // Scroll will happen after content is rendered via onContentSizeChange and onLayout
       
       // Mark messages as read when user opens group conversation
       const groupId = Number(id);
@@ -263,61 +207,8 @@ export default function GroupChatScreen() {
     }
   };
 
-  // Force scroll to bottom when component first loads (after images render)
-  useEffect(() => {
-    if (flatListRef.current && messages.length > 0 && !loading && !hasScrolledToBottom) {
-      // Check if last message has images - if so, wait longer
-      const lastMessage = messages[messages.length - 1];
-      const hasImages = lastMessage?.attachments?.some((att: any) => 
-        att.mime?.startsWith('image/') || att.type?.startsWith('image/')
-      );
-      
-      // Use InteractionManager to wait for all interactions to complete
-      const interactionHandle = InteractionManager.runAfterInteractions(() => {
-        // Multiple scroll attempts with increasing delays to ensure it works
-        const delays = hasImages ? [200, 500, 1000] : [100, 300, 600];
-        
-        delays.forEach((delay, index) => {
-          setTimeout(() => {
-            if (flatListRef.current && messages.length > 0 && !hasScrolledToBottom) {
-              try {
-                // Use scrollToEnd as primary method - it's more reliable for scrolling to bottom
-                flatListRef.current.scrollToEnd({ animated: false });
-                if (index === delays.length - 1) {
-                  // Only set flag on last attempt to avoid premature flag setting
-                  setHasScrolledToBottom(true);
-                  console.log(`Initial scroll to bottom completed via scrollToEnd (attempt ${index + 1}, group)`);
-                }
-              } catch (error) {
-                console.warn(`Scroll attempt ${index + 1} failed (group):`, error);
-                // Last resort: try scrollToIndex
-                if (index === delays.length - 1) {
-                  try {
-                    const lastIndex = messages.length - 1;
-                    if (lastIndex >= 0) {
-                      flatListRef.current.scrollToIndex({ 
-                        index: lastIndex, 
-                        animated: false,
-                        viewPosition: 1
-                      });
-                      setHasScrolledToBottom(true);
-                      console.log('Initial scroll to bottom completed via scrollToIndex (fallback, group)');
-                    }
-                  } catch (scrollError) {
-                    console.warn('All scroll attempts failed (group):', scrollError);
-                  }
-                }
-              }
-            }
-          }, delay);
-        });
-      });
-      
-      return () => {
-        interactionHandle.cancel();
-      };
-    }
-  }, [loading, messages.length, hasScrolledToBottom]);
+  // Scroll to bottom when messages are first loaded (after content is rendered)
+  // This is handled by onContentSizeChange and onLayout to avoid blank screen
 
   // Mark messages as read when group chat is opened
   useFocusEffect(
@@ -1134,7 +1025,31 @@ export default function GroupChatScreen() {
           )}
 
           {item.attachments && item.attachments.length > 0 && (
-            item.attachments[0].mime?.startsWith('image/') ? (
+            isVideoAttachment(item.attachments[0]) ? (
+              <View style={{ width: '100%' }}>
+                <VideoPlayer
+                  url={(() => {
+                    let url = item.attachments[0].url || item.attachments[0].path || item.attachments[0].uri;
+                    if (url && !url.startsWith('http')) {
+                      const cleanUrl = url.startsWith('/') ? url.substring(1) : url;
+                      url = `${getBaseUrl()}/${cleanUrl}`;
+                    }
+                    return url;
+                  })()}
+                  isMine={isMine}
+                  isDark={isDark}
+                  style={{ marginBottom: 4 }}
+                />
+                {/* Timestamp below video */}
+                <Text style={{ 
+                  fontSize: 10, 
+                  color: isMine ? '#E0E7FF' : '#6B7280',
+                  alignSelf: 'flex-end',
+                  marginTop: 2,
+                  marginRight: 2,
+                }}>{timestamp}</Text>
+              </View>
+            ) : item.attachments[0].mime?.startsWith('image/') ? (
               <View style={{ width: '100%' }}>
                 <TouchableOpacity 
                   onPress={() => {
@@ -1297,22 +1212,21 @@ export default function GroupChatScreen() {
             {/* Display message text - NEVER show [IMAGE] or [FILE] markers as text */}
             {!isVoiceMessage && (
               messageText && messageText.trim() ? (
-                <Text 
-                  style={{ 
+                <LinkText
+                  text={messageText}
+                  textStyle={{ 
                     color: isMine ? '#fff' : (isDark ? '#fff' : '#111827'),
                     fontSize: 16,
                     lineHeight: 20,
                     textAlign: 'left',
-                    flexWrap: 'wrap',
-                    flexShrink: 0, // Don't shrink text unnecessarily
-                    flexGrow: 1,   // Allow text to grow
-                    width: 'auto', // Allow text to take its natural width
-                    marginRight: messageText.length > 30 ? 0 : 40, // Only add margin for short messages
-                    wordBreak: 'break-word', // Prevent words from breaking unnecessarily
                   }}
-                >
-                  {messageText}
-                </Text>
+                  linkStyle={{
+                    fontSize: 16,
+                    lineHeight: 20,
+                  }}
+                  isDark={isDark}
+                  onVideoPress={(url) => setVideoUrl(url)}
+                />
               ) : (!item.attachments || item.attachments.length === 0) && item.message ? (
                 // If message exists but messageText is null, show original message
                 // BUT filter out [IMAGE] and [FILE] markers
@@ -1326,16 +1240,21 @@ export default function GroupChatScreen() {
                   const cleaned = rawMessage.replace(/\s*\[IMAGE\]$/g, '').replace(/\s*\[FILE\]$/g, '').trim();
                   if (cleaned) {
                     return (
-                      <Text 
-                        style={{ 
+                      <LinkText
+                        text={cleaned}
+                        textStyle={{ 
                           color: isMine ? '#fff' : (isDark ? '#fff' : '#111827'),
                           fontSize: 16,
                           lineHeight: 20,
                           textAlign: 'left',
                         }}
-                      >
-                        {cleaned}
-                      </Text>
+                        linkStyle={{
+                          fontSize: 16,
+                          lineHeight: 20,
+                        }}
+                        isDark={isDark}
+                        onVideoPress={(url) => setVideoUrl(url)}
+                      />
                     );
                   }
                   return null;
@@ -1747,33 +1666,29 @@ export default function GroupChatScreen() {
                 }
               }}
               onLayout={() => {
-                // Only scroll on initial layout if we haven't scrolled yet
-                if (flatListRef.current && messages.length > 0 && !hasScrolledToBottom && !loading) {
-                  const lastMessage = messages[messages.length - 1];
-                  const hasImages = lastMessage?.attachments?.some((att: any) => 
-                    att.mime?.startsWith('image/') || att.type?.startsWith('image/')
-                  );
-                  const delay = hasImages ? 600 : 200;
-                  
+                // Scroll to bottom on initial layout if we haven't scrolled yet
+                if (flatListRef.current && messages.length > 0 && !loading && !hasScrolledToBottom && isInitialLoad.current) {
+                  // Wait a bit longer to ensure all items are rendered
                   setTimeout(() => {
-                    if (flatListRef.current && messages.length > 0 && !hasScrolledToBottom) {
+                    if (flatListRef.current && messages.length > 0 && isInitialLoad.current) {
                       try {
-                        // Use scrollToEnd as primary method - it's more reliable for scrolling to bottom
+                        // Use scrollToEnd - it's more reliable when content is already rendered
                         flatListRef.current.scrollToEnd({ animated: false });
                         setHasScrolledToBottom(true);
+                        isInitialLoad.current = false;
                         console.log('Scrolled to bottom via onLayout (group)');
                       } catch (error) {
-                        console.warn('onLayout scrollToEnd failed (group):', error);
-                        // Fallback: try scrollToIndex
+                        // Fallback to scrollToIndex
                         try {
                           const lastIndex = messages.length - 1;
-                          if (lastIndex >= 0) {
+                          if (flatListRef.current && lastIndex >= 0) {
                             flatListRef.current.scrollToIndex({ 
                               index: lastIndex, 
                               animated: false,
                               viewPosition: 1
                             });
                             setHasScrolledToBottom(true);
+                            isInitialLoad.current = false;
                             console.log('Scrolled to bottom via onLayout (group - scrollToIndex fallback)');
                           }
                         } catch (scrollError) {
@@ -1781,7 +1696,7 @@ export default function GroupChatScreen() {
                         }
                       }
                     }
-                  }, delay);
+                  }, 300);
                 }
               }}
             />
@@ -2003,44 +1918,77 @@ export default function GroupChatScreen() {
       </View>
     </Modal>
 
-    {/* Image Preview Modal */}
-    <Modal
-      visible={!!showImagePreview}
-      transparent
-      animationType="fade"
-      onRequestClose={() => setShowImagePreview(null)}
-    >
-      <View style={{
-        flex: 1,
-        backgroundColor: 'rgba(0, 0, 0, 0.9)',
-        justifyContent: 'center',
-        alignItems: 'center',
-      }}>
-        <TouchableOpacity 
-          style={{
-            position: 'absolute',
-            top: 50,
-            right: 20,
-            zIndex: 1,
-          }}
-          onPress={() => setShowImagePreview(null)}
-        >
-          <MaterialCommunityIcons name="close" size={30} color="#fff" />
-        </TouchableOpacity>
-        
-        <Image 
-          source={{ uri: showImagePreview || '' }}
-          style={{
-            width: '90%',
-            height: '80%',
-            resizeMode: 'contain',
-          }}
-          onError={(error) => {
-            // Silent fail for image preview loading
-          }}
+      {/* Image Preview Modal */}
+      <Modal
+        visible={!!showImagePreview}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setShowImagePreview(null)}
+      >
+        <View style={{
+          flex: 1,
+          backgroundColor: 'rgba(0, 0, 0, 0.9)',
+          justifyContent: 'center',
+          alignItems: 'center',
+        }}>
+          <TouchableOpacity 
+            style={{
+              position: 'absolute',
+              top: 50,
+              right: 20,
+              zIndex: 1,
+            }}
+            onPress={() => setShowImagePreview(null)}
+          >
+            <MaterialCommunityIcons name="close" size={30} color="#fff" />
+          </TouchableOpacity>
+          
+          <Image 
+            source={{ uri: showImagePreview || '' }}
+            style={{
+              width: '90%',
+              height: '80%',
+              resizeMode: 'contain',
+            }}
+            onError={(error) => {
+              // Silent fail for image preview loading
+            }}
           />
         </View>
       </Modal>
+
+      {/* Video Player Modal */}
+      {videoUrl && (
+        <Modal
+          visible={!!videoUrl}
+          animationType="slide"
+          presentationStyle="fullScreen"
+          onRequestClose={() => setVideoUrl(null)}
+        >
+          <View style={{ flex: 1, backgroundColor: '#000' }}>
+            <TouchableOpacity
+              style={{
+                position: 'absolute',
+                top: 50,
+                right: 20,
+                zIndex: 1000,
+                backgroundColor: 'rgba(0, 0, 0, 0.5)',
+                borderRadius: 20,
+                padding: 8,
+              }}
+              onPress={() => setVideoUrl(null)}
+            >
+              <MaterialCommunityIcons name="close" size={32} color="#fff" />
+            </TouchableOpacity>
+            <VideoPlayer
+              url={videoUrl}
+              isMine={false}
+              isDark={true}
+              style={{ flex: 1 }}
+            />
+          </View>
+        </Modal>
+      )}
     </View>
   );
 }
