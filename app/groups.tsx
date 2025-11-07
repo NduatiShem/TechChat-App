@@ -231,8 +231,9 @@ export default function GroupsScreen() {
   );
 
   const handleCreateGroup = () => {
-    // Check if user is admin
-    if (!user?.is_admin) {
+    // Check if user is admin (handle both boolean true and number 1)
+    const isUserAdmin = user?.is_admin === true || user?.is_admin === 1;
+    if (!isUserAdmin) {
       Alert.alert(
         'Permission Denied',
         'Only administrators can create groups.',
@@ -245,8 +246,8 @@ export default function GroupsScreen() {
     router.push('/create-group');
   };
 
-  // Check if user is admin
-  const isAdmin = user?.is_admin === true;
+  // Check if user is admin (handle both boolean true and number 1)
+  const isAdmin = user?.is_admin === true || user?.is_admin === 1;
 
   if (isLoading) {
     return (

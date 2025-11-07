@@ -50,6 +50,7 @@ export default function UsersScreen() {
       }
       
       // Ensure we have an array and filter out the current user
+      // Backend already filters active users, so we don't need to filter here
       if (Array.isArray(usersData)) {
         const userList = usersData.filter((item: any) => 
           item.id !== user?.id

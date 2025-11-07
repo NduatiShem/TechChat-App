@@ -92,8 +92,11 @@ export default function ConversationsScreen() {
       // Ensure we have an array
       if (Array.isArray(conversationsData)) {
         // Remove duplicates based on id
+        // Backend already filters active users, so we don't need to filter here
         const uniqueConversations = conversationsData.filter((conversation, index, self) => 
-          conversation && conversation.id !== undefined && conversation.id !== null &&
+          conversation && 
+          conversation.id !== undefined && 
+          conversation.id !== null &&
           index === self.findIndex(c => c.id === conversation.id)
         );
         

@@ -8,7 +8,7 @@ interface User {
   email: string;
   email_verified_at?: string;
   avatar_url?: string;
-  is_admin?: boolean; // 1 for admin, 0 for regular user
+  is_admin?: boolean | number; // true/1 for admin, false/0 for regular user
   created_at: string;
   updated_at: string;
 }

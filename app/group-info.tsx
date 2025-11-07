@@ -66,37 +66,66 @@ export default function GroupInfoScreen() {
   const { currentTheme } = useTheme();
 
   const isDark = currentTheme === 'dark';
-  const isAdmin = user?.is_admin === true;
+  // Check if user is admin (handle both boolean true and number 1)
+  const isAdmin = user?.is_admin === true || user?.is_admin === 1;
   const isOwner = groupInfo?.owner_id === user?.id;
 
   const loadGroupInfo = async () => {
     try {
-      // Try to use passed group data first
-      if (groupData) {
-        const parsedGroupData = JSON.parse(decodeURIComponent(groupData as string));
-        setGroupInfo(parsedGroupData);
-        setIsLoading(false);
-        return;
+      setIsLoading(true);
+      
+      // Try to use passed group data first (only on initial load)
+      if (groupData && !groupInfo) {
+        try {
+          const parsedGroupData = JSON.parse(decodeURIComponent(groupData as string));
+          setGroupInfo(parsedGroupData);
+          setIsLoading(false);
+          return;
+        } catch (parseError) {
+          // If parsing fails, continue to fetch from API
+          console.warn('Failed to parse groupData, fetching from API');
+        }
       }
 
-      // Fallback: try to get from groups list
-      const response = await groupsAPI.getAll();
-      const group = response.data.find((g: any) => g.id === Number(id));
-      
-      if (group) {
-        // Create a basic group info structure with avatar_url
-        setGroupInfo({
-          id: group.id,
-          name: group.name,
-          description: group.description,
-          owner_id: group.owner_id,
-          created_at: group.created_at,
-          updated_at: group.updated_at,
-          avatar_url: group.avatar_url, // ✅ Include avatar_url
-          users: [] // We don't have user details from getAll()
-        });
-      } else {
-        Alert.alert('Error', 'Group not found');
+      // Fetch full group info from API (includes members)
+      try {
+        const response = await groupsAPI.getGroup(Number(id));
+        const group = response.data;
+        
+        if (group) {
+          setGroupInfo({
+            id: group.id,
+            name: group.name,
+            description: group.description,
+            owner_id: group.owner_id,
+            created_at: group.created_at,
+            updated_at: group.updated_at,
+            avatar_url: group.avatar_url,
+            users: group.users || group.members || [], // Get members from API
+          });
+        } else {
+          Alert.alert('Error', 'Group not found');
+        }
+      } catch (apiError: any) {
+        // Fallback: try to get from groups list if getGroup fails
+        console.warn('getGroup failed, trying getAll as fallback:', apiError);
+        const response = await groupsAPI.getAll();
+        const group = response.data.find((g: any) => g.id === Number(id));
+        
+        if (group) {
+          setGroupInfo({
+            id: group.id,
+            name: group.name,
+            description: group.description,
+            owner_id: group.owner_id,
+            created_at: group.created_at,
+            updated_at: group.updated_at,
+            avatar_url: group.avatar_url,
+            users: group.users || [], // May not have users from getAll()
+          });
+        } else {
+          Alert.alert('Error', 'Group not found');
+        }
       }
     } catch (error) {
       console.error('Failed to load group info:', error);
@@ -255,13 +284,24 @@ export default function GroupInfoScreen() {
     
     setIsAddingMembers(true);
     try {
-      await groupsAPI.addMembers(Number(id), selectedUsers);
+      const response = await groupsAPI.addMembers(Number(id), selectedUsers);
       
-      // Refresh group info to get updated members list
-      await loadGroupInfo();
-      
+      // Close modal and clear selection first
       setIsAddMemberModalVisible(false);
       setSelectedUsers([]);
+      
+      // Check if response includes updated group data
+      if (response.data?.group && response.data.group.users) {
+        // Update state directly from response if available
+        setGroupInfo({
+          ...groupInfo!,
+          users: response.data.group.users,
+        });
+      } else {
+        // Otherwise, refresh from API
+        await loadGroupInfo();
+      }
+      
       Alert.alert('Success', 'Members added successfully!');
     } catch (error: any) {
       console.error('Failed to add members:', error);

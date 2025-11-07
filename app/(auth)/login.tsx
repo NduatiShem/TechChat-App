@@ -139,7 +139,15 @@ export default function LoginScreen() {
       // Handle different error types with field-specific validation
       console.log('Error handling - Status:', error.response?.status, 'Message:', error.response?.data?.message);
       
-      if (error.response?.status === 401) {
+      if (error.response?.status === 403 && error.response?.data?.account_deactivated) {
+        // Account deactivated
+        const errorMessage = error.response?.data?.message || 'Your account has been deactivated. Please contact an administrator.';
+        setShowError(true);
+        setErrorMessage(errorMessage);
+        showErrorRef.current = true;
+        errorMessageRef.current = errorMessage;
+        setPassword(''); // Clear password
+      } else if (error.response?.status === 401) {
         // Unauthorized - could be wrong email or password
         const errorMessage = error.response?.data?.message || 'Invalid credentials';
         console.log('401 Error - Message:', errorMessage);
