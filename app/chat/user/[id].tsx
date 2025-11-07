@@ -20,7 +20,7 @@ import * as DocumentPicker from 'expo-document-picker';
 import * as ImagePicker from 'expo-image-picker';
 import { router, useLocalSearchParams } from 'expo-router';
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { ActivityIndicator, Alert, BackHandler, FlatList, Image, InteractionManager, Keyboard, Modal, Platform, StatusBar, Text, TextInput, TouchableOpacity, View } from 'react-native';
+import { ActivityIndicator, Alert, BackHandler, FlatList, Image, InteractionManager, Keyboard, KeyboardAvoidingView, Modal, Platform, StatusBar, Text, TextInput, TouchableOpacity, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 export const options = ({ params }) => ({
@@ -1576,24 +1576,29 @@ export default function UserChatScreen() {
         </View>
       </View>
 
-      <View style={{ 
-        flex: 1,
-        justifyContent: 'flex-end' // Always keep input at bottom
-      }}>
-        {loading ? (
-          <View className="flex-1 justify-center items-center">
-            <ActivityIndicator size="large" color="#283891" />
-          </View>
-        ) : (
-          <TouchableOpacity
-            activeOpacity={1}
-            onPress={() => {
-              setShowMessageOptions(null);
-              Keyboard.dismiss();
-            }}
-            style={{ flex: 1 }}
-          >
-            <FlatList
+      <KeyboardAvoidingView
+        style={{ flex: 1 }}
+        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+        keyboardVerticalOffset={0}
+      >
+        <View style={{ 
+          flex: 1,
+          justifyContent: 'flex-end' // Always keep input at bottom
+        }}>
+          {loading ? (
+            <View className="flex-1 justify-center items-center">
+              <ActivityIndicator size="large" color="#283891" />
+            </View>
+          ) : (
+            <TouchableOpacity
+              activeOpacity={1}
+              onPress={() => {
+                setShowMessageOptions(null);
+                Keyboard.dismiss();
+              }}
+              style={{ flex: 1 }}
+            >
+              <FlatList
               ref={flatListRef}
               data={messages}
               renderItem={renderItem}
@@ -1606,9 +1611,11 @@ export default function UserChatScreen() {
               style={{ flex: 1 }}
               contentContainerStyle={{ 
                 padding: 16, 
-                paddingBottom: keyboardHeight > 0 ? 20 : 0,
+                paddingBottom: 0, // Let KeyboardAvoidingView handle spacing
               }}
               inverted={false} // Make sure it's not inverted
+              keyboardShouldPersistTaps="handled"
+              keyboardDismissMode={Platform.OS === 'ios' ? 'interactive' : 'on-drag'}
               // Don't use initialScrollIndex - it causes blank screen
               // Scroll will happen after content is rendered via onContentSizeChange
               onScroll={({ nativeEvent }) => {
@@ -1798,7 +1805,9 @@ export default function UserChatScreen() {
             backgroundColor: isDark ? '#1F2937' : '#FFFFFF',
             paddingHorizontal: 16,
             paddingVertical: 8,
-            paddingBottom: Math.max(insets.bottom + 8, keyboardHeight > 0 ? 8 : 16), // Use safe area bottom + padding
+            paddingBottom: Platform.OS === 'android' 
+              ? (keyboardHeight > 0 ? 0 : insets.bottom) // ✅ No padding when keyboard open, safe area padding when dismissed
+              : Math.max(insets.bottom + 8, keyboardHeight > 0 ? 8 : 16),
             borderTopWidth: 1,
             borderTopColor: isDark ? '#374151' : '#E5E7EB',
           }}
@@ -1916,7 +1925,8 @@ export default function UserChatScreen() {
             )}
           </View>
         </View>
-      </View>
+        </View>
+      </KeyboardAvoidingView>
 
       {/* Voice Recorder Modal */}
       <Modal

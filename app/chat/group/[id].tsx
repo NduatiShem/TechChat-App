@@ -27,6 +27,7 @@ import {
   Image,
   InteractionManager,
   Keyboard,
+  KeyboardAvoidingView,
   Modal,
   Platform,
   StatusBar,
@@ -1562,38 +1563,45 @@ export default function GroupChatScreen() {
         )}
       </View>
 
-      <View style={{ 
-        flex: 1,
-        justifyContent: 'flex-end' // Always keep input at bottom
-      }}>
-        {loading ? (
-          <View className="flex-1 justify-center items-center">
-            <ActivityIndicator size="large" color="#283891" />
-          </View>
-        ) : (
-          <TouchableOpacity
-            activeOpacity={1}
-            onPress={() => {
-              setShowMessageOptions(null);
-              Keyboard.dismiss();
-            }}
-            style={{ flex: 1 }}
-          >
-            <FlatList
-              ref={flatListRef}
-              data={messages}
-              renderItem={renderItem}
-              keyExtractor={(item, index) => {
-                if (item && item.id !== undefined && item.id !== null) {
-                  return `message-${item.id}-${index}`;
-                }
-                return `message-fallback-${index}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      <KeyboardAvoidingView
+        style={{ flex: 1 }}
+        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+        keyboardVerticalOffset={0}
+      >
+        <View style={{ 
+          flex: 1,
+          justifyContent: 'flex-end' // Always keep input at bottom
+        }}>
+          {loading ? (
+            <View className="flex-1 justify-center items-center">
+              <ActivityIndicator size="large" color="#283891" />
+            </View>
+          ) : (
+            <TouchableOpacity
+              activeOpacity={1}
+              onPress={() => {
+                setShowMessageOptions(null);
+                Keyboard.dismiss();
               }}
-              contentContainerStyle={{ 
-                padding: 16, 
-                paddingBottom: keyboardHeight > 0 ? 20 : 0,
-              }}
-              inverted={false} // Make sure it's not inverted
+              style={{ flex: 1 }}
+            >
+              <FlatList
+                ref={flatListRef}
+                data={messages}
+                renderItem={renderItem}
+                keyExtractor={(item, index) => {
+                  if (item && item.id !== undefined && item.id !== null) {
+                    return `message-${item.id}-${index}`;
+                  }
+                  return `message-fallback-${index}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+                }}
+                contentContainerStyle={{ 
+                  padding: 16, 
+                  paddingBottom: 0, // Let KeyboardAvoidingView handle spacing
+                }}
+                inverted={false} // Make sure it's not inverted
+                keyboardShouldPersistTaps="handled"
+                keyboardDismissMode={Platform.OS === 'ios' ? 'interactive' : 'on-drag'}
               onScroll={({ nativeEvent }) => {
                 const { contentOffset, contentSize, layoutMeasurement } = nativeEvent;
                 const isAtTop = contentOffset.y <= 50;
@@ -1703,220 +1711,223 @@ export default function GroupChatScreen() {
           </TouchableOpacity>
         )}
         
-        {/* Reply Preview */}
-        {replyingTo && (
-          <ReplyPreview
-            replyTo={replyingTo}
-            onCancel={handleCancelReply}
-          />
-        )}
-        
-        {/* Emoji Picker */}
-        {showEmoji && (
-          <View style={{ height: 320 }}>
-            <Picker theme={isDark ? 'dark' : 'light'} onSelect={handleEmojiSelect} />
-          </View>
-        )}
-        
-        {/* Attachment Preview */}
-        {attachment && (
-          <View className="flex-row items-center px-2 pb-1">
-            {attachment.isImage ? (
-              <Image source={{ uri: attachment.uri }} style={{ width: 60, height: 60, borderRadius: 8, marginRight: 8 }} />
-            ) : (
-              <View style={{ flexDirection: 'row', alignItems: 'center', marginRight: 8 }}>
-                <MaterialCommunityIcons name="file" size={28} color="#283891" />
-                <Text style={{ marginLeft: 6, color: isDark ? '#fff' : '#111827' }}>{attachment.name}</Text>
+            {/* Reply Preview */}
+            {replyingTo && (
+              <ReplyPreview
+                replyTo={replyingTo}
+                onCancel={handleCancelReply}
+              />
+            )}
+            
+            {/* Emoji Picker */}
+            {showEmoji && (
+              <View style={{ height: 320 }}>
+                <Picker theme={isDark ? 'dark' : 'light'} onSelect={handleEmojiSelect} />
               </View>
             )}
-            <TouchableOpacity onPress={() => setAttachment(null)}>
-              <MaterialCommunityIcons name="close-circle" size={28} color="#EF4444" />
-            </TouchableOpacity>
-          </View>
-        )}
-        
-        {/* Voice Recording Preview - Above Input */}
-        {voiceRecording && (
-          <View 
-            style={{
-              backgroundColor: isDark ? '#374151' : '#F3F4F6',
-              paddingHorizontal: 16,
-              paddingVertical: 12,
-              borderTopWidth: 1,
-              borderTopColor: isDark ? '#4B5563' : '#D1D5DB',
-            }}
-          >
-            <View className="flex-row items-center">
-              <MaterialCommunityIcons name="microphone" size={20} color="#39B54A" />
-              <View className="flex-1 ml-3">
-                <VoicePlayer 
-                  uri={voiceRecording.uri} 
-                  duration={voiceRecording.duration}
-                  size="small"
-                />
+            
+            {/* Attachment Preview */}
+            {attachment && (
+              <View className="flex-row items-center px-2 pb-1">
+                {attachment.isImage ? (
+                  <Image source={{ uri: attachment.uri }} style={{ width: 60, height: 60, borderRadius: 8, marginRight: 8 }} />
+                ) : (
+                  <View style={{ flexDirection: 'row', alignItems: 'center', marginRight: 8 }}>
+                    <MaterialCommunityIcons name="file" size={28} color="#283891" />
+                    <Text style={{ marginLeft: 6, color: isDark ? '#fff' : '#111827' }}>{attachment.name}</Text>
+                  </View>
+                )}
+                <TouchableOpacity onPress={() => setAttachment(null)}>
+                  <MaterialCommunityIcons name="close-circle" size={28} color="#EF4444" />
+                </TouchableOpacity>
               </View>
-              <TouchableOpacity onPress={() => setVoiceRecording(null)}>
-                <MaterialCommunityIcons name="close-circle" size={24} color="#EF4444" />
-              </TouchableOpacity>
-            </View>
-          </View>
-        )}
-        
-        {/* Input Bar - WhatsApp Style */}
-        <View
-          style={{
-            backgroundColor: isDark ? '#1F2937' : '#FFFFFF',
-            paddingHorizontal: 16,
-            paddingVertical: 8,
-            paddingBottom: Math.max(insets.bottom + 8, keyboardHeight > 0 ? 8 : 16), // Use safe area bottom + padding
-            borderTopWidth: 1,
-            borderTopColor: isDark ? '#374151' : '#E5E7EB',
-          }}
-        >
-          <View
-            style={{
-              flexDirection: 'row',
-              alignItems: 'flex-end',
-              backgroundColor: isDark ? '#374151' : '#F3F4F6',
-              borderRadius: 25,
-              paddingHorizontal: 4,
-              paddingVertical: 4,
-              minHeight: 50,
-            }}
-          >
-            {/* Emoji Button */}
-            <TouchableOpacity 
-              onPress={() => setShowEmoji(v => !v)} 
-              style={{ 
-                width: 42, 
-                height: 42, 
-                borderRadius: 21, 
-                alignItems: 'center', 
-                justifyContent: 'center',
-                marginRight: 4,
-              }}
-            >
-              <MaterialCommunityIcons name="emoticon-outline" size={24} color="#6B7280" />
-            </TouchableOpacity>
-
-            {/* Text Input */}
-            <TextInput
-              value={input}
-              onChangeText={setInput}
-              placeholder="Message"
-              placeholderTextColor={isDark ? '#9CA3AF' : '#6B7280'}
+            )}
+            
+            {/* Voice Recording Preview - Above Input */}
+            {voiceRecording && (
+              <View 
+                style={{
+                  backgroundColor: isDark ? '#374151' : '#F3F4F6',
+                  paddingHorizontal: 16,
+                  paddingVertical: 12,
+                  borderTopWidth: 1,
+                  borderTopColor: isDark ? '#4B5563' : '#D1D5DB',
+                }}
+              >
+                <View className="flex-row items-center">
+                  <MaterialCommunityIcons name="microphone" size={20} color="#39B54A" />
+                  <View className="flex-1 ml-3">
+                    <VoicePlayer 
+                      uri={voiceRecording.uri} 
+                      duration={voiceRecording.duration}
+                      size="small"
+                    />
+                  </View>
+                  <TouchableOpacity onPress={() => setVoiceRecording(null)}>
+                    <MaterialCommunityIcons name="close-circle" size={24} color="#EF4444" />
+                  </TouchableOpacity>
+                </View>
+              </View>
+            )}
+            
+            {/* Input Bar - WhatsApp Style */}
+            <View
               style={{
-                flex: 1,
-                minHeight: 42,
-                maxHeight: 100,
-                backgroundColor: 'transparent',
-                color: isDark ? '#fff' : '#111827',
-                fontSize: 16,
-                paddingHorizontal: 12,
-                paddingVertical: 10,
-                textAlignVertical: 'center',
-              }}
-              editable={!sending}
-              multiline
-              onSubmitEditing={handleSend}
-              returnKeyType="send"
-              blurOnSubmit={false}
-            />
-
-            {/* Gallery Button (WhatsApp-style) */}
-            <TouchableOpacity 
-              onPress={pickImage} 
-              style={{ 
-                width: 42,
-                height: 42,
-                borderRadius: 21,
-                alignItems: 'center',
-                justifyContent: 'center',
-                marginRight: 4,
+                backgroundColor: isDark ? '#1F2937' : '#FFFFFF',
+                paddingHorizontal: 16,
+                paddingVertical: 8,
+                paddingBottom: Platform.OS === 'android' 
+                  ? (keyboardHeight > 0 ? 0 : insets.bottom) // ✅ No padding when keyboard open, safe area padding when dismissed
+                  : Math.max(insets.bottom + 8, keyboardHeight > 0 ? 8 : 16),
+                borderTopWidth: 1,
+                borderTopColor: isDark ? '#374151' : '#E5E7EB',
               }}
             >
-              <MaterialCommunityIcons name="image" size={24} color="#6B7280" />
-            </TouchableOpacity>
-
-            {/* Attachment Button */}
-            <TouchableOpacity 
-              onPress={pickFile} 
-              style={{ 
-                width: 42, 
-                height: 42, 
-                borderRadius: 21, 
-                alignItems: 'center', 
-                justifyContent: 'center',
-                marginRight: 4,
-              }}
-            >
-              <MaterialCommunityIcons name="paperclip" size={24} color="#6B7280" />
-            </TouchableOpacity>
-
-            {/* Send/Mic Button */}
-            {(!input.trim() && !attachment && !voiceRecording) ? (
-              <TouchableOpacity 
-                onPress={handleVoiceRecording} 
-                style={{ 
-                  width: 42, 
-                  height: 42, 
-                  borderRadius: 21, 
-                  backgroundColor: '#39B54A',
-                  alignItems: 'center', 
-                  justifyContent: 'center',
+              <View
+                style={{
+                  flexDirection: 'row',
+                  alignItems: 'flex-end',
+                  backgroundColor: isDark ? '#374151' : '#F3F4F6',
+                  borderRadius: 25,
+                  paddingHorizontal: 4,
+                  paddingVertical: 4,
+                  minHeight: 50,
                 }}
               >
-                <MaterialCommunityIcons name="microphone" size={24} color="#fff" />
-              </TouchableOpacity>
-            ) : (
-              <TouchableOpacity 
-                onPress={handleSend} 
-                disabled={sending} 
-                style={{ 
-                  width: 42, 
-                  height: 42, 
-                  borderRadius: 21, 
-                  backgroundColor: sending ? '#A5B4FC' : '#39B54A',
-                  alignItems: 'center', 
-                  justifyContent: 'center',
-                }}
-              >
-                <MaterialCommunityIcons name="send" size={24} color="#fff" />
-              </TouchableOpacity>
-            )}
+                {/* Emoji Button */}
+                <TouchableOpacity 
+                  onPress={() => setShowEmoji(v => !v)} 
+                  style={{ 
+                    width: 42, 
+                    height: 42, 
+                    borderRadius: 21, 
+                    alignItems: 'center', 
+                    justifyContent: 'center',
+                    marginRight: 4,
+                  }}
+                >
+                  <MaterialCommunityIcons name="emoticon-outline" size={24} color="#6B7280" />
+                </TouchableOpacity>
+
+                {/* Text Input */}
+                <TextInput
+                  value={input}
+                  onChangeText={setInput}
+                  placeholder="Message"
+                  placeholderTextColor={isDark ? '#9CA3AF' : '#6B7280'}
+                  style={{
+                    flex: 1,
+                    minHeight: 42,
+                    maxHeight: 100,
+                    backgroundColor: 'transparent',
+                    color: isDark ? '#fff' : '#111827',
+                    fontSize: 16,
+                    paddingHorizontal: 12,
+                    paddingVertical: 10,
+                    textAlignVertical: 'center',
+                  }}
+                  editable={!sending}
+                  multiline
+                  onSubmitEditing={handleSend}
+                  returnKeyType="send"
+                  blurOnSubmit={false}
+                />
+
+                {/* Gallery Button */}
+                <TouchableOpacity 
+                  onPress={pickImage} 
+                  style={{ 
+                    width: 42,
+                    height: 42,
+                    borderRadius: 21,
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    marginRight: 4,
+                  }}
+                >
+                  <MaterialCommunityIcons name="image" size={24} color="#6B7280" />
+                </TouchableOpacity>
+
+                {/* Attachment Button */}
+                <TouchableOpacity 
+                  onPress={pickFile} 
+                  style={{ 
+                    width: 42, 
+                    height: 42, 
+                    borderRadius: 21, 
+                    alignItems: 'center', 
+                    justifyContent: 'center',
+                    marginRight: 4,
+                  }}
+                >
+                  <MaterialCommunityIcons name="paperclip" size={24} color="#6B7280" />
+                </TouchableOpacity>
+
+                {/* Send/Mic Button */}
+                {(!input.trim() && !attachment && !voiceRecording) ? (
+                  <TouchableOpacity 
+                    onPress={handleVoiceRecording} 
+                    style={{ 
+                      width: 42, 
+                      height: 42, 
+                      borderRadius: 21, 
+                      backgroundColor: '#39B54A',
+                      alignItems: 'center', 
+                      justifyContent: 'center',
+                    }}
+                  >
+                    <MaterialCommunityIcons name="microphone" size={24} color="#fff" />
+                  </TouchableOpacity>
+                ) : (
+                  <TouchableOpacity 
+                    onPress={handleSend} 
+                    disabled={sending} 
+                    style={{ 
+                      width: 42, 
+                      height: 42, 
+                      borderRadius: 21, 
+                      backgroundColor: sending ? '#A5B4FC' : '#39B54A',
+                      alignItems: 'center', 
+                      justifyContent: 'center',
+                    }}
+                  >
+                    <MaterialCommunityIcons name="send" size={24} color="#fff" />
+                  </TouchableOpacity>
+                )}
           </View>
         </View>
-      </View>
-
-    {/* Voice Recorder Modal */}
-    <Modal
-      visible={showVoiceRecorder}
-      transparent
-      animationType="slide"
-      onRequestClose={handleVoiceRecordingCancel}
-    >
-      <View style={{
-        flex: 1,
-        backgroundColor: 'rgba(0, 0, 0, 0.5)',
-        justifyContent: 'center',
-        alignItems: 'center',
-        padding: 20,
-      }}>
-        <View style={{
-          backgroundColor: isDark ? '#1F2937' : '#FFFFFF',
-          borderRadius: 16,
-          padding: 20,
-          width: '100%',
-          maxWidth: 400,
-        }}>
-          <VoiceRecorder
-            onRecordingComplete={handleVoiceRecordingComplete}
-            onCancel={handleVoiceRecordingCancel}
-            maxDuration={60}
-          />
         </View>
-      </View>
-    </Modal>
+      </KeyboardAvoidingView>
+
+      {/* Voice Recorder Modal */}
+      <Modal
+        visible={showVoiceRecorder}
+        transparent
+        animationType="slide"
+        onRequestClose={handleVoiceRecordingCancel}
+      >
+        <View style={{
+          flex: 1,
+          backgroundColor: 'rgba(0, 0, 0, 0.5)',
+          justifyContent: 'center',
+          alignItems: 'center',
+          padding: 20,
+        }}>
+          <View style={{
+            backgroundColor: isDark ? '#1F2937' : '#FFFFFF',
+            borderRadius: 16,
+            padding: 20,
+            width: '100%',
+            maxWidth: 400,
+          }}>
+            <VoiceRecorder
+              onRecordingComplete={handleVoiceRecordingComplete}
+              onCancel={handleVoiceRecordingCancel}
+              maxDuration={60}
+            />
+          </View>
+        </View>
+      </Modal>
 
       {/* Image Preview Modal */}
       <Modal
