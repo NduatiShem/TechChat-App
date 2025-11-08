@@ -46,7 +46,7 @@ const getBaseUrl = () => {
 export default function UserChatScreen() {
   const { id } = useLocalSearchParams();
   const { currentTheme } = useTheme();
-  const { user, isAuthenticated, isLoading } = useAuth();
+  const { user } = useAuth();
   const { updateUnreadCount } = useNotifications();
   const insets = useSafeAreaInsets();
   const ENABLE_MARK_AS_READ = true; // Enable mark as read functionality
@@ -85,7 +85,6 @@ export default function UserChatScreen() {
 
   // Fetch messages and user info
   useEffect(() => {
-    let isMounted = true;
     const fetchMessages = async () => {
       setLoading(true);
       setHasScrolledToBottom(false); // Reset scroll flag when fetching new messages
@@ -165,13 +164,11 @@ export default function UserChatScreen() {
         
         // Find the newest message index for initial scroll
         const newestMessageId = pagination.newest_message_id;
-        let lastIndex = sortedMessages.length - 1;
         
         // If we have newest_message_id, find its index after sorting
         if (newestMessageId) {
           const newestIndex = sortedMessages.findIndex(msg => msg.id === newestMessageId);
           if (newestIndex >= 0) {
-            lastIndex = newestIndex;
             console.log('Found newest message at index:', newestIndex, 'ID:', newestMessageId);
           } else {
             console.log('Newest message ID not found in sorted messages, using last index');
@@ -1381,18 +1378,6 @@ export default function UserChatScreen() {
     setShowEmoji(false);
   };
 
-  // Get user avatar initials
-  const getUserAvatarInitials = (userName: string | null | undefined) => {
-    if (!userName || typeof userName !== 'string') {
-      return 'U';
-    }
-    return userName
-      .split(' ')
-      .map(word => word.charAt(0))
-      .join('')
-      .toUpperCase()
-      .slice(0, 2);
-  };
 
   // Get last seen time
   const getLastSeenTime = () => {
@@ -1619,7 +1604,7 @@ export default function UserChatScreen() {
               // Don't use initialScrollIndex - it causes blank screen
               // Scroll will happen after content is rendered via onContentSizeChange
               onScroll={({ nativeEvent }) => {
-                const { contentOffset, contentSize, layoutMeasurement } = nativeEvent;
+                const { contentOffset } = nativeEvent;
                 // Use a threshold instead of exactly 0, as FlatList might not reach exactly 0
                 const isAtTop = contentOffset.y <= 50; // Within 50 pixels of the top
                 
@@ -1701,7 +1686,7 @@ export default function UserChatScreen() {
                         setHasScrolledToBottom(true);
                         isInitialLoad.current = false;
                         console.log('Scrolled to bottom via onLayout');
-                      } catch (error) {
+                      } catch {
                         // Fallback to scrollToIndex
                         try {
                           const lastIndex = messages.length - 1;
