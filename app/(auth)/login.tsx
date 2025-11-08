@@ -2,11 +2,11 @@ import { AppConfig } from '@/config/app.config';
 import { useAuth } from '@/context/AuthContext';
 import { useTheme } from '@/context/ThemeContext';
 import { MaterialCommunityIcons } from '@expo/vector-icons';
-import { router } from 'expo-router';
 import { useEffect, useRef, useState } from 'react';
 import {
     Alert,
     Image,
+    Keyboard,
     KeyboardAvoidingView,
     Platform,
     ScrollView,
@@ -15,7 +15,7 @@ import {
     TouchableOpacity,
     View
 } from 'react-native';
-import { SafeAreaView } from 'react-native-safe-area-context';
+import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 
 export default function LoginScreen() {
   const [email, setEmail] = useState('');
@@ -36,8 +36,25 @@ export default function LoginScreen() {
   const { login } = useAuth();
   const { currentTheme } = useTheme();
   const passwordInputRef = useRef<TextInput>(null);
+  const insets = useSafeAreaInsets();
+  const [keyboardHeight, setKeyboardHeight] = useState(0);
 
   const isDark = currentTheme === 'dark';
+
+  // Track keyboard height
+  useEffect(() => {
+    const showSubscription = Keyboard.addListener('keyboardDidShow', (e) => {
+      setKeyboardHeight(e.endCoordinates.height);
+    });
+    const hideSubscription = Keyboard.addListener('keyboardDidHide', () => {
+      setKeyboardHeight(0);
+    });
+
+    return () => {
+      showSubscription.remove();
+      hideSubscription.remove();
+    };
+  }, []);
 
   // Helper function to get base URL
   const getBaseUrl = () => {
@@ -94,7 +111,7 @@ export default function LoginScreen() {
         await fetch(getBaseUrl(), {
           method: 'GET',
         });
-      } catch (networkError) {
+      } catch {
         Alert.alert(
           'Network Error', 
           'Cannot connect to server. Please ensure your Laravel server is running with:\n\nphp artisan serve --host=0.0.0.0 --port=8000'
@@ -157,43 +174,45 @@ export default function LoginScreen() {
       <KeyboardAvoidingView
         behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
         className="flex-1"
-        keyboardVerticalOffset={Platform.OS === 'ios' ? 100 : 0}
+        keyboardVerticalOffset={0}
       >
         <ScrollView
           contentContainerStyle={{ 
             flexGrow: 1,
             paddingHorizontal: 24,
             paddingVertical: 40,
-            paddingBottom: 100
+            paddingBottom: Platform.OS === 'android'
+              ? (keyboardHeight > 0 ? Math.max(keyboardHeight - 100, 20) : Math.max(insets.bottom + 20, 40))
+              : Math.max(insets.bottom + 20, keyboardHeight > 0 ? 20 : 40)
           }}
           className={isDark ? 'bg-gray-900' : 'bg-white'}
           showsVerticalScrollIndicator={false}
           keyboardShouldPersistTaps="handled"
-          automaticallyAdjustKeyboardInsets={Platform.OS === 'ios'}
+          automaticallyAdjustKeyboardInsets={Platform.OS === 'android'}
           bounces={false}
         >
-        <View className="w-full max-w-sm mx-auto" style={{ justifyContent: 'center', minHeight: '100%' }}>
-          {/* App Icon and Name */}
-          <View className="items-center mb-8">
-            <Image
-              source={require('@/assets/images/healtclassique-icon.png')}
-              style={{ width: 80, height: 80, borderRadius: 20 }}
-              resizeMode="cover"
-            />
-            <Text
-              className={`text-2xl font-bold mt-4 mb-2 ${
-                isDark ? 'text-white' : 'text-gray-900'
-              }`}
-            >
-              TechChat
-            </Text>
-            <Text
-              className={`text-center text-base ${
-                isDark ? 'text-gray-300' : 'text-gray-600'
-              }`}
-            >
-              Sign in to your account to continue
-            </Text>
+            <View className="w-full max-w-sm mx-auto" style={{ justifyContent: 'center', minHeight: '100%' }}>
+              {/* App Icon and Name */}
+              <View className="items-center mb-8">
+                <Image
+                  source={require('@/assets/images/healtclassique-icon.png')}
+                  style={{ width: 80, height: 80, borderRadius: 20 }}
+                  resizeMode="cover"
+                />
+                <Text
+                  className={`text-2xl font-bold mt-4 mb-2 ${
+                    isDark ? 'text-white' : 'text-gray-900'
+                  }`}
+                >
+                  TechChat
+                </Text>
+                <Text
+                  className={`text-center text-base ${
+                    isDark ? 'text-gray-300' : 'text-gray-600'
+                  }`}
+                >
+                  Sign in to your account to continue
+                </Text>
                 <View className="mt-2 px-4 py-2 bg-secondary/10 rounded-lg">
                   <Text className="text-secondary text-sm font-medium text-center">
                     Welcome to TechChat
@@ -211,7 +230,7 @@ export default function LoginScreen() {
               )}
 
               {/* Form */}
-          <View className="space-y-6">
+              <View className="space-y-6">
             <View>
               <Text
                 className={`text-sm font-semibold mb-3 ${
@@ -345,28 +364,26 @@ export default function LoginScreen() {
             </TouchableOpacity>
           </View>
 
-          {/* Sign Up Link - Hidden as requested */}
-          {/* <View className="mt-8 flex-row justify-center">
-            <Text
-              className={`text-base ${
-                isDark ? 'text-gray-300' : 'text-gray-600'
-              }`}
-            >
-              Don't have an account?{' '}
-            </Text>
-            <Link href="/signup" asChild>
-              <TouchableOpacity>
-                <Text className="text-primary font-semibold text-base">
-                  Sign Up
+              {/* Sign Up Link - Hidden as requested */}
+              {/* <View className="mt-8 flex-row justify-center">
+                <Text
+                  className={`text-base ${
+                    isDark ? 'text-gray-300' : 'text-gray-600'
+                  }`}
+                >
+                  Don't have an account?{' '}
                 </Text>
-              </TouchableOpacity>
-            </Link>
-          </View> */}
-
-          {/* Debug: Force Logout Button - Removed as requested */}
-        </View>
-        </ScrollView>
-      </KeyboardAvoidingView>
+                <Link href="/signup" asChild>
+                  <TouchableOpacity>
+                    <Text className="text-primary font-semibold text-base">
+                      Sign Up
+                    </Text>
+                  </TouchableOpacity>
+                </Link>
+              </View> */}
+            </View>
+          </ScrollView>
+        </KeyboardAvoidingView>
     </SafeAreaView>
   );
 } 

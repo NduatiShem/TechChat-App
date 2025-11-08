@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { View, StyleSheet, TouchableOpacity, ActivityIndicator, Modal, Text } from 'react-native';
+import { View, StyleSheet, TouchableOpacity, Modal, Text } from 'react-native';
 import { Video, ResizeMode, AVPlaybackStatus } from 'expo-av';
 import { MaterialCommunityIcons } from '@expo/vector-icons';
 import { getYouTubeVideoId, getVimeoVideoId, isVideoUrl } from '@/utils/textUtils';
@@ -29,7 +29,6 @@ export default function VideoPlayer({
 }: VideoPlayerProps) {
   const [isPlaying, setIsPlaying] = useState(false);
   const [showFullscreen, setShowFullscreen] = useState(false);
-  const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const videoRef = React.useRef<Video>(null);
 
@@ -61,11 +60,9 @@ export default function VideoPlayer({
   const handlePlaybackStatusUpdate = (status: AVPlaybackStatus) => {
     if (status.isLoaded) {
       setIsPlaying(status.isPlaying);
-      setIsLoading(false);
-      if (status.error) {
-        setError('Failed to load video');
-        console.error('Video playback error:', status.error);
-      }
+    } else if ('error' in status) {
+      setError('Failed to load video');
+      console.error('Video playback error:', status.error);
     }
   };
 

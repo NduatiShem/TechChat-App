@@ -1,6 +1,6 @@
 import * as ImagePicker from 'expo-image-picker';
 import React from 'react';
-import { Alert, Button, Text, View, Platform } from 'react-native';
+import { Alert, Button, Text, View } from 'react-native';
 import NetInfo from '@react-native-community/netinfo';
 
 export const AvatarUploadTest = () => {
@@ -35,8 +35,9 @@ export const AvatarUploadTest = () => {
         } else {
           setStatus(`Server ping failed: ${response.status}`);
         }
-      } catch (error) {
-        setStatus(`Server ping error: ${error.message}`);
+      } catch (error: unknown) {
+        const err = error as any;
+        setStatus(`Server ping error: ${err?.message || 'Unknown error'}`);
         
         // Try connecting to the base URL without the path
         const serverUrl = baseUrl.replace(/\/api$/, '');
@@ -48,12 +49,14 @@ export const AvatarUploadTest = () => {
             signal: AbortSignal.timeout(5000)
           });
           setStatus(`Base URL connection: ${baseResponse.status}`);
-        } catch (baseError) {
-          setStatus(`Base URL connection failed: ${baseError.message}`);
+        } catch (baseError: unknown) {
+          const baseErr = baseError as any;
+          setStatus(`Base URL connection failed: ${baseErr?.message || 'Unknown error'}`);
         }
       }
-    } catch (error) {
-      setStatus(`Network test error: ${error.message}`);
+    } catch (error: unknown) {
+      const err = error as any;
+      setStatus(`Network test error: ${err?.message || 'Unknown error'}`);
     }
   };
   
@@ -198,8 +201,9 @@ export const AvatarUploadTest = () => {
            setStatus(`Upload failed: ${errorText}`);
            throw new Error(`Upload failed with status ${uploadResponse.status}`);
          }
-       } catch (fetchError) {
-         setStatus(`Fetch approach failed: ${fetchError.message}`);
+       } catch (fetchError: unknown) {
+         const err = fetchError as any;
+         setStatus(`Fetch approach failed: ${err?.message || 'Unknown error'}`);
          
          // Fall back to XMLHttpRequest
          setStatus('Falling back to XMLHttpRequest...');
@@ -221,12 +225,12 @@ export const AvatarUploadTest = () => {
              
              if (xhr.status >= 200 && xhr.status < 300) {
                try {
-                 const response = JSON.parse(xhr.responseText);
+                 JSON.parse(xhr.responseText);
                  setStatus('Upload completed successfully');
                  Alert.alert('Success', 'Avatar updated successfully!');
                  resolve();
-               } catch (e) {
-                 setStatus(`Error parsing response: ${e.message}`);
+               } catch {
+                 setStatus('Error parsing response');
                  reject(new Error('Invalid JSON response'));
                }
              } else {
@@ -234,7 +238,7 @@ export const AvatarUploadTest = () => {
                  const errorData = JSON.parse(xhr.responseText);
                  setStatus(`Server error: ${JSON.stringify(errorData)}`);
                  reject(new Error(`Server error: ${xhr.status}`));
-               } catch (e) {
+               } catch {
                  setStatus(`Server error: ${xhr.status}, ${xhr.responseText}`);
                  reject(new Error(`Server error: ${xhr.status}`));
                }
@@ -268,7 +272,6 @@ export const AvatarUploadTest = () => {
            xhr.send(formData);
          });
        }
-       });
       
     } catch (error: any) {
       console.error('TEST: Avatar upload error:', error);

@@ -1,6 +1,5 @@
 import { secureStorage } from '@/utils/secureStore';
 import axios from 'axios';
-import Constants from 'expo-constants';
 import { router } from 'expo-router';
 import { Platform } from 'react-native';
 import { AppConfig } from '../config/app.config';

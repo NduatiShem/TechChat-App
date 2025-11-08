@@ -1,6 +1,5 @@
-import { useTheme } from '@/context/ThemeContext';
 import React, { useState } from 'react';
-import { Image, Text, View } from 'react-native';
+import { Image, View } from 'react-native';
 import { MaterialCommunityIcons } from '@expo/vector-icons';
 
 interface GroupAvatarProps {
@@ -11,8 +10,6 @@ interface GroupAvatarProps {
 }
 
 export default function GroupAvatar({ avatarUrl, name, size = 40, style }: GroupAvatarProps) {
-  const { currentTheme } = useTheme();
-  const isDark = currentTheme === 'dark';
   const [imageError, setImageError] = useState(false);
 
   const containerStyle = {

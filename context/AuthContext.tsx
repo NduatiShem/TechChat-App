@@ -18,7 +18,7 @@ interface AuthContextType {
   isLoading: boolean;
   isAuthenticated: boolean;
   login: (email: string, password: string) => Promise<void>;
-  register: (name: string, email: string, password: string, password_confirmation: string) => Promise<void>;
+  register: (name: string, email: string, phone: string, password: string, password_confirmation: string) => Promise<void>;
   logout: () => Promise<void>;
   checkAuth: () => Promise<void>;
   refreshUser: () => Promise<void>;
@@ -145,10 +145,10 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     }
   };
 
-  const register = async (name: string, email: string, password: string, password_confirmation: string) => {
+  const register = async (name: string, email: string, phone: string, password: string, password_confirmation: string) => {
     try {
       console.log('AuthContext: Starting registration...');
-      const response = await authAPI.register(name, email, password, password_confirmation);
+      const response = await authAPI.register(name, email, phone, password, password_confirmation);
       console.log('AuthContext: Registration response:', response.data);
       
       // Handle the response structure - it's directly in response.data, not response.data.data

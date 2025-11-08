@@ -1,11 +1,11 @@
 import { AppConfig } from '@/config/app.config';
 import { useNotifications } from '@/context/NotificationContext';
 import { useTheme } from '@/context/ThemeContext';
-import { Device } from 'expo-device';
+import * as Device from 'expo-device';
 import * as SecureStore from 'expo-secure-store';
 import React, { useState } from 'react';
 import { Alert, Platform, ScrollView, Text, TouchableOpacity, View } from 'react-native';
-import NetworkTest from './NetworkTest';
+import { NetworkTest } from './NetworkTest';
 
 export default function ApiTest() {
   const { currentTheme } = useTheme();
@@ -31,7 +31,7 @@ export default function ApiTest() {
 
   const testApiConnection = async () => {
     let testUrl;
-    if (Device && Device.isDevice) {
+    if (Device.isDevice) {
       // Physical device - use the physical IP
       testUrl = AppConfig.api.development.physical.replace('/api', '/api/test');
     } else {
@@ -48,7 +48,7 @@ export default function ApiTest() {
 
   const testUserProfile = async () => {
     let testUrl;
-    if (Device && Device.isDevice) {
+    if (Device.isDevice) {
       // Physical device - use the physical IP
       testUrl = AppConfig.api.development.physical.replace('/api', '/api/user/profile');
     } else {

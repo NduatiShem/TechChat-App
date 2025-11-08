@@ -20,12 +20,64 @@ import * as DocumentPicker from 'expo-document-picker';
 import * as ImagePicker from 'expo-image-picker';
 import { router, useLocalSearchParams } from 'expo-router';
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { ActivityIndicator, Alert, BackHandler, FlatList, Image, InteractionManager, Keyboard, KeyboardAvoidingView, Modal, Platform, StatusBar, Text, TextInput, TouchableOpacity, View } from 'react-native';
+import { ActivityIndicator, Alert, BackHandler, FlatList, Image, Keyboard, KeyboardAvoidingView, Modal, Platform, StatusBar, Text, TextInput, TouchableOpacity, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
-export const options = ({ params }) => ({
+export const options = ({ params }: { params: any }) => ({
   headerShown: false, // Hide the default header, use custom header instead
 });
+
+interface Message {
+  id: number;
+  message: string;
+  sender_id: number;
+  receiver_id?: number;
+  group_id?: number;
+  created_at: string;
+  read_at?: string | null;
+  attachments?: {
+    id: number;
+    name: string;
+    mime: string;
+    url: string;
+    path?: string;
+    uri?: string;
+    size?: number;
+    type?: string;
+    isImage?: boolean;
+  }[];
+  voice_message?: {
+    url: string;
+    duration: number;
+  };
+  sender?: {
+    id: number;
+    name: string;
+    avatar_url?: string;
+  };
+  reply_to?: {
+    id: number;
+    message: string;
+    sender: {
+      id: number;
+      name: string;
+    };
+    attachments?: {
+      id: number;
+      name: string;
+      mime: string;
+      url: string;
+    }[];
+    created_at: string;
+  };
+}
+
+interface Attachment {
+  uri: string;
+  name: string;
+  type: string;
+  isImage?: boolean;
+}
 
 // Helper function to get base URL without /api suffix
 const getBaseUrl = () => {
@@ -46,7 +98,7 @@ const getBaseUrl = () => {
 export default function UserChatScreen() {
   const { id } = useLocalSearchParams();
   const { currentTheme } = useTheme();
-  const { user, isAuthenticated, isLoading } = useAuth();
+  const { user } = useAuth();
   const { updateUnreadCount } = useNotifications();
   const insets = useSafeAreaInsets();
   const ENABLE_MARK_AS_READ = true; // Enable mark as read functionality
@@ -54,12 +106,12 @@ export default function UserChatScreen() {
   
   // Remove the navigation effect - let the AppLayout handle authentication state changes
   const isDark = currentTheme === 'dark';
-  const [messages, setMessages] = useState([]);
+  const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(true);
   const [sending, setSending] = useState(false);
   const [showEmoji, setShowEmoji] = useState(false);
-  const [attachment, setAttachment] = useState(null); // { uri, name, type, isImage }
+  const [attachment, setAttachment] = useState<Attachment | null>(null); // { uri, name, type, isImage }
   const [userInfo, setUserInfo] = useState<any>(null);
   const [isOnline, setIsOnline] = useState(false);
   const [showVoiceRecorder, setShowVoiceRecorder] = useState(false);
@@ -69,7 +121,7 @@ export default function UserChatScreen() {
   const [showMessageOptions, setShowMessageOptions] = useState<number | null>(null);
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
   const [keyboardHeight, setKeyboardHeight] = useState(0);
-  const flatListRef = useRef(null);
+  const flatListRef = useRef<FlatList<Message>>(null);
   const isInitialLoad = useRef(true);
   
   // Pagination state
@@ -85,20 +137,19 @@ export default function UserChatScreen() {
 
   // Fetch messages and user info
   useEffect(() => {
-    let isMounted = true;
     const fetchMessages = async () => {
       setLoading(true);
       setHasScrolledToBottom(false); // Reset scroll flag when fetching new messages
       isInitialLoad.current = true; // Reset initial load flag
       try {
-        const res = await messagesAPI.getByUser(id, 1, 10);
+        const res = await messagesAPI.getByUser(Number(id), 1, 10);
         
         // Handle Laravel pagination format
         const messagesData = res.data.messages?.data || res.data.messages || [];
         const pagination = res.data.messages || {};
         
         // Debug each message's attachments
-        messagesData.forEach((message, index) => {
+        messagesData.forEach((message: any, index: number) => {
           if (message.attachments && message.attachments.length > 0) {
             // Message has attachments
           }
@@ -159,19 +210,17 @@ export default function UserChatScreen() {
         });
         
         // Sort messages by created_at in ascending order (oldest first)
-        const sortedMessages = processedMessages.sort((a, b) => 
+        const sortedMessages = processedMessages.sort((a: Message, b: Message) => 
           new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
         );
         
         // Find the newest message index for initial scroll
         const newestMessageId = pagination.newest_message_id;
-        let lastIndex = sortedMessages.length - 1;
         
         // If we have newest_message_id, find its index after sorting
         if (newestMessageId) {
-          const newestIndex = sortedMessages.findIndex(msg => msg.id === newestMessageId);
+          const newestIndex = sortedMessages.findIndex((msg: Message) => msg.id === newestMessageId);
           if (newestIndex >= 0) {
-            lastIndex = newestIndex;
             console.log('Found newest message at index:', newestIndex, 'ID:', newestMessageId);
           } else {
             console.log('Newest message ID not found in sorted messages, using last index');
@@ -245,14 +294,14 @@ export default function UserChatScreen() {
         }
         
         // Scroll will be handled by useEffect and onContentSizeChange after images render
-      } catch (e) {
+      } catch {
         setMessages([]);
         setLoading(false);
       }
     };
     fetchMessages();
-    return () => { isMounted = false; };
-  }, [id]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [id]); // ENABLE_MARK_AS_READ and updateUnreadCount are stable, no need to include
 
   // Debug: Log all keys and check for duplicates before rendering FlatList
   useEffect(() => {
@@ -373,7 +422,7 @@ export default function UserChatScreen() {
     setLoadingMore(true);
     try {
       const nextPage = currentPage + 1;
-      const res = await messagesAPI.getByUser(id, nextPage, 10);
+      const res = await messagesAPI.getByUser(Number(id), nextPage, 10);
       
       // Handle Laravel pagination format
       const newMessages = res.data.messages?.data || res.data.messages || [];
@@ -397,7 +446,7 @@ export default function UserChatScreen() {
       });
       
       // Sort new messages by created_at in ascending order (oldest first)
-      const sortedNewMessages = processedNewMessages.sort((a, b) => 
+      const sortedNewMessages = processedNewMessages.sort((a: Message, b: Message) => 
         new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
       );
       
@@ -432,7 +481,7 @@ export default function UserChatScreen() {
         if (flatListRef.current) {
           // Calculate the new scroll position to maintain the user's view
           const newScrollPosition = sortedNewMessages.length * 100; // Approximate height per message
-          flatListRef.current.scrollToOffset({ 
+          (flatListRef.current as any).scrollToOffset({ 
             offset: newScrollPosition, 
             animated: false 
           });
@@ -475,7 +524,7 @@ export default function UserChatScreen() {
         }
       }
       
-      formData.append('receiver_id', id);
+      formData.append('receiver_id', String(id));
       
       // Add reply_to_id if replying to a message
       if (replyingTo) {
@@ -585,7 +634,7 @@ export default function UserChatScreen() {
           setTimeout(() => {
             if (flatListRef.current) {
               try {
-                flatListRef.current.scrollToEnd({ animated: true });
+                (flatListRef.current as any).scrollToEnd({ animated: true });
               } catch (error) {
                 // If scrollToEnd fails, try scrolling to the last item by index
                 console.warn('scrollToEnd failed, trying scrollToIndex:', error);
@@ -594,7 +643,7 @@ export default function UserChatScreen() {
                   setTimeout(() => {
                     if (flatListRef.current) {
                       const lastIndex = updatedMessages.length - 1;
-                      flatListRef.current.scrollToIndex({ 
+                      (flatListRef.current as any).scrollToIndex({ 
                         index: lastIndex, 
                         animated: true,
                         viewPosition: 1 // 1 means bottom (0 = top, 1 = bottom)
@@ -614,7 +663,7 @@ export default function UserChatScreen() {
           setTimeout(() => {
             if (flatListRef.current) {
               try {
-                flatListRef.current.scrollToEnd({ animated: true });
+                (flatListRef.current as any).scrollToEnd({ animated: true });
               } catch (error) {
                 console.warn('Second scrollToEnd failed:', error);
               }
@@ -629,13 +678,14 @@ export default function UserChatScreen() {
       setVoiceRecording(null);
       setReplyingTo(null); // Clear reply state
       setShowEmoji(false);
-    } catch (e) {
-      console.error('Error sending message:', e);
+    } catch (e: unknown) {
+      const error = e as any;
+      console.error('Error sending message:', error);
       console.error('Error details:', {
-        message: e.message,
-        status: e.response?.status,
-        statusText: e.response?.statusText,
-        data: e.response?.data,
+        message: error.message,
+        status: error.response?.status,
+        statusText: error.response?.statusText,
+        data: error.response?.data,
         requestData: {
           input: input,
           hasAttachment: !!attachment,
@@ -646,7 +696,7 @@ export default function UserChatScreen() {
       });
       
       // Handle specific database constraint errors
-      if (e.response?.data?.exception === 'Illuminate\\Database\\QueryException') {
+      if (error.response?.data?.exception === 'Illuminate\\Database\\QueryException') {
         // If it's a voice message with database constraint error, still show the message
         if (voiceRecording) {
           // Don't show error alert, just log it
@@ -816,7 +866,7 @@ export default function UserChatScreen() {
   };
 
   // Render message bubble
-  const renderItem = ({ item, index }) => {
+  const renderItem = ({ item, index }: { item: Message; index: number }) => {
     // Ensure sender_id and user.id are compared as numbers
     const senderId = Number(item.sender_id);
     const currentUserId = Number(user?.id);
@@ -860,7 +910,7 @@ export default function UserChatScreen() {
       // Try to find audio attachment
       let audioAttachment = null;
       if (item.attachments && item.attachments.length > 0) {
-        audioAttachment = item.attachments.find(att => att.mime?.startsWith('audio/'));
+        audioAttachment = item.attachments.find((att: any) => att.mime?.startsWith('audio/'));
       }
       
       // Extract text part (everything before the voice message format)
@@ -1017,17 +1067,20 @@ export default function UserChatScreen() {
             />
           )}
           
-          {item.attachments && item.attachments.length > 0 && (
-            isVideoAttachment(item.attachments[0]) ? (
+          {item.attachments && item.attachments.length > 0 && (() => {
+            const firstAttachment = item.attachments[0];
+            if (!firstAttachment) return null;
+            
+            return isVideoAttachment(firstAttachment) ? (
               <View style={{ width: '100%' }}>
                 <VideoPlayer
                   url={(() => {
-                    let url = item.attachments[0].url || item.attachments[0].path || item.attachments[0].uri;
+                    let url = firstAttachment.url || firstAttachment.path || firstAttachment.uri || '';
                     if (url && !url.startsWith('http')) {
                       const cleanUrl = url.startsWith('/') ? url.substring(1) : url;
                       url = `${getBaseUrl()}/${cleanUrl}`;
                     }
-                    return url;
+                    return url || '';
                   })()}
                   isMine={isMine}
                   isDark={isDark}
@@ -1055,14 +1108,14 @@ export default function UserChatScreen() {
                   )}
                 </View>
               </View>
-            ) : item.attachments[0].mime?.startsWith('image/') ? (
+            ) : firstAttachment.mime?.startsWith('image/') ? (
               <View style={{ width: '100%' }}>
                 <TouchableOpacity 
                   onPress={() => {
                     // Try multiple possible URL fields and construct full URL
-                    let imageUrl = item.attachments[0].url || 
-                                  item.attachments[0].path || 
-                                  item.attachments[0].uri;
+                    let imageUrl = firstAttachment.url || 
+                                  firstAttachment.path || 
+                                  firstAttachment.uri;
                     
                     // If URL is relative, make it absolute
                     if (imageUrl && !imageUrl.startsWith('http')) {
@@ -1078,7 +1131,7 @@ export default function UserChatScreen() {
                   <Image 
                     source={{ 
                       uri: (() => {
-                        let url = item.attachments[0].url || item.attachments[0].path || item.attachments[0].uri;
+                        let url = firstAttachment.url || firstAttachment.path || firstAttachment.uri || '';
                         
                         if (url && !url.startsWith('http')) {
                           // Remove leading slash if present and construct full URL
@@ -1086,7 +1139,7 @@ export default function UserChatScreen() {
                           const fullUrl = `${getBaseUrl()}/${cleanUrl}`;
                           return fullUrl;
                         }
-                        return url;
+                        return url || '';
                       })()
                     }} 
                     style={{ 
@@ -1162,14 +1215,14 @@ export default function UserChatScreen() {
                   <TouchableOpacity 
                     style={{ flex: 1, minWidth: 0, flexShrink: 1 }}
                     onPress={async () => {
-                      const fileUrl = item.attachments[0].url || item.attachments[0].path || item.attachments[0].uri;
+                      const fileUrl = firstAttachment.url || firstAttachment.path || firstAttachment.uri;
                       let downloadUrl = fileUrl;
                       if (fileUrl && !fileUrl.startsWith('http')) {
                         const cleanUrl = fileUrl.startsWith('/') ? fileUrl.substring(1) : fileUrl;
                         downloadUrl = `${getBaseUrl()}/${cleanUrl}`;
                       }
                       
-                      const fileName = item.attachments[0].name || 'download';
+                      const fileName = firstAttachment.name || 'download';
                       
                       Alert.alert('File Download', `File: ${fileName}\nURL: ${downloadUrl}`, [
                         { text: 'OK', style: 'default' }
@@ -1187,7 +1240,7 @@ export default function UserChatScreen() {
                       numberOfLines={3}
                       ellipsizeMode="tail"
                     >
-                      {item.attachments[0].name}
+                      {firstAttachment.name}
                     </Text>
                     {/* Second row: File details with download icon */}
                     <View style={{ flexDirection: 'row', alignItems: 'center', width: '100%' }}>
@@ -1201,7 +1254,7 @@ export default function UserChatScreen() {
                         numberOfLines={1}
                         ellipsizeMode="tail"
                       >
-                        {item.attachments[0].size ? `${(item.attachments[0].size / 1024).toFixed(0)} KB` : 'Unknown'} • {(item.attachments[0].name || 'file').split('.').pop()?.toUpperCase() || 'FILE'}
+                        {firstAttachment.size ? `${(firstAttachment.size / 1024).toFixed(0)} KB` : 'Unknown'} • {(firstAttachment.name || 'file').split('.').pop()?.toUpperCase() || 'FILE'}
                       </Text>
                       <MaterialCommunityIcons 
                         name="download" 
@@ -1232,8 +1285,8 @@ export default function UserChatScreen() {
                   )}
                 </View>
               </View>
-            )
-          )}
+            );
+          })()}
           
           {/* Message content and timestamp in a flex container */}
           <View style={{ alignSelf: 'flex-start', maxWidth: '100%' }}>
@@ -1376,23 +1429,11 @@ export default function UserChatScreen() {
   };
 
   // Handle emoji select
-  const handleEmojiSelect = (emoji) => {
+  const handleEmojiSelect = (emoji: { native: string }) => {
     setInput(input + emoji.native);
     setShowEmoji(false);
   };
 
-  // Get user avatar initials
-  const getUserAvatarInitials = (userName: string | null | undefined) => {
-    if (!userName || typeof userName !== 'string') {
-      return 'U';
-    }
-    return userName
-      .split(' ')
-      .map(word => word.charAt(0))
-      .join('')
-      .toUpperCase()
-      .slice(0, 2);
-  };
 
   // Get last seen time
   const getLastSeenTime = () => {
@@ -1619,7 +1660,7 @@ export default function UserChatScreen() {
               // Don't use initialScrollIndex - it causes blank screen
               // Scroll will happen after content is rendered via onContentSizeChange
               onScroll={({ nativeEvent }) => {
-                const { contentOffset, contentSize, layoutMeasurement } = nativeEvent;
+                const { contentOffset } = nativeEvent;
                 // Use a threshold instead of exactly 0, as FlatList might not reach exactly 0
                 const isAtTop = contentOffset.y <= 50; // Within 50 pixels of the top
                 
@@ -1661,7 +1702,7 @@ export default function UserChatScreen() {
                       if (flatListRef.current && messages.length > 0 && isInitialLoad.current) {
                         try {
                           // Use scrollToEnd - it's more reliable when content is already rendered
-                          flatListRef.current.scrollToEnd({ animated: false });
+                          (flatListRef.current as any).scrollToEnd({ animated: false });
                           setHasScrolledToBottom(true);
                           isInitialLoad.current = false;
                           console.log('Scrolled to bottom via onContentSizeChange');
@@ -1671,7 +1712,7 @@ export default function UserChatScreen() {
                           try {
                             const lastIndex = messages.length - 1;
                             if (flatListRef.current && lastIndex >= 0) {
-                              flatListRef.current.scrollToIndex({ 
+                              (flatListRef.current as any).scrollToIndex({ 
                                 index: lastIndex, 
                                 animated: false,
                                 viewPosition: 1
@@ -1697,16 +1738,16 @@ export default function UserChatScreen() {
                     if (flatListRef.current && messages.length > 0 && isInitialLoad.current) {
                       try {
                         // Use scrollToEnd - it's more reliable when content is already rendered
-                        flatListRef.current.scrollToEnd({ animated: false });
+                        (flatListRef.current as any).scrollToEnd({ animated: false });
                         setHasScrolledToBottom(true);
                         isInitialLoad.current = false;
                         console.log('Scrolled to bottom via onLayout');
-                      } catch (error) {
+                      } catch {
                         // Fallback to scrollToIndex
                         try {
                           const lastIndex = messages.length - 1;
                           if (flatListRef.current && lastIndex >= 0) {
-                            flatListRef.current.scrollToIndex({ 
+                            (flatListRef.current as any).scrollToIndex({ 
                               index: lastIndex, 
                               animated: false,
                               viewPosition: 1
@@ -1715,8 +1756,8 @@ export default function UserChatScreen() {
                             isInitialLoad.current = false;
                             console.log('Scrolled to bottom via onLayout (scrollToIndex fallback)');
                           }
-                        } catch (scrollError) {
-                          console.warn('onLayout scroll failed:', scrollError);
+                        } catch {
+                          // Scroll failed
                         }
                       }
                     }

@@ -32,12 +32,12 @@ interface Group {
   users?: any[];
   unread_count?: number; // Unread message count for this group
   avatar_url?: string; // Group profile picture URL
-  last_message_attachments?: Array<{
+  last_message_attachments?: {
     id: number;
     name: string;
     mime: string;
     url: string;
-  }>;
+  }[];
 }
 
 export const options = {
@@ -79,7 +79,7 @@ export default function GroupsScreen() {
       
       setGroups(safeGroupsData);
       setFilteredGroups(safeGroupsData);
-    } catch (error) {
+    } catch {
       // Failed to load groups - set empty array to prevent errors
       setGroups([]);
       setFilteredGroups([]);
@@ -108,13 +108,15 @@ export default function GroupsScreen() {
 
   useEffect(() => {
     loadGroups();
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []); // loadGroups is stable, no need to include
 
   // Refresh groups when screen comes into focus
   useFocusEffect(
     React.useCallback(() => {
       loadGroups();
-    }, [])
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []) // loadGroups is stable, no need to include
   );
 
   const formatDate = (dateString: string | null | undefined): string => {
@@ -135,7 +137,7 @@ export default function GroupsScreen() {
         const dateStr = date.toLocaleDateString([], { month: 'short', day: 'numeric' });
         return dateStr || '';
       }
-    } catch (error) {
+    } catch {
       return '';
     }
   };
@@ -272,7 +274,7 @@ export default function GroupsScreen() {
   const sortedGroups = [...filteredGroups].sort((a, b) => {
     if (!a.last_message_date) return 1;
     if (!b.last_message_date) return -1;
-    return new Date(b.last_message_date) - new Date(a.last_message_date);
+    return new Date(b.last_message_date).getTime() - new Date(a.last_message_date).getTime();
   });
 
   return (

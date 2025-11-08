@@ -1,0 +1,73 @@
+name: Security Scan
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  schedule:
+    # Run weekly on Mondays at 2 AM UTC
+    - cron: '0 2 * * 1'
+
+jobs:
+  security-scan:
+    name: Security Vulnerability Scan
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      
+      - name: Install dependencies
+        run: npm ci
+      
+      - name: Run npm audit
+        run: |
+          echo "## Security Audit Report" > SECURITY_REPORT.md
+          echo "" >> SECURITY_REPORT.md
+          echo "### Vulnerabilities Found:" >> SECURITY_REPORT.md
+          npm audit --audit-level=moderate >> SECURITY_REPORT.md || echo "No vulnerabilities found" >> SECURITY_REPORT.md
+          cat SECURITY_REPORT.md
+      
+      - name: Check for sensitive data
+        run: |
+          echo "Checking for potential sensitive data..."
+          # Check for common patterns that might indicate secrets
+          if grep -r "password.*=.*['\"].*[^=]" app/ components/ services/ --exclude-dir=node_modules 2>/dev/null | grep -v "password.*=.*''" | grep -v "password.*=.*\"\""; then
+            echo "⚠️ Warning: Potential hardcoded passwords found"
+          fi
+          
+          if grep -r "api.*key.*=.*['\"].*[^=]" app/ components/ services/ --exclude-dir=node_modules 2>/dev/null | grep -v "api.*key.*=.*''" | grep -v "api.*key.*=.*\"\""; then
+            echo "⚠️ Warning: Potential hardcoded API keys found"
+          fi
+          
+          if grep -r "token.*=.*['\"].*[^=]" app/ components/ services/ --exclude-dir=node_modules 2>/dev/null | grep -v "token.*=.*''" | grep -v "token.*=.*\"\""; then
+            echo "⚠️ Warning: Potential hardcoded tokens found"
+          fi
+        continue-on-error: true
+      
+      - name: Create Security Issue (if vulnerabilities found)
+        uses: actions/github-script@v7
+        if: success() && github.event_name == 'schedule'
+        with:
+          script: |
+            const fs = require('fs');
+            const report = fs.readFileSync('SECURITY_REPORT.md', 'utf8');
+            
+            // Check if there are actual vulnerabilities
+            if (report.includes('moderate') || report.includes('high') || report.includes('critical')) {
+              github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: '🔒 Security Vulnerabilities Detected',
+                body: report + '\n\n---\n\n*This issue was automatically created by the Security Scan workflow.*\n\n**Action Required:** Review and update vulnerable dependencies.',
+                labels: ['security', 'automated', 'dependencies']
+              });
+            }
+

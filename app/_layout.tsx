@@ -18,7 +18,7 @@ SplashScreen.preventAutoHideAsync();
 
 function AppTabsLayout() {
   const { currentTheme } = useTheme();
-  const { unreadCount, groupUnreadCount, updateGroupUnreadCount, resetAllCounts, updateUnreadCount } = useNotifications();
+  const { groupUnreadCount, updateGroupUnreadCount, updateUnreadCount } = useNotifications();
   const { isAuthenticated } = useAuth();
   const pathname = usePathname();
   const isDark = currentTheme === 'dark';
@@ -163,7 +163,8 @@ function AppTabsLayout() {
         console.error('Error cleaning up app state listeners:', error);
       }
     };
-  }, [isAuthenticated]); // Removed updateUnreadCount and resetAllCounts from dependencies to prevent infinite loops
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isAuthenticated]); // Removed loadGroupsForCounter, syncUnreadCount, and updateLastSeen from dependencies to prevent infinite loops
 
   return (
     <>

@@ -18,6 +18,8 @@ import {
   View,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import NetInfo from '@react-native-community/netinfo';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 
 interface Conversation {
   id: number;
@@ -35,12 +37,12 @@ interface Conversation {
   user_id?: number; // The actual user ID for user conversations
   conversation_id?: number; // The conversation ID
   unread_count?: number; // Unread message count for this conversation
-  last_message_attachments?: Array<{
+  last_message_attachments?: {
     id: number;
     name: string;
     mime: string;
     url: string;
-  }>;
+  }[];
   user?: {
     id: number;
     name: string;
@@ -49,19 +51,58 @@ interface Conversation {
   };
 }
 
+const CONVERSATIONS_CACHE_KEY = '@techchat_conversations';
+
 export default function ConversationsScreen() {
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [filteredConversations, setFilteredConversations] = useState<Conversation[]>([]);
   const [searchQuery, setSearchQuery] = useState('');
   const [isLoading, setIsLoading] = useState(true);
   const [isRefreshing, setIsRefreshing] = useState(false);
+  const [isOnline, setIsOnline] = useState(true);
   const { user } = useAuth();
   const { currentTheme } = useTheme();
   const { requestPermissions, conversationCounts, updateUnreadCount } = useNotifications();
 
   const isDark = currentTheme === 'dark';
 
-  const loadConversations = async () => {
+  // Cache conversations to AsyncStorage
+  const cacheConversations = async (conversationsToCache: Conversation[]) => {
+    try {
+      await AsyncStorage.setItem(CONVERSATIONS_CACHE_KEY, JSON.stringify(conversationsToCache));
+    } catch (error) {
+      console.error('Failed to cache conversations:', error);
+    }
+  };
+
+  // Load cached conversations from AsyncStorage
+  const loadCachedConversations = async (): Promise<Conversation[]> => {
+    try {
+      const cachedData = await AsyncStorage.getItem(CONVERSATIONS_CACHE_KEY);
+      if (cachedData) {
+        const parsed = JSON.parse(cachedData);
+        if (Array.isArray(parsed)) {
+          return parsed;
+        }
+      }
+    } catch (error) {
+      console.error('Failed to load cached conversations:', error);
+    }
+    return [];
+  };
+
+  const loadConversations = async (forceRefresh = false) => {
+    // If offline, load from cache only
+    if (!isOnline && !forceRefresh) {
+      const cachedConversations = await loadCachedConversations();
+      if (cachedConversations.length > 0) {
+        setConversations(cachedConversations);
+        setFilteredConversations(cachedConversations);
+        setIsLoading(false);
+        return;
+      }
+    }
+
     try {
       const response = await conversationsAPI.getAll();
       let conversationsData = response.data;
@@ -79,11 +120,13 @@ export default function ConversationsScreen() {
               conversationsData = JSON.parse(fixedData);
             } catch (fixError) {
               console.error('Failed to parse fixed JSON array:', fixError);
-              setConversations([]);
+              // Don't clear conversations on parse error - keep existing data
+              setIsLoading(false);
               return;
             }
           } else {
-            setConversations([]);
+            // Don't clear conversations on parse error - keep existing data
+            setIsLoading(false);
             return;
           }
         }
@@ -111,15 +154,50 @@ export default function ConversationsScreen() {
         
         setConversations(uniqueConversations);
         setFilteredConversations(uniqueConversations);
+        // Cache conversations for offline use
+        await cacheConversations(uniqueConversations);
       } else {
         console.error('Response data is not an array:', conversationsData);
-        setConversations([]);
-        setFilteredConversations([]);
+        // Don't clear conversations if response format is unexpected - keep existing data
+        // Only clear if we have no existing conversations
+        if (conversations.length === 0) {
+          setConversations([]);
+          setFilteredConversations([]);
+        }
       }
-    } catch (error) {
+    } catch (error: any) {
       console.error('Failed to load conversations:', error);
-      setConversations([]);
-      setFilteredConversations([]);
+      // If offline or network error, try to load from cache
+      if (!isOnline || error?.message?.includes('Network') || error?.code === 'NETWORK_ERROR') {
+        const cachedConversations = await loadCachedConversations();
+        if (cachedConversations.length > 0) {
+          setConversations(cachedConversations);
+          setFilteredConversations(cachedConversations);
+          setIsLoading(false);
+          return;
+        }
+      }
+      // Don't clear conversations on error - preserve existing data
+      // Only clear if we have no existing conversations (initial load)
+      if (conversations.length === 0) {
+        // Try loading from cache one more time
+        const cachedConversations = await loadCachedConversations();
+        if (cachedConversations.length > 0) {
+          setConversations(cachedConversations);
+          setFilteredConversations(cachedConversations);
+        } else {
+          setConversations([]);
+          setFilteredConversations([]);
+        }
+      }
+      // Log error details for debugging
+      if (error?.response) {
+        console.error('API Error Response:', {
+          status: error.response.status,
+          data: error.response.data,
+          headers: error.response.headers
+        });
+      }
     } finally {
       setIsLoading(false);
     }
@@ -127,7 +205,8 @@ export default function ConversationsScreen() {
 
   const onRefresh = async () => {
     setIsRefreshing(true);
-    await loadConversations();
+    // Force refresh even if offline
+    await loadConversations(true);
     setIsRefreshing(false);
   };
 
@@ -143,18 +222,61 @@ export default function ConversationsScreen() {
     }
   }, [searchQuery, conversations]);
 
+  // Monitor network state
   useEffect(() => {
-    loadConversations();
-    // Request notification permissions when the app loads
-    requestPermissions();
-  }, []);
+    // Get initial network state
+    NetInfo.fetch().then(state => {
+      setIsOnline(state.isConnected ?? false);
+    });
+
+    // Subscribe to network state changes
+    const unsubscribe = NetInfo.addEventListener(state => {
+      const connected = state.isConnected ?? false;
+      const wasOffline = !isOnline;
+      setIsOnline(connected);
+      
+      // If we just came back online, refresh conversations
+      if (connected && wasOffline && user) {
+        loadConversations(true);
+      }
+    });
+
+    return () => {
+      unsubscribe();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user, isOnline]);
+
+  useEffect(() => {
+    // Only load conversations if user is authenticated
+    if (user) {
+      // First try to load from cache for instant display
+      loadCachedConversations().then(cached => {
+        if (cached.length > 0) {
+          setConversations(cached);
+          setFilteredConversations(cached);
+          setIsLoading(false);
+        }
+      });
+      
+      // Then load from API (will update cache if successful)
+      loadConversations();
+      // Request notification permissions when the app loads
+      requestPermissions();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user]); // loadConversations and requestPermissions are stable, no need to include
 
   // Reload conversations when screen comes into focus (e.g., returning from chat)
   // This ensures unread counts are updated after marking messages as read
   useFocusEffect(
     useCallback(() => {
-      loadConversations();
-    }, [])
+      // Only reload if user is authenticated
+      if (user) {
+        loadConversations();
+      }
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [user]) // loadConversations is stable, no need to include
   );
 
   const formatDate = (dateString: string) => {
@@ -255,7 +377,7 @@ export default function ConversationsScreen() {
   const sortedConversations = [...filteredConversations].sort((a, b) => {
     if (!a.last_message_date) return 1;
     if (!b.last_message_date) return -1;
-    return new Date(b.last_message_date) - new Date(a.last_message_date);
+    return new Date(b.last_message_date).getTime() - new Date(a.last_message_date).getTime();
   });
 
   if (isLoading) {
@@ -290,8 +412,10 @@ export default function ConversationsScreen() {
             Welcome back, {user?.name}
           </Text>
           <View className="flex-row items-center">
-            <View className="w-2 h-2 bg-secondary rounded-full mr-2"></View>
-            <Text className="text-secondary text-xs font-medium">Online</Text>
+            <View className={`w-2 h-2 rounded-full mr-2 ${isOnline ? 'bg-green-500' : 'bg-gray-500'}`}></View>
+            <Text className={`text-xs font-medium ${isOnline ? 'text-green-500' : 'text-gray-500'}`}>
+              {isOnline ? 'Online' : 'Offline'}
+            </Text>
           </View>
         </View>
         

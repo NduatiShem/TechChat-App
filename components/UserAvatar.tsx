@@ -1,4 +1,3 @@
-import { useTheme } from '@/context/ThemeContext';
 import React, { useState } from 'react';
 import { Image, Text, View } from 'react-native';
 
@@ -10,8 +9,6 @@ interface UserAvatarProps {
 }
 
 export default function UserAvatar({ avatarUrl, name, size = 40, style }: UserAvatarProps) {
-  const { currentTheme } = useTheme();
-  const isDark = currentTheme === 'dark';
   const [imageError, setImageError] = useState(false);
 
   const getInitials = (userName: string | null | undefined) => {

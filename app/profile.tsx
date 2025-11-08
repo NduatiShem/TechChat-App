@@ -1,4 +1,3 @@
-import { AppConfig } from '@/config/app.config';
 import { useAuth } from '@/context/AuthContext';
 import { useTheme } from '@/context/ThemeContext';
 import { secureStorage } from '@/utils/secureStore';
@@ -10,7 +9,7 @@ import React, { useEffect, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
-  Image, Platform, ScrollView,
+  Image, ScrollView,
   Text,
   TouchableOpacity,
   View
@@ -171,7 +170,7 @@ export default function ProfileScreen() {
           }
         );
         fileUri = manipulated.uri;
-      } catch (manipulatorError) {
+      } catch {
         // Fallback to original URI if manipulation fails
       }
 
@@ -192,7 +191,7 @@ export default function ProfileScreen() {
         type: mimeType,
       } as any);
 
-      const response = await authAPI.uploadAvatar(formData);
+      await authAPI.uploadAvatar(formData);
       
       Alert.alert('Success', 'Avatar updated successfully!');
       await refreshUser();

@@ -26,7 +26,6 @@ import {
   BackHandler,
   FlatList,
   Image,
-  InteractionManager,
   Keyboard,
   KeyboardAvoidingView,
   Modal,
@@ -45,12 +44,18 @@ interface Message {
   sender_id: number;
   group_id: number;
   created_at: string;
-  attachments?: Array<{
+  read_at?: string | null;
+  attachments?: {
     id: number;
     name: string;
     mime: string;
     url: string;
-  }>;
+    path?: string;
+    uri?: string;
+    size?: number;
+    type?: string;
+    isImage?: boolean;
+  }[];
   voice_message?: {
     url: string;
     duration: number;
@@ -58,6 +63,7 @@ interface Message {
   sender?: {
     id: number;
     name: string;
+    avatar_url?: string;
   };
   reply_to?: {
     id: number;
@@ -65,8 +71,17 @@ interface Message {
     sender: {
       id: number;
       name: string;
+      avatar_url?: string;
     };
+    attachments?: {
+      id: number;
+      name: string;
+      mime: string;
+      url: string;
+    }[];
+    created_at: string;
   };
+  reply_to_id?: number;
 }
 
 interface Attachment {
@@ -95,7 +110,7 @@ const getBaseUrl = () => {
 export default function GroupChatScreen() {
   const { id } = useLocalSearchParams();
   const { currentTheme } = useTheme();
-  const { user, isAuthenticated, isLoading } = useAuth();
+  const { user } = useAuth();
   const { updateUnreadCount } = useNotifications();
   const insets = useSafeAreaInsets();
   const ENABLE_MARK_AS_READ = true; // Enable mark as read functionality for groups
@@ -109,7 +124,6 @@ export default function GroupChatScreen() {
   const [showEmoji, setShowEmoji] = useState(false);
   const [sending, setSending] = useState(false);
   const [loading, setLoading] = useState(true);
-  const [isRecording, setIsRecording] = useState(false);
   const [groupInfo, setGroupInfo] = useState<any>(null);
   const [showGroupMembers, setShowGroupMembers] = useState(false);
   const [showVoiceRecorder, setShowVoiceRecorder] = useState(false);
@@ -173,7 +187,7 @@ export default function GroupChatScreen() {
       });
       
       // Sort messages by created_at in ascending order (oldest first)
-      const sortedMessages = processedMessages.sort((a, b) => 
+      const sortedMessages = processedMessages.sort((a: Message, b: Message) => 
         new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
       );
       setMessages(sortedMessages);
@@ -195,7 +209,7 @@ export default function GroupChatScreen() {
           await groupsAPI.markMessagesAsRead(groupId);
           // Update unread count to 0 for this group - this will update badge
           updateUnreadCount(groupId, 0);
-        } catch (error: any) {
+        } catch {
           // Ignore validation (422) or missing route errors
           // Failed to mark messages as read
         }
@@ -269,7 +283,7 @@ export default function GroupChatScreen() {
       });
       
       // Sort new messages by created_at in ascending order (oldest first)
-      const sortedNewMessages = processedNewMessages.sort((a, b) => 
+      const sortedNewMessages = processedNewMessages.sort((a: Message, b: Message) => 
         new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
       );
       
@@ -379,7 +393,7 @@ export default function GroupChatScreen() {
           uri: attachment.uri,
           name: attachment.name,
           type: attachment.type,
-        });
+        } as any);
       }
       
       // Add text message if present (or marker for attachment)
@@ -410,7 +424,7 @@ export default function GroupChatScreen() {
       // Update last_seen_at when user sends a message (activity indicator)
       try {
         await usersAPI.updateLastSeen();
-      } catch (error) {
+      } catch {
         // Silently fail - don't block message sending if last_seen update fails
         // Failed to update last_seen_at
       }
@@ -464,7 +478,7 @@ export default function GroupChatScreen() {
             if (flatListRef.current) {
               try {
                 flatListRef.current.scrollToEnd({ animated: true });
-              } catch (error) {
+              } catch {
                 // If scrollToEnd fails, try scrolling to the last item by index
                 // Scroll failed, trying alternative method
                 try {
@@ -479,7 +493,7 @@ export default function GroupChatScreen() {
                       });
                     }
                   }, 100);
-                } catch (scrollError) {
+                } catch {
                   // Alternative scroll method also failed
                 }
               }
@@ -493,7 +507,7 @@ export default function GroupChatScreen() {
             if (flatListRef.current) {
               try {
                 flatListRef.current.scrollToEnd({ animated: true });
-              } catch (error) {
+              } catch {
                 // Second scroll attempt failed
               }
             }
@@ -507,10 +521,11 @@ export default function GroupChatScreen() {
       setVoiceRecording(null);
       setReplyingTo(null); // Clear reply state
       setShowEmoji(false);
-    } catch (e) {
+    } catch (e: unknown) {
+      const error = e as any;
       // Error sending message
       // Handle specific database constraint errors
-      if (e.response?.data?.exception === 'Illuminate\\Database\\QueryException') {
+      if (error.response?.data?.exception === 'Illuminate\\Database\\QueryException') {
         // If it's a voice message with database constraint error, still show the message
         if (voiceRecording) {
           // Don't show error alert, just log it
@@ -630,7 +645,7 @@ export default function GroupChatScreen() {
           style: 'destructive',
           onPress: async () => {
             try {
-              const response = await messagesAPI.deleteMessage(messageId);
+              await messagesAPI.deleteMessage(messageId);
               
               // Remove message from local state
               setMessages(prev => prev.filter(msg => msg.id !== messageId));
@@ -678,19 +693,6 @@ export default function GroupChatScreen() {
     setShowGroupMembers(!showGroupMembers);
   };
 
-  // Get group avatar initials
-  const getGroupAvatarInitials = (groupName: string | null | undefined) => {
-    if (!groupName || typeof groupName !== 'string') {
-      return 'G';
-    }
-    return groupName
-      .split(' ')
-      .map(word => word.charAt(0))
-      .join('')
-      .toUpperCase()
-      .slice(0, 2);
-  };
-
   // Render message bubble
   const renderItem = ({ item, index }: { item: Message; index: number }) => {
     // Ensure sender_id and user.id are compared as numbers
@@ -721,6 +723,7 @@ export default function GroupChatScreen() {
       const voiceMatch = item.message.match(/\[VOICE_MESSAGE:(\d+)\]$/);
       
       // This is a voice message - ALWAYS render as voice bubble regardless of attachments
+      if (!voiceMatch) return null; // Safety check
       const duration = parseInt(voiceMatch[1]);
       
       // Try to find audio attachment
@@ -996,17 +999,20 @@ export default function GroupChatScreen() {
             </Text>
           )}
 
-          {item.attachments && item.attachments.length > 0 && (
-            isVideoAttachment(item.attachments[0]) ? (
+          {item.attachments && item.attachments.length > 0 && (() => {
+            const firstAttachment = item.attachments[0];
+            if (!firstAttachment) return null;
+            
+            return isVideoAttachment(firstAttachment) ? (
               <View style={{ width: '100%' }}>
                 <VideoPlayer
                   url={(() => {
-                    let url = item.attachments[0].url || item.attachments[0].path || item.attachments[0].uri;
+                    let url = firstAttachment.url || firstAttachment.path || firstAttachment.uri || '';
                     if (url && !url.startsWith('http')) {
                       const cleanUrl = url.startsWith('/') ? url.substring(1) : url;
                       url = `${getBaseUrl()}/${cleanUrl}`;
                     }
-                    return url;
+                    return url || '';
                   })()}
                   isMine={isMine}
                   isDark={isDark}
@@ -1021,14 +1027,14 @@ export default function GroupChatScreen() {
                   marginRight: 2,
                 }}>{timestamp}</Text>
               </View>
-            ) : item.attachments[0].mime?.startsWith('image/') ? (
+            ) : firstAttachment.mime?.startsWith('image/') ? (
               <View style={{ width: '100%' }}>
                 <TouchableOpacity 
                   onPress={() => {
                     // Try multiple possible URL fields and construct full URL
-                    let imageUrl = item.attachments[0].url || 
-                                  item.attachments[0].path || 
-                                  item.attachments[0].uri;
+                    let imageUrl = firstAttachment.url || 
+                                  firstAttachment.path || 
+                                  firstAttachment.uri;
                     
                     // If URL is relative, make it absolute
                     if (imageUrl && !imageUrl.startsWith('http')) {
@@ -1044,7 +1050,7 @@ export default function GroupChatScreen() {
                   <Image 
                     source={{ 
                       uri: (() => {
-                        let url = item.attachments[0].url || item.attachments[0].path || item.attachments[0].uri;
+                        let url = firstAttachment.url || firstAttachment.path || firstAttachment.uri;
                         
                         if (url && !url.startsWith('http')) {
                           // Remove leading slash if present and construct full URL
@@ -1114,14 +1120,14 @@ export default function GroupChatScreen() {
                   <TouchableOpacity 
                     style={{ flex: 1, minWidth: 0, flexShrink: 1 }}
                     onPress={async () => {
-                      const fileUrl = item.attachments[0].url || item.attachments[0].path || item.attachments[0].uri;
+                      const fileUrl = firstAttachment.url || firstAttachment.path || firstAttachment.uri;
                       let downloadUrl = fileUrl;
                       if (fileUrl && !fileUrl.startsWith('http')) {
                         const cleanUrl = fileUrl.startsWith('/') ? fileUrl.substring(1) : fileUrl;
                         downloadUrl = `${getBaseUrl()}/${cleanUrl}`;
                       }
                       
-                      const fileName = item.attachments[0].name || 'download';
+                      const fileName = firstAttachment.name || 'download';
                       
                       Alert.alert('File Download', `File: ${fileName}\nURL: ${downloadUrl}`, [
                         { text: 'OK', style: 'default' }
@@ -1139,7 +1145,7 @@ export default function GroupChatScreen() {
                       numberOfLines={3}
                       ellipsizeMode="tail"
                     >
-                      {item.attachments[0].name}
+                      {firstAttachment.name}
                     </Text>
                     {/* Second row: File details with download icon */}
                     <View style={{ flexDirection: 'row', alignItems: 'center', width: '100%' }}>
@@ -1153,7 +1159,7 @@ export default function GroupChatScreen() {
                         numberOfLines={1}
                         ellipsizeMode="tail"
                       >
-                        {item.attachments[0].size ? `${(item.attachments[0].size / 1024).toFixed(0)} KB` : 'Unknown'} • {(item.attachments[0].name || 'file').split('.').pop()?.toUpperCase() || 'FILE'}
+                        {firstAttachment.size ? `${(firstAttachment.size / 1024).toFixed(0)} KB` : 'Unknown'} • {(firstAttachment.name || 'file').split('.').pop()?.toUpperCase() || 'FILE'}
                       </Text>
                       <MaterialCommunityIcons 
                         name="download" 
@@ -1176,8 +1182,8 @@ export default function GroupChatScreen() {
                   </Text>
                 </View>
               </View>
-            )
-          )}
+            );
+          })()}
           
           {/* Message content and timestamp in a flex container */}
           <View style={{ width: '100%' }}>
@@ -1322,7 +1328,8 @@ export default function GroupChatScreen() {
 
   useEffect(() => {
     fetchMessages();
-  }, [id]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [id]); // fetchMessages is stable, no need to include in deps
 
   // Format message date for separators
   const formatMessageDate = (dateString: string | null | undefined) => {
@@ -1359,7 +1366,7 @@ export default function GroupChatScreen() {
           month: 'long', 
           day: 'numeric' 
         });
-      } catch (error) {
+      } catch {
         // Error formatting date
         return 'Today'; // Default fallback
       }
@@ -1578,7 +1585,7 @@ export default function GroupChatScreen() {
                 keyboardShouldPersistTaps="handled"
                 keyboardDismissMode={Platform.OS === 'ios' ? 'interactive' : 'on-drag'}
               onScroll={({ nativeEvent }) => {
-                const { contentOffset, contentSize, layoutMeasurement } = nativeEvent;
+                const { contentOffset } = nativeEvent;
                 const isAtTop = contentOffset.y <= 50;
                 
                 // Debounce: only trigger once every 2 seconds
@@ -1623,7 +1630,7 @@ export default function GroupChatScreen() {
                             setHasScrolledToBottom(true);
                             // Scrolled to bottom
                           }
-                        } catch (error) {
+                        } catch {
                           // Scroll failed
                           // Fallback: try scrollToIndex
                           if (!hasScrolledToBottom) {
@@ -1638,7 +1645,7 @@ export default function GroupChatScreen() {
                                 setHasScrolledToBottom(true);
                                 // Scrolled to bottom (fallback)
                               }
-                            } catch (scrollError) {
+                            } catch {
                               // Scroll fallback failed
                             }
                           }
@@ -1660,7 +1667,7 @@ export default function GroupChatScreen() {
                         setHasScrolledToBottom(true);
                         isInitialLoad.current = false;
                         // Scrolled to bottom
-                      } catch (error) {
+                      } catch {
                         // Fallback to scrollToIndex
                         try {
                           const lastIndex = messages.length - 1;
@@ -1674,7 +1681,7 @@ export default function GroupChatScreen() {
                             isInitialLoad.current = false;
                             // Scrolled to bottom (fallback)
                           }
-                        } catch (scrollError) {
+                        } catch {
                           // Scroll failed
                         }
                       }

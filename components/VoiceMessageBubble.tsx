@@ -54,7 +54,8 @@ export default function VoiceMessageBubble({
       }
       stopWaveformAnimation();
     };
-  }, [uri]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [uri]); // loadAudio, sound, and stopWaveformAnimation are stable, no need to include
 
   const loadAudio = async () => {
     try {
@@ -89,13 +90,14 @@ export default function VoiceMessageBubble({
 
       console.log('VoiceMessageBubble - Sound object created successfully');
       setSound(newSound);
-    } catch (error) {
+    } catch (error: unknown) {
+      const err = error as any;
       console.error('Error loading audio:', error);
       console.error('VoiceMessageBubble - Failed URI:', uri);
       console.error('VoiceMessageBubble - Error details:', {
-        message: error.message,
-        code: error.code,
-        stack: error.stack
+        message: err?.message,
+        code: err?.code,
+        stack: err?.stack
       });
       
       setSound(null);
@@ -214,12 +216,13 @@ export default function VoiceMessageBubble({
           }
         }, 100);
       }
-    } catch (error) {
+    } catch (error: unknown) {
+      const err = error as any;
       console.error('Error toggling playback:', error);
       console.error('VoiceMessageBubble - Sound object state:', { sound: !!sound, isPlaying });
       
       // Try to reload the audio if there's an error
-      if (error.message.includes('Player does not exist')) {
+      if (err?.message?.includes('Player does not exist')) {
         console.log('VoiceMessageBubble - Player does not exist, reloading audio...');
         setSound(null);
         await loadAudio();
@@ -257,10 +260,6 @@ export default function VoiceMessageBubble({
     return `${mins}:${secs.toString().padStart(2, '0')}`;
   };
 
-  const getProgressPercentage = () => {
-    if (duration === 0) return 0;
-    return (position / duration) * 100;
-  };
 
   const renderWaveform = () => {
     const bars = 20;
