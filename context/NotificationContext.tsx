@@ -5,7 +5,7 @@ import Constants from 'expo-constants';
 import * as Device from 'expo-device';
 import * as Notifications from 'expo-notifications';
 import React, { createContext, ReactNode, useContext, useEffect, useState } from 'react';
-import { AppState } from 'react-native';
+import { AppState, AppStateStatus } from 'react-native';
 
 interface NotificationContextType {
   unreadCount: number;
@@ -34,6 +34,8 @@ Notifications.setNotificationHandler({
       shouldShowAlert: true,
       shouldPlaySound: true,
       shouldSetBadge: true,
+      shouldShowBanner: true,
+      shouldShowList: true,
     };
   },
 });
@@ -257,7 +259,7 @@ export const NotificationProvider: React.FC<NotificationProviderProps> = ({ chil
     initializeNotifications();
 
     // Track app state changes with error handling
-    const handleAppStateChange = (nextAppState: string) => {
+    const handleAppStateChange = (nextAppState: AppStateStatus) => {
       try {
         console.log('App state changed from', appState, 'to', nextAppState);
         if (mounted) {
@@ -289,8 +291,8 @@ export const NotificationProvider: React.FC<NotificationProviderProps> = ({ chil
         const data = notification.request.content.data;
         if (data?.type === 'new_message') {
           // Update unread count for the conversation
-          const conversationId = data.conversation_id || data.conversationId;
-          if (conversationId) {
+          const conversationId = (data.conversation_id || data.conversationId) as number | undefined;
+          if (conversationId && typeof conversationId === 'number') {
             try {
               // Increment unread count
               const newCount = (conversationCounts[conversationId] || 0) + 1;
@@ -298,7 +300,7 @@ export const NotificationProvider: React.FC<NotificationProviderProps> = ({ chil
               
               // Update badge count - use total unread count
               const totalUnread = Object.values({ ...conversationCounts, [conversationId]: newCount })
-                .reduce((sum, count) => sum + count, 0);
+                .reduce((sum: number, count: number) => sum + count, 0);
               await badgeService.setBadgeCount(totalUnread);
             } catch (badgeError) {
               console.error('Error updating badge:', badgeError);
@@ -314,14 +316,14 @@ export const NotificationProvider: React.FC<NotificationProviderProps> = ({ chil
           
           // Always show notification, regardless of app state
           // This ensures users see notifications even when the app is open
-          const title = data.sender_name || 'New Message';
+          const title = (data.sender_name as string) || 'New Message';
           const body = notification.request.content.body || 'You have a new message';
           
           console.log('Showing notification for new message:', { title, body, appState });
           
           // Small delay to ensure the notification shows
           setTimeout(() => {
-            showForegroundNotification(title, body, data).catch(err => {
+            showForegroundNotification(title, body, data).catch((err: unknown) => {
               console.error('Error showing foreground notification:', err);
             });
           }, 100);

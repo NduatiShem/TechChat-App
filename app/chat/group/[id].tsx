@@ -44,11 +44,17 @@ interface Message {
   sender_id: number;
   group_id: number;
   created_at: string;
+  read_at?: string | null;
   attachments?: {
     id: number;
     name: string;
     mime: string;
     url: string;
+    path?: string;
+    uri?: string;
+    size?: number;
+    type?: string;
+    isImage?: boolean;
   }[];
   voice_message?: {
     url: string;
@@ -57,6 +63,7 @@ interface Message {
   sender?: {
     id: number;
     name: string;
+    avatar_url?: string;
   };
   reply_to?: {
     id: number;
@@ -64,8 +71,17 @@ interface Message {
     sender: {
       id: number;
       name: string;
+      avatar_url?: string;
     };
+    attachments?: {
+      id: number;
+      name: string;
+      mime: string;
+      url: string;
+    }[];
+    created_at: string;
   };
+  reply_to_id?: number;
 }
 
 interface Attachment {
@@ -171,7 +187,7 @@ export default function GroupChatScreen() {
       });
       
       // Sort messages by created_at in ascending order (oldest first)
-      const sortedMessages = processedMessages.sort((a, b) => 
+      const sortedMessages = processedMessages.sort((a: Message, b: Message) => 
         new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
       );
       setMessages(sortedMessages);
@@ -267,7 +283,7 @@ export default function GroupChatScreen() {
       });
       
       // Sort new messages by created_at in ascending order (oldest first)
-      const sortedNewMessages = processedNewMessages.sort((a, b) => 
+      const sortedNewMessages = processedNewMessages.sort((a: Message, b: Message) => 
         new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
       );
       
@@ -377,7 +393,7 @@ export default function GroupChatScreen() {
           uri: attachment.uri,
           name: attachment.name,
           type: attachment.type,
-        });
+        } as any);
       }
       
       // Add text message if present (or marker for attachment)
@@ -505,10 +521,11 @@ export default function GroupChatScreen() {
       setVoiceRecording(null);
       setReplyingTo(null); // Clear reply state
       setShowEmoji(false);
-    } catch (e) {
+    } catch (e: unknown) {
+      const error = e as any;
       // Error sending message
       // Handle specific database constraint errors
-      if (e.response?.data?.exception === 'Illuminate\\Database\\QueryException') {
+      if (error.response?.data?.exception === 'Illuminate\\Database\\QueryException') {
         // If it's a voice message with database constraint error, still show the message
         if (voiceRecording) {
           // Don't show error alert, just log it
@@ -706,6 +723,7 @@ export default function GroupChatScreen() {
       const voiceMatch = item.message.match(/\[VOICE_MESSAGE:(\d+)\]$/);
       
       // This is a voice message - ALWAYS render as voice bubble regardless of attachments
+      if (!voiceMatch) return null; // Safety check
       const duration = parseInt(voiceMatch[1]);
       
       // Try to find audio attachment
@@ -981,17 +999,20 @@ export default function GroupChatScreen() {
             </Text>
           )}
 
-          {item.attachments && item.attachments.length > 0 && (
-            isVideoAttachment(item.attachments[0]) ? (
+          {item.attachments && item.attachments.length > 0 && (() => {
+            const firstAttachment = item.attachments[0];
+            if (!firstAttachment) return null;
+            
+            return isVideoAttachment(firstAttachment) ? (
               <View style={{ width: '100%' }}>
                 <VideoPlayer
                   url={(() => {
-                    let url = item.attachments[0].url || item.attachments[0].path || item.attachments[0].uri;
+                    let url = firstAttachment.url || firstAttachment.path || firstAttachment.uri || '';
                     if (url && !url.startsWith('http')) {
                       const cleanUrl = url.startsWith('/') ? url.substring(1) : url;
                       url = `${getBaseUrl()}/${cleanUrl}`;
                     }
-                    return url;
+                    return url || '';
                   })()}
                   isMine={isMine}
                   isDark={isDark}
@@ -1006,14 +1027,14 @@ export default function GroupChatScreen() {
                   marginRight: 2,
                 }}>{timestamp}</Text>
               </View>
-            ) : item.attachments[0].mime?.startsWith('image/') ? (
+            ) : firstAttachment.mime?.startsWith('image/') ? (
               <View style={{ width: '100%' }}>
                 <TouchableOpacity 
                   onPress={() => {
                     // Try multiple possible URL fields and construct full URL
-                    let imageUrl = item.attachments[0].url || 
-                                  item.attachments[0].path || 
-                                  item.attachments[0].uri;
+                    let imageUrl = firstAttachment.url || 
+                                  firstAttachment.path || 
+                                  firstAttachment.uri;
                     
                     // If URL is relative, make it absolute
                     if (imageUrl && !imageUrl.startsWith('http')) {
@@ -1029,7 +1050,7 @@ export default function GroupChatScreen() {
                   <Image 
                     source={{ 
                       uri: (() => {
-                        let url = item.attachments[0].url || item.attachments[0].path || item.attachments[0].uri;
+                        let url = firstAttachment.url || firstAttachment.path || firstAttachment.uri;
                         
                         if (url && !url.startsWith('http')) {
                           // Remove leading slash if present and construct full URL
@@ -1099,14 +1120,14 @@ export default function GroupChatScreen() {
                   <TouchableOpacity 
                     style={{ flex: 1, minWidth: 0, flexShrink: 1 }}
                     onPress={async () => {
-                      const fileUrl = item.attachments[0].url || item.attachments[0].path || item.attachments[0].uri;
+                      const fileUrl = firstAttachment.url || firstAttachment.path || firstAttachment.uri;
                       let downloadUrl = fileUrl;
                       if (fileUrl && !fileUrl.startsWith('http')) {
                         const cleanUrl = fileUrl.startsWith('/') ? fileUrl.substring(1) : fileUrl;
                         downloadUrl = `${getBaseUrl()}/${cleanUrl}`;
                       }
                       
-                      const fileName = item.attachments[0].name || 'download';
+                      const fileName = firstAttachment.name || 'download';
                       
                       Alert.alert('File Download', `File: ${fileName}\nURL: ${downloadUrl}`, [
                         { text: 'OK', style: 'default' }
@@ -1124,7 +1145,7 @@ export default function GroupChatScreen() {
                       numberOfLines={3}
                       ellipsizeMode="tail"
                     >
-                      {item.attachments[0].name}
+                      {firstAttachment.name}
                     </Text>
                     {/* Second row: File details with download icon */}
                     <View style={{ flexDirection: 'row', alignItems: 'center', width: '100%' }}>
@@ -1138,7 +1159,7 @@ export default function GroupChatScreen() {
                         numberOfLines={1}
                         ellipsizeMode="tail"
                       >
-                        {item.attachments[0].size ? `${(item.attachments[0].size / 1024).toFixed(0)} KB` : 'Unknown'} • {(item.attachments[0].name || 'file').split('.').pop()?.toUpperCase() || 'FILE'}
+                        {firstAttachment.size ? `${(firstAttachment.size / 1024).toFixed(0)} KB` : 'Unknown'} • {(firstAttachment.name || 'file').split('.').pop()?.toUpperCase() || 'FILE'}
                       </Text>
                       <MaterialCommunityIcons 
                         name="download" 
@@ -1161,8 +1182,8 @@ export default function GroupChatScreen() {
                   </Text>
                 </View>
               </View>
-            )
-          )}
+            );
+          })()}
           
           {/* Message content and timestamp in a flex container */}
           <View style={{ width: '100%' }}>

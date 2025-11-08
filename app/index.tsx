@@ -377,7 +377,7 @@ export default function ConversationsScreen() {
   const sortedConversations = [...filteredConversations].sort((a, b) => {
     if (!a.last_message_date) return 1;
     if (!b.last_message_date) return -1;
-    return new Date(b.last_message_date) - new Date(a.last_message_date);
+    return new Date(b.last_message_date).getTime() - new Date(a.last_message_date).getTime();
   });
 
   if (isLoading) {

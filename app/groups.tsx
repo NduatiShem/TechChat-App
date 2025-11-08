@@ -274,7 +274,7 @@ export default function GroupsScreen() {
   const sortedGroups = [...filteredGroups].sort((a, b) => {
     if (!a.last_message_date) return 1;
     if (!b.last_message_date) return -1;
-    return new Date(b.last_message_date) - new Date(a.last_message_date);
+    return new Date(b.last_message_date).getTime() - new Date(a.last_message_date).getTime();
   });
 
   return (

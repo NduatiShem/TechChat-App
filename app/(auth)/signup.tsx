@@ -48,7 +48,7 @@ export default function SignupScreen() {
     setIsLoading(true);
     try {
       console.log('Attempting registration with:', { name, email, password: '***', password_confirmation: '***' });
-      await register(name, email, password, passwordConfirmation);
+      await register(name, email, '', password, passwordConfirmation);
       console.log('Registration successful!');
       // Wait for auth state to update, then navigate
       // expo-router automatically handles navigation based on auth state

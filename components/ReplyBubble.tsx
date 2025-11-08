@@ -57,7 +57,7 @@ export default function ReplyBubble({ replyTo, isMyMessage, onPress }: ReplyBubb
   const senderTextStyle = {
     color: isMyMessage ? '#007AFF' : '#34C759',
     fontSize: 11,
-    fontWeight: '600',
+    fontWeight: '600' as const,
     marginBottom: 2,
   };
 

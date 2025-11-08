@@ -60,10 +60,9 @@ export default function VideoPlayer({
   const handlePlaybackStatusUpdate = (status: AVPlaybackStatus) => {
     if (status.isLoaded) {
       setIsPlaying(status.isPlaying);
-      if (status.error) {
-        setError('Failed to load video');
-        console.error('Video playback error:', status.error);
-      }
+    } else if ('error' in status) {
+      setError('Failed to load video');
+      console.error('Video playback error:', status.error);
     }
   };
 

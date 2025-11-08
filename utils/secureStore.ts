@@ -54,11 +54,9 @@ export const secureStorage = {
         return;
       }
       
-      // Try different method names for compatibility
+      // Use deleteItemAsync (standard method in expo-secure-store)
       if (typeof SecureStore.deleteItemAsync === 'function') {
         await SecureStore.deleteItemAsync(key);
-      } else if (typeof SecureStore.deleteValueWithKeyAsync === 'function') {
-        await SecureStore.deleteValueWithKeyAsync(key);
       } else {
         console.warn('No delete method available in SecureStore');
       }
