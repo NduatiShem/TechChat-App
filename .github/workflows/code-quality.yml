@@ -1,0 +1,62 @@
+name: Code Quality
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  code-quality:
+    name: Code Quality Checks
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      
+      - name: Install dependencies
+        run: npm ci
+      
+      - name: Run ESLint
+        run: npm run lint
+        continue-on-error: true
+      
+      - name: TypeScript type check
+        run: npx tsc --noEmit
+        continue-on-error: true
+      
+      - name: Check for console statements
+        run: |
+          echo "Checking for console statements..."
+          CONSOLE_COUNT=$(grep -r "console\." app/ components/ services/ context/ --exclude-dir=node_modules | wc -l || echo "0")
+          echo "Found $CONSOLE_COUNT console statements"
+          if [ "$CONSOLE_COUNT" -gt 0 ]; then
+            echo "⚠️ Warning: Found console statements. Review and remove for production."
+            grep -r "console\." app/ components/ services/ context/ --exclude-dir=node_modules | head -20
+          fi
+        continue-on-error: true
+      
+      - name: Check for TODO/FIXME comments
+        run: |
+          echo "Checking for TODO/FIXME comments..."
+          TODO_COUNT=$(grep -r "TODO\|FIXME" app/ components/ services/ context/ --exclude-dir=node_modules | wc -l || echo "0")
+          echo "Found $TODO_COUNT TODO/FIXME comments"
+          if [ "$TODO_COUNT" -gt 0 ]; then
+            echo "📝 TODO/FIXME comments found:"
+            grep -r "TODO\|FIXME" app/ components/ services/ context/ --exclude-dir=node_modules | head -10
+          fi
+        continue-on-error: true
+      
+      - name: Check file sizes
+        run: |
+          echo "Checking for large files..."
+          find app/ components/ services/ context/ -type f -size +100k -not -path "*/node_modules/*" | head -10 || echo "No large files found"
+        continue-on-error: true
+

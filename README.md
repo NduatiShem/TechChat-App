@@ -1,50 +1,142 @@
-# Welcome to your Expo app 👋
+# TechChat App 💬
 
-This is an [Expo](https://expo.dev) project created with [`create-expo-app`](https://www.npmjs.com/package/create-expo-app).
+A modern messaging application built with React Native and Expo, featuring real-time chat, group messaging, file sharing, and push notifications.
 
-## Get started
+![CI](https://github.com/shemnd/TechChat-App/workflows/CI/badge.svg)
+![Code Quality](https://github.com/shemnd/TechChat-App/workflows/Code%20Quality/badge.svg)
+![Build Android](https://github.com/shemnd/TechChat-App/workflows/Build%20Android/badge.svg)
+![Build iOS](https://github.com/shemnd/TechChat-App/workflows/Build%20iOS/badge.svg)
 
-1. Install dependencies
+## Features
 
+- 💬 **Real-time Messaging**: Individual and group conversations
+- 📎 **File Sharing**: Images, videos, documents, and voice messages
+- 🔔 **Push Notifications**: Stay connected with instant notifications
+- 👥 **Group Management**: Create and manage group chats
+- 🎨 **Dark Mode**: Beautiful dark and light themes
+- 🔐 **Secure Authentication**: Token-based authentication
+- 📱 **Cross-platform**: iOS and Android support
+- 🔄 **Reply to Messages**: Reply to specific messages in conversations
+- 🖼️ **Profile Pictures**: User and group avatars
+- ✅ **Read Receipts**: See when messages are read
+
+## Getting Started
+
+### Prerequisites
+
+- Node.js 20 or higher
+- npm or yarn
+- Expo CLI
+- iOS Simulator (for iOS development) or Android Emulator (for Android development)
+
+### Installation
+
+1. **Clone the repository**
+   ```bash
+   git clone https://github.com/shemnd/TechChat-App.git
+   cd TechChat-App
+   ```
+
+2. **Install dependencies**
    ```bash
    npm install
    ```
 
-2. Start the app
+3. **Configure API endpoints**
+   - Update `config/app.config.ts` with your backend API URLs
+   - For development, ensure your Laravel backend is running
 
+4. **Start the development server**
    ```bash
-   npx expo start
+   npm start
    ```
 
-In the output, you'll find options to open the app in a
+5. **Run on device/emulator**
+   - Press `i` for iOS simulator
+   - Press `a` for Android emulator
+   - Scan QR code with Expo Go app (for physical devices)
 
-- [development build](https://docs.expo.dev/develop/development-builds/introduction/)
-- [Android emulator](https://docs.expo.dev/workflow/android-studio-emulator/)
-- [iOS simulator](https://docs.expo.dev/workflow/ios-simulator/)
-- [Expo Go](https://expo.dev/go), a limited sandbox for trying out app development with Expo
+## Development
 
-You can start developing by editing the files inside the **app** directory. This project uses [file-based routing](https://docs.expo.dev/router/introduction).
+### Project Structure
 
-## Get a fresh project
-
-When you're ready, run:
-
-```bash
-npm run reset-project
+```
+TechChat-App/
+├── app/                    # App screens (expo-router)
+│   ├── (auth)/            # Authentication screens
+│   ├── chat/              # Chat screens
+│   └── ...
+├── components/            # Reusable components
+├── context/               # React contexts (Auth, Theme, Notifications)
+├── services/              # API services
+├── utils/                 # Utility functions
+├── config/                # Configuration files
+└── assets/                # Images, icons, fonts
 ```
 
-This command will move the starter code to the **app-example** directory and create a blank **app** directory where you can start developing.
+### Available Scripts
 
-## Learn more
+- `npm start` - Start Expo development server
+- `npm run lint` - Run ESLint
+- `npm run android` - Start on Android
+- `npm run ios` - Start on iOS
+- `npm run web` - Start on web
 
-To learn more about developing your project with Expo, look at the following resources:
+### Building for Production
 
-- [Expo documentation](https://docs.expo.dev/): Learn fundamentals, or go into advanced topics with our [guides](https://docs.expo.dev/guides).
-- [Learn Expo tutorial](https://docs.expo.dev/tutorial/introduction/): Follow a step-by-step tutorial where you'll create a project that runs on Android, iOS, and the web.
+See [BUILD_GUIDE.md](./BUILD_GUIDE.md) for detailed build instructions.
 
-## Join the community
+**Quick build commands:**
+```bash
+# Android
+eas build --profile production --platform android
 
-Join our community of developers creating universal apps.
+# iOS
+eas build --profile production --platform ios
+```
 
-- [Expo on GitHub](https://github.com/expo/expo): View our open source platform and contribute.
-- [Discord community](https://chat.expo.dev): Chat with Expo users and ask questions.
+## CI/CD
+
+This project uses GitHub Actions for continuous integration and quality checks:
+
+- **CI**: Automatically runs linting, type checking, and installs packages on every push/PR
+- **Build**: Automated builds for Android and iOS via EAS
+- **Release**: Automatic release creation on version tags
+- **Security**: Weekly security vulnerability scans
+- **Quality**: Code quality checks (console statements, TODOs, etc.)
+
+**Note:** Deployment to servers is done manually. GitHub Actions focuses on code quality and building apps.
+
+See [GITHUB_ACTIONS_SETUP.md](./GITHUB_ACTIONS_SETUP.md) for setup instructions.
+
+## Documentation
+
+- [Build Guide](./BUILD_GUIDE.md) - How to build for production
+- [GitHub Actions Setup](./GITHUB_ACTIONS_SETUP.md) - CI/CD configuration
+- [Production Readiness](./production_readiness.md) - Production checklist
+
+## Contributing
+
+1. Create a feature branch from `develop`
+2. Make your changes
+3. Ensure CI passes (linting, type checking)
+4. Create a Pull Request
+5. Wait for review and approval
+
+## Technology Stack
+
+- **Framework**: React Native with Expo
+- **Routing**: Expo Router (file-based routing)
+- **Styling**: NativeWind (Tailwind CSS for React Native)
+- **State Management**: React Context API
+- **API Client**: Axios
+- **Notifications**: Expo Notifications
+- **Build Service**: EAS Build
+
+## License
+
+Private project - All rights reserved
+
+## Support
+
+For issues and questions, please open an issue on GitHub or contact the development team.
