@@ -1,29 +1,77 @@
 {
   "project_info": {
-    "project_number": "663757122947",
-    "project_id": "techchat-52c59",
-    "storage_bucket": "techchat-52c59.firebasestorage.app"
-  },
-  "client": [
-    {
-      "client_info": {
-        "mobilesdk_app_id": "1:663757122947:android:1f923e41986150c8dbdab6",
-        "android_client_info": {
-          "package_name": "com.techchat.messageapp"
+  "project_number": "938521882495",
+  "firebase_url": "https://chat-32491.firebaseio.com",
+  "project_id": "chat-32491",
+  "storage_bucket": "chat-32491.firebasestorage.app"
+},
+"client": [
+  {
+    "client_info": {
+      "mobilesdk_app_id": "1:938521882495:android:cc4843da9a0c82fe",
+      "android_client_info": {
+        "package_name": "com.example.macshem.chat"
+      }
+    },
+    "oauth_client": [
+      {
+        "client_id": "938521882495-9hi22cvjebsc9705l63a73spac7lmg36.apps.googleusercontent.com",
+        "client_type": 1,
+        "android_info": {
+          "package_name": "com.example.macshem.chat",
+          "certificate_hash": "c43c65a1238070e31b51fa9b2f206de42298a7f0"
         }
       },
-      "oauth_client": [],
-      "api_key": [
-        {
-          "current_key": "AIzaSyC85WGkdVkbOicbyi_ROzuA-ZDKPGXLQdk"
-        }
-      ],
-      "services": {
-        "appinvite_service": {
-          "other_platform_oauth_client": []
-        }
+      {
+        "client_id": "938521882495-fs5ca1e7bgvurdh100b4312r1qlqvh85.apps.googleusercontent.com",
+        "client_type": 3
+      }
+    ],
+    "api_key": [
+      {
+        "current_key": "AIzaSyCQ8xZtPBpC9xWFrFEe1XG0r6fPixfPxFs"
+      }
+    ],
+    "services": {
+      "appinvite_service": {
+        "other_platform_oauth_client": [
+          {
+            "client_id": "938521882495-fs5ca1e7bgvurdh100b4312r1qlqvh85.apps.googleusercontent.com",
+            "client_type": 3
+          }
+        ]
       }
     }
-  ],
-  "configuration_version": "1"
+  },
+  {
+    "client_info": {
+      "mobilesdk_app_id": "1:938521882495:android:e5c2c16e0084f1c11ff44a",
+      "android_client_info": {
+        "package_name": "com.techchat.app"
+      }
+    },
+    "oauth_client": [
+      {
+        "client_id": "938521882495-fs5ca1e7bgvurdh100b4312r1qlqvh85.apps.googleusercontent.com",
+        "client_type": 3
+      }
+    ],
+    "api_key": [
+      {
+        "current_key": "AIzaSyCQ8xZtPBpC9xWFrFEe1XG0r6fPixfPxFs"
+      }
+    ],
+    "services": {
+      "appinvite_service": {
+        "other_platform_oauth_client": [
+          {
+            "client_id": "938521882495-fs5ca1e7bgvurdh100b4312r1qlqvh85.apps.googleusercontent.com",
+            "client_type": 3
+          }
+        ]
+      }
+    }
+  }
+],
+"configuration_version": "1"
 }
