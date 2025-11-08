@@ -5,7 +5,7 @@
     "version": "1.0.0",
     "sdkVersion": "54.0.0",
     "orientation": "portrait",
-    "icon": "./assets/ic_launcher/android/ic_launcher-web.png",
+    "icon": "./assets/images/healtclassique-icon.png",
     "userInterfaceStyle": "automatic",
     "splash": {
       "image": "./assets/images/healtclassique-icon.png",
