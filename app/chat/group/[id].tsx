@@ -94,7 +94,7 @@ const getBaseUrl = () => {
 export default function GroupChatScreen() {
   const { id } = useLocalSearchParams();
   const { currentTheme } = useTheme();
-  const { user, isLoading } = useAuth();
+  const { user } = useAuth();
   const { updateUnreadCount } = useNotifications();
   const insets = useSafeAreaInsets();
   const ENABLE_MARK_AS_READ = true; // Enable mark as read functionality for groups
@@ -108,7 +108,6 @@ export default function GroupChatScreen() {
   const [showEmoji, setShowEmoji] = useState(false);
   const [sending, setSending] = useState(false);
   const [loading, setLoading] = useState(true);
-  const [isRecording, setIsRecording] = useState(false);
   const [groupInfo, setGroupInfo] = useState<any>(null);
   const [showGroupMembers, setShowGroupMembers] = useState(false);
   const [showVoiceRecorder, setShowVoiceRecorder] = useState(false);
@@ -194,7 +193,7 @@ export default function GroupChatScreen() {
           await groupsAPI.markMessagesAsRead(groupId);
           // Update unread count to 0 for this group - this will update badge
           updateUnreadCount(groupId, 0);
-        } catch (error: any) {
+        } catch {
           // Ignore validation (422) or missing route errors
           // Failed to mark messages as read
         }
@@ -409,7 +408,7 @@ export default function GroupChatScreen() {
       // Update last_seen_at when user sends a message (activity indicator)
       try {
         await usersAPI.updateLastSeen();
-      } catch (error) {
+      } catch {
         // Silently fail - don't block message sending if last_seen update fails
         // Failed to update last_seen_at
       }
@@ -463,7 +462,7 @@ export default function GroupChatScreen() {
             if (flatListRef.current) {
               try {
                 flatListRef.current.scrollToEnd({ animated: true });
-              } catch (error) {
+              } catch {
                 // If scrollToEnd fails, try scrolling to the last item by index
                 // Scroll failed, trying alternative method
                 try {
@@ -478,7 +477,7 @@ export default function GroupChatScreen() {
                       });
                     }
                   }, 100);
-                } catch (scrollError) {
+                } catch {
                   // Alternative scroll method also failed
                 }
               }
@@ -492,7 +491,7 @@ export default function GroupChatScreen() {
             if (flatListRef.current) {
               try {
                 flatListRef.current.scrollToEnd({ animated: true });
-              } catch (error) {
+              } catch {
                 // Second scroll attempt failed
               }
             }
@@ -629,7 +628,7 @@ export default function GroupChatScreen() {
           style: 'destructive',
           onPress: async () => {
             try {
-              const response = await messagesAPI.deleteMessage(messageId);
+              await messagesAPI.deleteMessage(messageId);
               
               // Remove message from local state
               setMessages(prev => prev.filter(msg => msg.id !== messageId));
