@@ -61,10 +61,13 @@ export default function GroupsScreen() {
       const response = await groupsAPI.getAll();
       const groupsData = response.data;
       
+      // Ensure groupsData is always an array
+      const safeGroupsData = Array.isArray(groupsData) ? groupsData : [];
+      
       // Sync unread counts from backend to notification context
-      if (Array.isArray(groupsData)) {
+      if (safeGroupsData.length > 0) {
         let totalGroupUnread = 0;
-        groupsData.forEach((group) => {
+        safeGroupsData.forEach((group) => {
           const unreadCount = group.unread_count || 0;
           totalGroupUnread += unreadCount;
           // Don't call updateUnreadCount for groups - that's only for individual conversations
@@ -74,10 +77,12 @@ export default function GroupsScreen() {
         updateGroupUnreadCount(totalGroupUnread);
       }
       
-      setGroups(groupsData);
-      setFilteredGroups(groupsData);
+      setGroups(safeGroupsData);
+      setFilteredGroups(safeGroupsData);
     } catch (error) {
-      console.error('Failed to load groups:', error);
+      // Failed to load groups - set empty array to prevent errors
+      setGroups([]);
+      setFilteredGroups([]);
     } finally {
       setIsLoading(false);
     }
@@ -112,7 +117,7 @@ export default function GroupsScreen() {
     }, [])
   );
 
-  const formatDate = (dateString: string) => {
+  const formatDate = (dateString: string | null | undefined): string => {
     if (!dateString) return '';
     try {
       const date = new Date(dateString);
@@ -121,11 +126,14 @@ export default function GroupsScreen() {
       const diffInHours = (now.getTime() - date.getTime()) / (1000 * 60 * 60);
 
       if (diffInHours < 24) {
-        return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        const timeStr = date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        return timeStr || '';
       } else if (diffInHours < 168) { // 7 days
-        return date.toLocaleDateString([], { weekday: 'short' });
+        const dayStr = date.toLocaleDateString([], { weekday: 'short' });
+        return dayStr || '';
       } else {
-        return date.toLocaleDateString([], { month: 'short', day: 'numeric' });
+        const dateStr = date.toLocaleDateString([], { month: 'short', day: 'numeric' });
+        return dateStr || '';
       }
     } catch (error) {
       return '';
@@ -202,7 +210,7 @@ export default function GroupsScreen() {
                   isDark ? 'text-gray-400' : 'text-gray-500'
                 }`}
               >
-                {formatDate(item.last_message_date) || ''}
+                {formatDate(item.last_message_date)}
               </Text>
             )}
           </View>

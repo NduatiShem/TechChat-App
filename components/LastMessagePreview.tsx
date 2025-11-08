@@ -264,9 +264,7 @@ export default function LastMessagePreview({
   // Regular text message - truncate if too long
   const truncatedMessage = safeMessage && safeMessage.length > maxLength 
     ? safeMessage.substring(0, maxLength) + '...'
-    : safeMessage;
-  
-  //console.log('Rendering text message:', truncatedMessage);
+    : (safeMessage || 'No message');
   
   // If message is from us, show read receipt on the LEFT
   if (isFromMe) {
@@ -285,7 +283,7 @@ export default function LastMessagePreview({
           ]}
           numberOfLines={1}
         >
-          {truncatedMessage || 'No message'}
+          {truncatedMessage}
         </Text>
       </View>
     );
@@ -299,7 +297,7 @@ export default function LastMessagePreview({
       ]}
       numberOfLines={1}
     >
-      {truncatedMessage || 'No message'}
+      {truncatedMessage}
     </Text>
   );
 }

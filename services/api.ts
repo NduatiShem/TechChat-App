@@ -9,19 +9,11 @@ import { AppConfig } from '../config/app.config';
 // Use the configuration from AppConfig
 const getApiBaseUrl = () => {
   if (__DEV__) {
-    console.log('🔧 API Configuration - Device Detection:', {
-      platform: Platform.OS,
-      executionEnvironment: Constants.executionEnvironment,
-      appOwnership: Constants.appOwnership,
-    });
-    
     // For Android devices (both physical and emulator in Expo Go), use the physical device URL
     // This is because Expo Go on physical devices needs your computer's network IP
     if (Platform.OS === 'android') {
-      console.log('📱 Android device detected - using physical device URL');
       return AppConfig.api.development.physical;
     } else if (Platform.OS === 'ios') {
-      console.log('🍎 iOS device detected - using simulator URL');
       return AppConfig.api.development.ios;
     }
   }
@@ -30,13 +22,6 @@ const getApiBaseUrl = () => {
 };
 
 const API_BASE_URL = getApiBaseUrl();
-
-// Debug logging
-console.log('🔧 API Configuration:', {
-  isDev: __DEV__,
-  platform: Platform.OS,
-  apiBaseUrl: API_BASE_URL
-});
 
 // Create axios instance
 const api = axios.create({
@@ -52,33 +37,24 @@ const api = axios.create({
         const parsed = JSON.parse(data);
         return parsed;
       } catch (e) {
-        console.error('TransformResponse - Parse error:', e);
-        console.error('TransformResponse - Raw data length:', data.length);
-        console.error('TransformResponse - Raw data preview:', data.substring(0, 200) + '...');
-        console.error('TransformResponse - Raw data end:', data.substring(Math.max(0, data.length - 100)));
-        
         // Try to fix common truncation issues
         if (data.includes('[') && !data.endsWith(']')) {
-          console.log('Attempting to fix truncated JSON array...');
           try {
             const fixedData = data + ']';
             const parsed = JSON.parse(fixedData);
-            console.log('Successfully parsed fixed JSON array');
             return parsed;
           } catch (fixError) {
-            console.error('Failed to parse fixed JSON array:', fixError);
+            // Silent fail
           }
         }
         
         if (data.includes('{') && !data.endsWith('}')) {
-          console.log('Attempting to fix truncated JSON object...');
           try {
             const fixedData = data + '}';
             const parsed = JSON.parse(fixedData);
-            console.log('Successfully parsed fixed JSON object');
             return parsed;
           } catch (fixError) {
-            console.error('Failed to parse fixed JSON object:', fixError);
+            // Silent fail
           }
         }
         
@@ -94,15 +70,6 @@ const api = axios.create({
 // Request interceptor to add auth token
 api.interceptors.request.use(
   async (config) => {
-    console.log('🚀 API Request:', {
-      method: config.method?.toUpperCase(),
-      url: config.url,
-      baseURL: config.baseURL,
-      fullURL: `${config.baseURL}${config.url}`,
-      headers: config.headers,
-      // Don't log data - FormData cannot be serialized
-    });
-    
     const token = await secureStorage.getItem('auth_token');
     if (token) {
       config.headers.Authorization = `Bearer ${token}`;
@@ -110,7 +77,6 @@ api.interceptors.request.use(
     return config;
   },
   (error) => {
-    console.error('❌ Request interceptor error:', error);
     return Promise.reject(error);
   }
 );
@@ -118,41 +84,27 @@ api.interceptors.request.use(
 // Response interceptor to handle auth errors and JSON parsing
 api.interceptors.response.use(
   (response) => {
-    console.log('📥 API Response:', {
-      status: response.status,
-      url: response.config.url,
-      data: response.data
-    });
-    
     // Handle case where response.data is a JSON string instead of parsed object
     if (typeof response.data === 'string') {
       try {
         response.data = JSON.parse(response.data);
       } catch (parseError) {
-        console.warn('Response interceptor - Failed to parse JSON string:', parseError);
-        console.warn('Response interceptor - Raw data length:', response.data.length);
-        console.warn('Response interceptor - Raw data preview:', response.data.substring(0, 200) + '...');
-        
         // Try to fix common truncation issues
         if (response.data.includes('[') && !response.data.endsWith(']')) {
-          console.log('Response interceptor - Attempting to fix truncated JSON array...');
           try {
             const fixedData = response.data + ']';
             response.data = JSON.parse(fixedData);
-            console.log('Response interceptor - Successfully parsed fixed JSON array');
           } catch (fixError) {
-            console.error('Response interceptor - Failed to parse fixed JSON array:', fixError);
+            // Silent fail
           }
         }
         
         if (response.data.includes('{') && !response.data.endsWith('}')) {
-          console.log('Response interceptor - Attempting to fix truncated JSON object...');
           try {
             const fixedData = response.data + '}';
             response.data = JSON.parse(fixedData);
-            console.log('Response interceptor - Successfully parsed fixed JSON object');
           } catch (fixError) {
-            console.error('Response interceptor - Failed to parse fixed JSON object:', fixError);
+            // Silent fail
           }
         }
       }
@@ -170,20 +122,7 @@ api.interceptors.response.use(
     return response;
   },
   async (error) => {
-    console.error('❌ API Response Error:', {
-      message: error.message,
-      code: error.code,
-      status: error.response?.status,
-      statusText: error.response?.statusText,
-      data: error.response?.data,
-      config: {
-        method: error.config?.method,
-        url: error.config?.url,
-        baseURL: error.config?.baseURL,
-        fullURL: `${error.config?.baseURL}${error.config?.url}`,
-      }
-    });
-    
+    // Handle 401 Unauthorized - redirect to login
     if (error.response?.status === 401) {
       // Token expired or invalid, redirect to login
       await secureStorage.deleteItem('auth_token');

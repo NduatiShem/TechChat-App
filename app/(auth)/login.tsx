@@ -33,9 +33,6 @@ export default function LoginScreen() {
   const showErrorRef = useRef(false);
   const errorMessageRef = useRef('');
   
-  // Debug: Log component lifecycle
-  console.log('Login component render - email:', email, 'password:', password, 'emailError:', emailError, 'passwordError:', passwordError);
-  
   const { login } = useAuth();
   const { currentTheme } = useTheme();
   const passwordInputRef = useRef<TextInput>(null);
@@ -57,30 +54,18 @@ export default function LoginScreen() {
     return AppConfig.api.production;
   };
 
-  // Debug: Track component lifecycle
-  useEffect(() => {
-    console.log('Login component mounted');
-    return () => {
-      console.log('Login component unmounted');
-    };
-  }, []);
-
   // Restore error state from refs if component re-renders
   useEffect(() => {
     if (passwordErrorRef.current && !passwordError) {
-      console.log('Restoring password error from ref:', passwordErrorRef.current);
       setPasswordError(passwordErrorRef.current);
     }
     if (emailErrorRef.current && !emailError) {
-      console.log('Restoring email error from ref:', emailErrorRef.current);
       setEmailError(emailErrorRef.current);
     }
     if (showErrorRef.current && !showError) {
-      console.log('Restoring show error from ref:', showErrorRef.current);
       setShowError(showErrorRef.current);
     }
     if (errorMessageRef.current && !errorMessage) {
-      console.log('Restoring error message from ref:', errorMessageRef.current);
       setErrorMessage(errorMessageRef.current);
     }
   }, [emailError, passwordError, showError, errorMessage]);
@@ -104,17 +89,12 @@ export default function LoginScreen() {
 
     setIsLoading(true);
     try {
-      console.log('Attempting login with:', { email, password: '***' });
-      console.log('API Base URL:', getBaseUrl());
-      
       // Test network connectivity first
       try {
-        const testResponse = await fetch(getBaseUrl(), {
+        await fetch(getBaseUrl(), {
           method: 'GET',
         });
-        console.log('Network test response:', testResponse.status);
       } catch (networkError) {
-        console.error('Network test failed:', networkError);
         Alert.alert(
           'Network Error', 
           'Cannot connect to server. Please ensure your Laravel server is running with:\n\nphp artisan serve --host=0.0.0.0 --port=8000'
@@ -124,21 +104,11 @@ export default function LoginScreen() {
       }
       
       await login(email, password);
-      console.log('Login successful!');
       // Wait for auth state to update, then navigate
       // expo-router automatically handles navigation based on auth state
       // No need to manually navigate here as AppLayout will handle it
     } catch (error: any) {
-      console.error('Login error details:', {
-        message: error.message,
-        status: error.response?.status,
-        data: error.response?.data,
-        config: error.config
-      });
-      
       // Handle different error types with field-specific validation
-      console.log('Error handling - Status:', error.response?.status, 'Message:', error.response?.data?.message);
-      
       if (error.response?.status === 403 && error.response?.data?.account_deactivated) {
         // Account deactivated
         const errorMessage = error.response?.data?.message || 'Your account has been deactivated. Please contact an administrator.';
@@ -149,18 +119,13 @@ export default function LoginScreen() {
         setPassword(''); // Clear password
       } else if (error.response?.status === 401) {
         // Unauthorized - could be wrong email or password
-        const errorMessage = error.response?.data?.message || 'Invalid credentials';
-        console.log('401 Error - Message:', errorMessage);
-        
         // For 401 errors, show persistent error message
-        console.log('Before setting error - current state:', { email, password, emailError, passwordError });
         const errorMsg = 'Wrong credentials. Please check your email and password.';
         setShowError(true);
         setErrorMessage(errorMsg);
         showErrorRef.current = true;
         errorMessageRef.current = errorMsg;
         setPassword(''); // Clear password for retry
-        console.log('After setting error - should show persistent error message');
       } else if (error.response?.data?.errors) {
         // Handle Laravel validation errors
         const errors = error.response.data.errors;

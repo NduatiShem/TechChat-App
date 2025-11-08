@@ -197,7 +197,7 @@ export default function GroupChatScreen() {
           updateUnreadCount(groupId, 0);
         } catch (error: any) {
           // Ignore validation (422) or missing route errors
-          console.log('markGroupMessagesAsRead failed:', error?.response?.status || error?.message || error);
+          // Failed to mark messages as read
         }
       }
       
@@ -225,7 +225,7 @@ export default function GroupChatScreen() {
           // Update unread count to 0 for this group
           updateUnreadCount(Number(id), 0);
           
-          console.log('Group messages marked as read for group:', id);
+          // Group messages marked as read
         } catch (error) {
           console.error('Error marking group messages as read:', error);
           // Don't show error to user - this is a background operation
@@ -412,7 +412,7 @@ export default function GroupChatScreen() {
         await usersAPI.updateLastSeen();
       } catch (error) {
         // Silently fail - don't block message sending if last_seen update fails
-        console.warn('Failed to update last_seen_at:', error);
+        // Failed to update last_seen_at
       }
       
       // Prepare message text to preserve what was sent
@@ -448,18 +448,6 @@ export default function GroupChatScreen() {
         } : undefined)
       };
       
-      console.log('New message sent:', {
-        id: newMessage.id,
-        message: newMessage.message,
-        originalInput: input.trim(),
-        messageTextToPreserve: messageTextToPreserve,
-        resDataMessage: res.data?.message,
-        sender_id: newMessage.sender_id,
-        user_id: user?.id,
-        isMine: newMessage.sender_id === user?.id,
-        sender: newMessage.sender,
-        fullResData: res.data
-      });
       
       setMessages(prev => {
         // Check if message already exists to prevent duplicates
@@ -478,7 +466,7 @@ export default function GroupChatScreen() {
                 flatListRef.current.scrollToEnd({ animated: true });
               } catch (error) {
                 // If scrollToEnd fails, try scrolling to the last item by index
-                console.warn('scrollToEnd failed, trying scrollToIndex:', error);
+                // Scroll failed, trying alternative method
                 try {
                   // Wait for layout to complete, then scroll to last index
                   setTimeout(() => {
@@ -492,7 +480,7 @@ export default function GroupChatScreen() {
                     }
                   }, 100);
                 } catch (scrollError) {
-                  console.warn('scrollToIndex also failed:', scrollError);
+                  // Alternative scroll method also failed
                 }
               }
             }
@@ -506,7 +494,7 @@ export default function GroupChatScreen() {
               try {
                 flatListRef.current.scrollToEnd({ animated: true });
               } catch (error) {
-                console.warn('Second scrollToEnd failed:', error);
+                // Second scroll attempt failed
               }
             }
           }, (attachment || voiceRecording) ? 400 : 200);
@@ -520,21 +508,7 @@ export default function GroupChatScreen() {
       setReplyingTo(null); // Clear reply state
       setShowEmoji(false);
     } catch (e) {
-      console.error('Error sending message:', e);
-      console.error('Error details:', {
-        message: e.message,
-        status: e.response?.status,
-        statusText: e.response?.statusText,
-        data: e.response?.data,
-        requestData: {
-          input: input,
-          hasAttachment: !!attachment,
-          hasVoiceRecording: !!voiceRecording,
-          voiceDuration: voiceRecording?.duration,
-          replyingTo: replyingTo?.id
-        }
-      });
-      
+      // Error sending message
       // Handle specific database constraint errors
       if (e.response?.data?.exception === 'Illuminate\\Database\\QueryException') {
         // If it's a voice message with database constraint error, still show the message
@@ -656,9 +630,7 @@ export default function GroupChatScreen() {
           style: 'destructive',
           onPress: async () => {
             try {
-              console.log('Deleting message ID:', messageId);
               const response = await messagesAPI.deleteMessage(messageId);
-              console.log('Delete response:', response.data);
               
               // Remove message from local state
               setMessages(prev => prev.filter(msg => msg.id !== messageId));
@@ -667,9 +639,7 @@ export default function GroupChatScreen() {
               // Optionally refresh messages to get updated last_message
               // You can add this if needed
             } catch (error: any) {
-              console.error('Error deleting message:', error);
-              console.error('Error response:', error?.response?.data);
-              console.error('Error status:', error?.response?.status);
+              // Error deleting message
               
               // Handle different error types
               if (error?.response?.status === 404) {
@@ -1363,7 +1333,7 @@ export default function GroupChatScreen() {
     
     // Check if date is invalid
     if (isNaN(messageDate.getTime())) {
-      console.warn('Invalid date string for formatMessageDate:', dateString);
+      // Invalid date string
       return 'Today'; // Default to "Today" for invalid dates
     }
     
@@ -1390,7 +1360,7 @@ export default function GroupChatScreen() {
           day: 'numeric' 
         });
       } catch (error) {
-        console.warn('Error formatting date:', error, dateString);
+        // Error formatting date
         return 'Today'; // Default fallback
       }
     }
@@ -1411,7 +1381,7 @@ export default function GroupChatScreen() {
       
       // Check if the date is valid
       if (isNaN(date.getTime())) {
-        console.warn('Invalid time string:', dateString);
+        // Invalid time string
         return new Date().toLocaleTimeString('en-US', { 
           hour: '2-digit', 
           minute: '2-digit',
@@ -1447,10 +1417,7 @@ export default function GroupChatScreen() {
     
     // Check if dates are valid
     if (isNaN(currentDate.getTime()) || isNaN(previousDate.getTime())) {
-      console.warn('Invalid date in shouldShowDateSeparator:', {
-        current: currentMessage.created_at,
-        previous: previousMessage.created_at
-      });
+      // Invalid date in shouldShowDateSeparator
       return false; // Don't show separator for invalid dates
     }
     
@@ -1654,10 +1621,10 @@ export default function GroupChatScreen() {
                           flatListRef.current.scrollToEnd({ animated: false });
                           if (!hasScrolledToBottom) {
                             setHasScrolledToBottom(true);
-                            console.log('Scrolled to bottom via onContentSizeChange (group)');
+                            // Scrolled to bottom
                           }
                         } catch (error) {
-                          console.warn('onContentSizeChange scrollToEnd failed (group):', error);
+                          // Scroll failed
                           // Fallback: try scrollToIndex
                           if (!hasScrolledToBottom) {
                             try {
@@ -1669,10 +1636,10 @@ export default function GroupChatScreen() {
                                   viewPosition: 1
                                 });
                                 setHasScrolledToBottom(true);
-                                console.log('Scrolled to bottom via onContentSizeChange (group - scrollToIndex fallback)');
+                                // Scrolled to bottom (fallback)
                               }
                             } catch (scrollError) {
-                              console.warn('onContentSizeChange scroll failed (group):', scrollError);
+                              // Scroll fallback failed
                             }
                           }
                         }
@@ -1692,7 +1659,7 @@ export default function GroupChatScreen() {
                         flatListRef.current.scrollToEnd({ animated: false });
                         setHasScrolledToBottom(true);
                         isInitialLoad.current = false;
-                        console.log('Scrolled to bottom via onLayout (group)');
+                        // Scrolled to bottom
                       } catch (error) {
                         // Fallback to scrollToIndex
                         try {
@@ -1705,10 +1672,10 @@ export default function GroupChatScreen() {
                             });
                             setHasScrolledToBottom(true);
                             isInitialLoad.current = false;
-                            console.log('Scrolled to bottom via onLayout (group - scrollToIndex fallback)');
+                            // Scrolled to bottom (fallback)
                           }
                         } catch (scrollError) {
-                          console.warn('onLayout scroll failed (group):', scrollError);
+                          // Scroll failed
                         }
                       }
                     }
