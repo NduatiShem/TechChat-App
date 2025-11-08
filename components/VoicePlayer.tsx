@@ -41,7 +41,8 @@ export default function VoicePlayer({
         clearInterval(positionInterval.current);
       }
     };
-  }, [uri]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [uri]); // loadAudio and sound are stable, no need to include
 
   const loadAudio = async () => {
     try {

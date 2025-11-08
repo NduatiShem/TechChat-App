@@ -11,12 +11,12 @@ interface ReplyPreviewProps {
       id: number;
       name: string;
     };
-    attachments?: Array<{
+    attachments?: {
       id: number;
       name: string;
       mime: string;
       url: string;
-    }>;
+    }[];
   };
   onCancel: () => void;
 }

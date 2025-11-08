@@ -87,7 +87,7 @@ export const NetworkTest = () => {
         log += `Protocol: ${urlObj.protocol}\n`;
         log += `Port: ${urlObj.port || 'default'}\n`;
         log += `Path: ${urlObj.pathname}\n`;
-      } catch (e) {
+      } catch {
         log += `Could not parse URL\n`;
       }
 
