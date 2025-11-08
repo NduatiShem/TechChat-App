@@ -676,19 +676,6 @@ export default function GroupChatScreen() {
     setShowGroupMembers(!showGroupMembers);
   };
 
-  // Get group avatar initials
-  const getGroupAvatarInitials = (groupName: string | null | undefined) => {
-    if (!groupName || typeof groupName !== 'string') {
-      return 'G';
-    }
-    return groupName
-      .split(' ')
-      .map(word => word.charAt(0))
-      .join('')
-      .toUpperCase()
-      .slice(0, 2);
-  };
-
   // Render message bubble
   const renderItem = ({ item, index }: { item: Message; index: number }) => {
     // Ensure sender_id and user.id are compared as numbers
@@ -1320,7 +1307,8 @@ export default function GroupChatScreen() {
 
   useEffect(() => {
     fetchMessages();
-  }, [id]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [id]); // fetchMessages is stable, no need to include in deps
 
   // Format message date for separators
   const formatMessageDate = (dateString: string | null | undefined) => {
@@ -1357,7 +1345,7 @@ export default function GroupChatScreen() {
           month: 'long', 
           day: 'numeric' 
         });
-      } catch (error) {
+      } catch {
         // Error formatting date
         return 'Today'; // Default fallback
       }
@@ -1576,7 +1564,7 @@ export default function GroupChatScreen() {
                 keyboardShouldPersistTaps="handled"
                 keyboardDismissMode={Platform.OS === 'ios' ? 'interactive' : 'on-drag'}
               onScroll={({ nativeEvent }) => {
-                const { contentOffset, contentSize, layoutMeasurement } = nativeEvent;
+                const { contentOffset } = nativeEvent;
                 const isAtTop = contentOffset.y <= 50;
                 
                 // Debounce: only trigger once every 2 seconds
@@ -1621,7 +1609,7 @@ export default function GroupChatScreen() {
                             setHasScrolledToBottom(true);
                             // Scrolled to bottom
                           }
-                        } catch (error) {
+                        } catch {
                           // Scroll failed
                           // Fallback: try scrollToIndex
                           if (!hasScrolledToBottom) {
@@ -1636,7 +1624,7 @@ export default function GroupChatScreen() {
                                 setHasScrolledToBottom(true);
                                 // Scrolled to bottom (fallback)
                               }
-                            } catch (scrollError) {
+                            } catch {
                               // Scroll fallback failed
                             }
                           }
@@ -1658,7 +1646,7 @@ export default function GroupChatScreen() {
                         setHasScrolledToBottom(true);
                         isInitialLoad.current = false;
                         // Scrolled to bottom
-                      } catch (error) {
+                      } catch {
                         // Fallback to scrollToIndex
                         try {
                           const lastIndex = messages.length - 1;
@@ -1672,7 +1660,7 @@ export default function GroupChatScreen() {
                             isInitialLoad.current = false;
                             // Scrolled to bottom (fallback)
                           }
-                        } catch (scrollError) {
+                        } catch {
                           // Scroll failed
                         }
                       }
