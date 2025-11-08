@@ -12,5 +12,13 @@
     "**/*.ts",
     "**/*.tsx",
     "nativewind-env.d.ts"
+  ],
+  "exclude": [
+    "**/*.php",
+    "**/*.md",
+    "node_modules",
+    ".expo",
+    "dist",
+    "web-build"
   ]
 }
