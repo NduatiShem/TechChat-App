@@ -108,13 +108,15 @@ export default function GroupsScreen() {
 
   useEffect(() => {
     loadGroups();
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []); // loadGroups is stable, no need to include
 
   // Refresh groups when screen comes into focus
   useFocusEffect(
     React.useCallback(() => {
       loadGroups();
-    }, [])
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []) // loadGroups is stable, no need to include
   );
 
   const formatDate = (dateString: string | null | undefined): string => {
@@ -135,7 +137,7 @@ export default function GroupsScreen() {
         const dateStr = date.toLocaleDateString([], { month: 'short', day: 'numeric' });
         return dateStr || '';
       }
-    } catch (error) {
+    } catch {
       return '';
     }
   };

@@ -37,12 +37,12 @@ interface Conversation {
   user_id?: number; // The actual user ID for user conversations
   conversation_id?: number; // The conversation ID
   unread_count?: number; // Unread message count for this conversation
-  last_message_attachments?: Array<{
+  last_message_attachments?: {
     id: number;
     name: string;
     mime: string;
     url: string;
-  }>;
+  }[];
   user?: {
     id: number;
     name: string;
@@ -264,7 +264,8 @@ export default function ConversationsScreen() {
       // Request notification permissions when the app loads
       requestPermissions();
     }
-  }, [user]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user]); // loadConversations and requestPermissions are stable, no need to include
 
   // Reload conversations when screen comes into focus (e.g., returning from chat)
   // This ensures unread counts are updated after marking messages as read
@@ -274,7 +275,8 @@ export default function ConversationsScreen() {
       if (user) {
         loadConversations();
       }
-    }, [user])
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [user]) // loadConversations is stable, no need to include
   );
 
   const formatDate = (dateString: string) => {
