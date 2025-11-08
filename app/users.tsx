@@ -73,7 +73,8 @@ export default function UsersScreen() {
 
   useEffect(() => {
     loadUsers();
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []); // loadUsers is stable, no need to include
 
   useEffect(() => {
     if (searchQuery.trim() === '') {

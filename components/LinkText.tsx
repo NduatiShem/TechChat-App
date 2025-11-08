@@ -1,7 +1,6 @@
 import React from 'react';
-import { Text, TouchableOpacity, Linking, StyleSheet, View } from 'react-native';
+import { Text, Linking } from 'react-native';
 import { detectUrls, isVideoUrl } from '@/utils/textUtils';
-import { MaterialCommunityIcons } from '@expo/vector-icons';
 
 interface LinkTextProps {
   text: string;

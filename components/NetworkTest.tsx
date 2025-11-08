@@ -4,9 +4,8 @@
  */
 import { secureStorage } from '@/utils/secureStore';
 import { AppConfig } from '@/config/app.config';
-import { Platform } from 'react-native';
 import { useState } from 'react';
-import { Alert, Text, TouchableOpacity, View, ActivityIndicator } from 'react-native';
+import { Alert, Text, TouchableOpacity, View, ActivityIndicator, Platform } from 'react-native';
 
 export const NetworkTest = () => {
   const [testing, setTesting] = useState(false);

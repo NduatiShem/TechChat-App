@@ -5,7 +5,7 @@ import { Device } from 'expo-device';
 import * as SecureStore from 'expo-secure-store';
 import React, { useState } from 'react';
 import { Alert, Platform, ScrollView, Text, TouchableOpacity, View } from 'react-native';
-import NetworkTest from './NetworkTest';
+import { NetworkTest } from './NetworkTest';
 
 export default function ApiTest() {
   const { currentTheme } = useTheme();

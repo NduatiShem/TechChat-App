@@ -7,12 +7,12 @@ interface LastMessagePreviewProps {
   message: string;
   isDark?: boolean;
   maxLength?: number;
-  attachments?: Array<{
+  attachments?: {
     id: number;
     name: string;
     mime: string;
     url: string;
-  }>;
+  }[];
   isFromMe?: boolean; // Whether this message is from the current user
   readAt?: string | null; // Read receipt timestamp
 }
