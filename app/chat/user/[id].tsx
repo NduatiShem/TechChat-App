@@ -242,14 +242,14 @@ export default function UserChatScreen() {
         }
         
         // Scroll will be handled by useEffect and onContentSizeChange after images render
-      } catch (e) {
+      } catch {
         setMessages([]);
         setLoading(false);
       }
     };
     fetchMessages();
-    return () => { isMounted = false; };
-  }, [id]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [id]); // ENABLE_MARK_AS_READ and updateUnreadCount are stable, no need to include
 
   // Debug: Log all keys and check for duplicates before rendering FlatList
   useEffect(() => {

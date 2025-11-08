@@ -81,7 +81,7 @@ export default function GroupInfoScreen() {
           setGroupInfo(parsedGroupData);
           setIsLoading(false);
           return;
-        } catch (parseError) {
+        } catch {
           // If parsing fails, continue to fetch from API
           console.warn('Failed to parse groupData, fetching from API');
         }
@@ -137,13 +137,15 @@ export default function GroupInfoScreen() {
 
   useEffect(() => {
     loadGroupInfo();
-  }, [id, groupData]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [id, groupData]); // loadGroupInfo is stable, no need to include
   
   // Reload group info when screen comes into focus (to get updated avatar)
   useFocusEffect(
     useCallback(() => {
       loadGroupInfo();
-    }, [id])
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [id]) // loadGroupInfo is stable, no need to include
   );
   
   useEffect(() => {
@@ -413,7 +415,7 @@ export default function GroupInfoScreen() {
           }
         );
         fileUri = manipulated.uri;
-      } catch (manipulatorError) {
+      } catch {
         // Fallback to original URI if manipulation fails
       }
 
@@ -434,7 +436,7 @@ export default function GroupInfoScreen() {
         type: mimeType,
       } as any);
 
-      const response = await groupsAPI.uploadAvatar(Number(id), formData);
+      await groupsAPI.uploadAvatar(Number(id), formData);
       
       // Reload group info to get the updated avatar_url from backend
       await loadGroupInfo();

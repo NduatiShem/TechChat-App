@@ -32,12 +32,12 @@ interface Group {
   users?: any[];
   unread_count?: number; // Unread message count for this group
   avatar_url?: string; // Group profile picture URL
-  last_message_attachments?: Array<{
+  last_message_attachments?: {
     id: number;
     name: string;
     mime: string;
     url: string;
-  }>;
+  }[];
 }
 
 export const options = {
@@ -79,7 +79,7 @@ export default function GroupsScreen() {
       
       setGroups(safeGroupsData);
       setFilteredGroups(safeGroupsData);
-    } catch (error) {
+    } catch {
       // Failed to load groups - set empty array to prevent errors
       setGroups([]);
       setFilteredGroups([]);

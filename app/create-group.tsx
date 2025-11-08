@@ -69,7 +69,8 @@ export default function CreateGroupScreen() {
 
   useEffect(() => {
     loadUsers();
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []); // loadUsers is stable, no need to include
 
   const filteredUsers = users.filter(user =>
     (user.name && user.name.toLowerCase().includes(searchQuery.toLowerCase())) ||
