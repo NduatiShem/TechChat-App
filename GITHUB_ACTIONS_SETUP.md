@@ -41,7 +41,7 @@ The workflows are already created in `.github/workflows/`. To test:
 
 2. **Test Build Workflow:**
    - Go to **Actions** tab in GitHub
-   - Select **"Build Android"** or **"Build iOS"**
+   - Select **"Build Android"**
    - Click **"Run workflow"**
    - Select branch and build profile
    - Click **"Run workflow"**
@@ -53,10 +53,12 @@ The workflows are already created in `.github/workflows/`. To test:
 - **What:** Lints code, checks TypeScript, verifies config, installs packages
 - **Time:** ~2-3 minutes
 
-### 🏗️ Build Workflows
+### 🏗️ Build Android Workflow
 - **When:** Push to `main`, version tags, or manual trigger
-- **What:** Builds Android APK or iOS app via EAS
+- **What:** Builds Android APK via EAS
 - **Time:** ~15-30 minutes (builds happen on Expo servers)
+
+**Note:** iOS builds are handled manually when needed.
 
 ### 📦 Release Workflow
 - **When:** You push a version tag (e.g., `v1.0.0`)

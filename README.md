@@ -5,7 +5,6 @@ A modern messaging application built with React Native and Expo, featuring real-
 ![CI](https://github.com/shemnd/TechChat-App/workflows/CI/badge.svg)
 ![Code Quality](https://github.com/shemnd/TechChat-App/workflows/Code%20Quality/badge.svg)
 ![Build Android](https://github.com/shemnd/TechChat-App/workflows/Build%20Android/badge.svg)
-![Build iOS](https://github.com/shemnd/TechChat-App/workflows/Build%20iOS/badge.svg)
 
 ## Features
 
@@ -100,7 +99,7 @@ eas build --profile production --platform ios
 This project uses GitHub Actions for continuous integration and quality checks:
 
 - **CI**: Automatically runs linting, type checking, and installs packages on every push/PR
-- **Build**: Automated builds for Android and iOS via EAS
+- **Build**: Automated Android builds via EAS
 - **Release**: Automatic release creation on version tags
 - **Security**: Weekly security vulnerability scans
 - **Quality**: Code quality checks (console statements, TODOs, etc.)

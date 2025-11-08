@@ -26,7 +26,6 @@ import {
   BackHandler,
   FlatList,
   Image,
-  InteractionManager,
   Keyboard,
   KeyboardAvoidingView,
   Modal,
@@ -45,12 +44,12 @@ interface Message {
   sender_id: number;
   group_id: number;
   created_at: string;
-  attachments?: Array<{
+  attachments?: {
     id: number;
     name: string;
     mime: string;
     url: string;
-  }>;
+  }[];
   voice_message?: {
     url: string;
     duration: number;
@@ -95,7 +94,7 @@ const getBaseUrl = () => {
 export default function GroupChatScreen() {
   const { id } = useLocalSearchParams();
   const { currentTheme } = useTheme();
-  const { user, isAuthenticated, isLoading } = useAuth();
+  const { user, isLoading } = useAuth();
   const { updateUnreadCount } = useNotifications();
   const insets = useSafeAreaInsets();
   const ENABLE_MARK_AS_READ = true; // Enable mark as read functionality for groups

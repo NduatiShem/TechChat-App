@@ -2,7 +2,6 @@ import { AppConfig } from '@/config/app.config';
 import { useAuth } from '@/context/AuthContext';
 import { useTheme } from '@/context/ThemeContext';
 import { MaterialCommunityIcons } from '@expo/vector-icons';
-import { router } from 'expo-router';
 import { useEffect, useRef, useState } from 'react';
 import {
     Alert,
@@ -112,7 +111,7 @@ export default function LoginScreen() {
         await fetch(getBaseUrl(), {
           method: 'GET',
         });
-      } catch (networkError) {
+      } catch {
         Alert.alert(
           'Network Error', 
           'Cannot connect to server. Please ensure your Laravel server is running with:\n\nphp artisan serve --host=0.0.0.0 --port=8000'

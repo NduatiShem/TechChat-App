@@ -38,20 +38,9 @@ This directory contains GitHub Actions workflows for continuous integration and 
 
 **Purpose:** Automated Android APK builds
 
-### 4. Build iOS (`build-ios.yml`)
-**Triggers:**
-- Push to `main` branch
-- Version tags (v*)
-- Manual workflow dispatch
+**Note:** iOS builds are handled manually when needed.
 
-**Build Profiles:**
-- `development`: Development builds with dev client
-- `preview`: Preview builds for testing
-- `production`: Production builds for release
-
-**Purpose:** Automated iOS builds
-
-### 5. Release (`release.yml`)
+### 4. Release (`release.yml`)
 **Triggers:** Version tags (v*.*.*)
 
 **Actions:**
@@ -119,12 +108,12 @@ Add these secrets to your GitHub repository (Settings → Secrets and variables 
 ## Usage
 
 ### Automatic Builds
-- **On push to main**: Automatically builds preview versions
-- **On version tag**: Automatically builds production versions
+- **On push to main**: Automatically builds Android preview versions
+- **On version tag**: Automatically builds Android production versions
 
 ### Manual Builds
 1. Go to Actions tab in GitHub
-2. Select "Build Android" or "Build iOS"
+2. Select "Build Android"
 3. Click "Run workflow"
 4. Select build profile
 5. Click "Run workflow"
@@ -136,7 +125,7 @@ Add these secrets to your GitHub repository (Settings → Secrets and variables 
    git push origin v1.0.0
    ```
 2. The release workflow will automatically:
-   - Build production versions
+   - Build Android production version
    - Create a GitHub release
    - Generate changelog
 
@@ -147,7 +136,6 @@ Add these badges to your README.md:
 ```markdown
 ![CI](https://github.com/your-username/TechChat-App/workflows/CI/badge.svg)
 ![Build Android](https://github.com/your-username/TechChat-App/workflows/Build%20Android/badge.svg)
-![Build iOS](https://github.com/your-username/TechChat-App/workflows/Build%20iOS/badge.svg)
 ```
 
 ## Troubleshooting
