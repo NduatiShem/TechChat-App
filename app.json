@@ -70,6 +70,15 @@
       "androidChannelName": "Messages",
       "androidChannelDescription": "New messages and notifications from TechChat"
     },
+    "updates": {
+      "url": "https://u.expo.dev/ff808b2d-601c-4c49-9969-b884cfb8b1e7",
+      "fallbackToCacheTimeout": 0,
+      "checkAutomatically": "ON_LOAD",
+      "enabled": true
+    },
+    "runtimeVersion": {
+      "policy": "appVersion"
+    },
     "extra": {
       "router": {},
       "eas": {

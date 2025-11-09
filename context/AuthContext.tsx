@@ -1,5 +1,6 @@
 import { authAPI } from '@/services/api';
 import { secureStorage } from '@/utils/secureStore';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import React, { createContext, useContext, useEffect, useState } from 'react';
 
 interface User {
@@ -26,6 +27,8 @@ interface AuthContextType {
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
+const USER_CACHE_KEY = '@techchat_user';
+
 export const useAuth = () => {
   const context = useContext(AuthContext);
   if (!context) {
@@ -38,6 +41,31 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [user, setUser] = useState<User | null>(null);
   const [isLoading, setIsLoading] = useState(true);
 
+  // Cache user data to AsyncStorage
+  const cacheUser = async (userData: User) => {
+    try {
+      await AsyncStorage.setItem(USER_CACHE_KEY, JSON.stringify(userData));
+    } catch (error) {
+      console.error('Failed to cache user:', error);
+    }
+  };
+
+  // Load cached user data from AsyncStorage
+  const loadCachedUser = async (): Promise<User | null> => {
+    try {
+      const cachedData = await AsyncStorage.getItem(USER_CACHE_KEY);
+      if (cachedData) {
+        const parsed = JSON.parse(cachedData);
+        if (parsed && parsed.id) {
+          return parsed;
+        }
+      }
+    } catch (error) {
+      console.error('Failed to load cached user:', error);
+    }
+    return null;
+  };
+
   const checkAuth = async () => {
     try {
       // Add small delay to ensure secureStorage is fully initialized
@@ -47,6 +75,13 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       console.log('AuthContext: Checking auth, token exists:', !!token);
       
       if (token) {
+        // First try to load from cache for instant display
+        let cachedUser = await loadCachedUser();
+        if (cachedUser) {
+          setUser(cachedUser);
+          setIsLoading(false);
+        }
+
         try {
           // Add timeout protection for API call
           // Use a shorter timeout in production to fail faster
@@ -62,11 +97,16 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           const userData = response.data?.data || response.data?.user || response.data;
           if (userData && userData.id) {
             setUser(userData);
+            // Cache user data for offline access
+            await cacheUser(userData);
           } else {
             console.warn('AuthContext: No user data in response');
             // Don't clear token immediately - might be network issue
             // Only clear if it's a 401 error
-            setUser(null);
+            // Keep cached user if available
+            if (!cachedUser) {
+              setUser(null);
+            }
           }
         } catch (profileError: any) {
           // If profile fetch fails, check error type
@@ -90,26 +130,29 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
             // Unauthorized/Forbidden - token is invalid, clear it
             try {
               await secureStorage.deleteItem('auth_token');
+              // Clear cached user data
+              await AsyncStorage.removeItem(USER_CACHE_KEY);
               console.log('AuthContext: Token cleared due to', statusCode, 'error');
             } catch (deleteError) {
               console.error('AuthContext: Failed to delete token:', deleteError);
             }
             setUser(null);
-          } else if (statusCode === 500) {
-            // Server error - don't clear token, might be temporary server issue
-            // But set user to null so user can try logging in again
-            console.warn('AuthContext: Server error (500) - keeping token, user needs to login again');
-            setUser(null);
-            // Optionally clear token on 500 if you want to force re-login
-            // await secureStorage.deleteItem('auth_token');
           } else {
-            // Network error, timeout, or other errors - don't clear token
-            // User might be offline or server might be temporarily unavailable
-            // Keep token so user can retry when connection is restored
-            if (__DEV__) {
-              console.warn('AuthContext: Profile fetch failed (status:', statusCode, ') - keeping token for retry');
+            // Server error, network error, timeout, or other errors
+            // Don't clear token - might be temporary server issue or offline
+            // Keep cached user if available (already loaded at the start)
+            if (!cachedUser) {
+              // Try to load from cache one more time
+              cachedUser = await loadCachedUser();
+              if (cachedUser) {
+                setUser(cachedUser);
+              } else {
+                setUser(null);
+              }
             }
-            setUser(null);
+            if (__DEV__) {
+              console.warn('AuthContext: Profile fetch failed (status:', statusCode, ') - keeping token and cached user');
+            }
           }
         }
       } else {
@@ -154,6 +197,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       console.log('AuthContext: Setting token and user...');
       await secureStorage.setItem('auth_token', token);
       setUser(userData);
+      // Cache user data for offline access
+      await cacheUser(userData);
       console.log('AuthContext: Login completed successfully');
     } catch (error) {
       console.error('Login failed:', error);
@@ -178,6 +223,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       console.log('AuthContext: Setting token and user...');
       await secureStorage.setItem('auth_token', token);
       setUser(userData);
+      // Cache user data for offline access
+      await cacheUser(userData);
       console.log('AuthContext: Registration completed successfully');
     } catch (error) {
       console.error('AuthContext: Registration failed:', error);
@@ -195,6 +242,12 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     } finally {
       // Always clear local auth state regardless of API call success
       await secureStorage.deleteItem('auth_token');
+      // Clear cached user data
+      try {
+        await AsyncStorage.removeItem(USER_CACHE_KEY);
+      } catch (error) {
+        console.error('Failed to clear cached user:', error);
+      }
       setUser(null);
       // Don't navigate here - let the AppLayout handle the navigation
       // The AppLayout will automatically show the auth screens when isAuthenticated becomes false
@@ -209,6 +262,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         const userData = response.data?.data || response.data?.user || response.data;
         if (userData && userData.id) {
           setUser(userData);
+          // Cache user data for offline access
+          await cacheUser(userData);
         } else {
           console.warn('RefreshUser: No user data returned, keeping existing user');
         }
@@ -216,6 +271,11 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     } catch (error) {
       console.error('Failed to refresh user data:', error);
       // Do not force logout on refresh failures - keep existing user state
+      // Try to load from cache if refresh fails
+      const cachedUser = await loadCachedUser();
+      if (cachedUser) {
+        setUser(cachedUser);
+      }
     }
   };
 

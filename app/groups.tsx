@@ -19,6 +19,8 @@ import {
   View,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import NetInfo from '@react-native-community/netinfo';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 
 interface Group {
   id: number;
@@ -44,19 +46,58 @@ export const options = {
   title: "Groups",
 };
 
+const GROUPS_CACHE_KEY = '@techchat_groups';
+
 export default function GroupsScreen() {
   const [groups, setGroups] = useState<Group[]>([]);
   const [filteredGroups, setFilteredGroups] = useState<Group[]>([]);
   const [searchQuery, setSearchQuery] = useState('');
   const [isLoading, setIsLoading] = useState(true);
   const [isRefreshing, setIsRefreshing] = useState(false);
+  const [isOnline, setIsOnline] = useState(true);
   const { user } = useAuth();
   const { currentTheme } = useTheme();
   const { updateGroupUnreadCount } = useNotifications();
 
   const isDark = currentTheme === 'dark';
 
-  const loadGroups = async () => {
+  // Cache groups to AsyncStorage
+  const cacheGroups = async (groupsToCache: Group[]) => {
+    try {
+      await AsyncStorage.setItem(GROUPS_CACHE_KEY, JSON.stringify(groupsToCache));
+    } catch (error) {
+      console.error('Failed to cache groups:', error);
+    }
+  };
+
+  // Load cached groups from AsyncStorage
+  const loadCachedGroups = async (): Promise<Group[]> => {
+    try {
+      const cachedData = await AsyncStorage.getItem(GROUPS_CACHE_KEY);
+      if (cachedData) {
+        const parsed = JSON.parse(cachedData);
+        if (Array.isArray(parsed)) {
+          return parsed;
+        }
+      }
+    } catch (error) {
+      console.error('Failed to load cached groups:', error);
+    }
+    return [];
+  };
+
+  const loadGroups = async (forceRefresh = false) => {
+    // If offline, load from cache only
+    if (!isOnline && !forceRefresh) {
+      const cachedGroups = await loadCachedGroups();
+      if (cachedGroups.length > 0) {
+        setGroups(cachedGroups);
+        setFilteredGroups(cachedGroups);
+        setIsLoading(false);
+        return;
+      }
+    }
+
     try {
       const response = await groupsAPI.getAll();
       const groupsData = response.data;
@@ -79,10 +120,20 @@ export default function GroupsScreen() {
       
       setGroups(safeGroupsData);
       setFilteredGroups(safeGroupsData);
+      
+      // Cache groups for offline access
+      await cacheGroups(safeGroupsData);
     } catch {
-      // Failed to load groups - set empty array to prevent errors
-      setGroups([]);
-      setFilteredGroups([]);
+      // Failed to load groups - try to load from cache
+      const cachedGroups = await loadCachedGroups();
+      if (cachedGroups.length > 0) {
+        setGroups(cachedGroups);
+        setFilteredGroups(cachedGroups);
+      } else {
+        // No cache available - set empty array
+        setGroups([]);
+        setFilteredGroups([]);
+      }
     } finally {
       setIsLoading(false);
     }
@@ -106,17 +157,58 @@ export default function GroupsScreen() {
     }
   }, [searchQuery, groups]);
 
+  // Monitor network state
   useEffect(() => {
-    loadGroups();
+    // Get initial network state
+    NetInfo.fetch().then(state => {
+      setIsOnline(state.isConnected ?? false);
+    });
+
+    // Subscribe to network state changes
+    const unsubscribe = NetInfo.addEventListener(state => {
+      const connected = state.isConnected ?? false;
+      const wasOffline = !isOnline;
+      setIsOnline(connected);
+      
+      // If we just came back online, refresh groups
+      if (connected && wasOffline && user) {
+        loadGroups(true);
+      }
+    });
+
+    return () => {
+      unsubscribe();
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []); // loadGroups is stable, no need to include
+  }, [user, isOnline]);
+
+  useEffect(() => {
+    // Only load groups if user is authenticated
+    if (user) {
+      // First try to load from cache for instant display
+      loadCachedGroups().then(cached => {
+        if (cached.length > 0) {
+          setGroups(cached);
+          setFilteredGroups(cached);
+          setIsLoading(false);
+        }
+      });
+      
+      // Then load from API (will update cache if successful)
+      loadGroups();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user]); // loadGroups is stable, no need to include
 
   // Refresh groups when screen comes into focus
   useFocusEffect(
     React.useCallback(() => {
-      loadGroups();
+      // Only reload if user is authenticated
+      if (user) {
+        loadGroups();
+      }
       // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, []) // loadGroups is stable, no need to include
+    }, [user]) // loadGroups is stable, no need to include
   );
 
   const formatDate = (dateString: string | null | undefined): string => {
