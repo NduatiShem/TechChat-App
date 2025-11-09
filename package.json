@@ -4,9 +4,13 @@
   "version": "1.0.0",
   "scripts": {
     "start": "expo start",
+    "start:tunnel": "expo start --tunnel",
+    "start:lan": "expo start --lan",
     "start:prod": "NODE_ENV=production expo start --no-dev --minify",
     "start:prod:web": "NODE_ENV=production expo start --no-dev --minify --web",
     "start:prod:tunnel": "NODE_ENV=production expo start --no-dev --minify --tunnel",
+    "start:prod-api:tunnel": "EXPO_PUBLIC_FORCE_PRODUCTION=true expo start --tunnel",
+    "start:prod-api:lan": "EXPO_PUBLIC_FORCE_PRODUCTION=true expo start --lan",
     "build:web:prod": "NODE_ENV=production npx expo export:web",
     "reset-project": "node ./scripts/reset-project.js",
     "android": "expo start --android",

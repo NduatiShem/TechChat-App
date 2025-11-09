@@ -5,6 +5,7 @@
   },
   "build": {
     "development": {
+      "channel": "development",
       "developmentClient": true,
       "distribution": "internal",
       "android": {
@@ -15,6 +16,7 @@
       }
     },
     "preview": {
+      "channel": "preview",
       "distribution": "internal",
       "android": {
         "buildType": "apk"
@@ -24,6 +26,7 @@
       }
     },
     "production": {
+      "channel": "production",
       "env": {
         "EXPO_PUBLIC_FORCE_PRODUCTION": "true"
       },
@@ -33,17 +36,6 @@
       "ios": {
         "resourceClass": "m-medium"
       }
-    }
-  },
-  "update": {
-    "production": {
-      "channel": "production"
-    },
-    "preview": {
-      "channel": "preview"
-    },
-    "development": {
-      "channel": "development"
     }
   },
   "submit": {

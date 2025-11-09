@@ -212,25 +212,25 @@ export default function GroupsScreen() {
   );
 
   const formatDate = (dateString: string | null | undefined): string => {
-    if (!dateString) return '';
+    if (!dateString) return ' ';
     try {
       const date = new Date(dateString);
-      if (isNaN(date.getTime())) return '';
+      if (isNaN(date.getTime())) return ' ';
       const now = new Date();
       const diffInHours = (now.getTime() - date.getTime()) / (1000 * 60 * 60);
 
       if (diffInHours < 24) {
         const timeStr = date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-        return timeStr || '';
+        return timeStr || ' ';
       } else if (diffInHours < 168) { // 7 days
         const dayStr = date.toLocaleDateString([], { weekday: 'short' });
-        return dayStr || '';
+        return dayStr || ' ';
       } else {
         const dateStr = date.toLocaleDateString([], { month: 'short', day: 'numeric' });
-        return dateStr || '';
+        return dateStr || ' ';
       }
     } catch {
-      return '';
+      return ' ';
     }
   };
 
@@ -275,10 +275,10 @@ export default function GroupsScreen() {
               }`}
               numberOfLines={1}
             >
-              {item.name || ''}
+              {item.name ? String(item.name) : ' '}
             </Text>
             {/* Show unread count on the right side - like WhatsApp */}
-            {item.unread_count && item.unread_count > 0 && (
+            {item.unread_count > 0 && (
               <View 
                 className="ml-2 h-5 px-1.5 rounded-full bg-green-500 items-center justify-center"
                 style={{ minWidth: 20 }}
@@ -317,7 +317,7 @@ export default function GroupsScreen() {
             }`}
             numberOfLines={1}
           >
-            {item.description || ''}
+            {item.description ? String(item.description) : ' '}
           </Text>
         )}
         

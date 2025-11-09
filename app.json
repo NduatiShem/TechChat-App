@@ -38,11 +38,7 @@
         "INTERNET",
         "ACCESS_NETWORK_STATE"
       ],
-      "softwareKeyboardLayoutMode": "adjustResize",
-      "usesCleartextTraffic": false,
-      "networkSecurityConfig": {
-        "cleartextTrafficPermitted": false
-      }
+      "softwareKeyboardLayoutMode": "adjustResize"
     },
     "web": {
       "favicon": "./assets/icons/Icon-48.png"
@@ -72,8 +68,8 @@
     },
     "updates": {
       "url": "https://u.expo.dev/ff808b2d-601c-4c49-9969-b884cfb8b1e7",
-      "fallbackToCacheTimeout": 0,
-      "checkAutomatically": "ON_LOAD",
+      "fallbackToCacheTimeout": 3000,
+      "checkAutomatically": "ON_ERROR_RECOVERY",
       "enabled": true
     },
     "runtimeVersion": {
