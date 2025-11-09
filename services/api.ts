@@ -99,7 +99,8 @@ const api = axios.create({
 api.interceptors.request.use(
   async (config) => {
     const token = await secureStorage.getItem('auth_token');
-    if (token) {
+    // Only add token if it's valid (non-empty string)
+    if (token && typeof token === 'string' && token.trim().length > 0) {
       config.headers.Authorization = `Bearer ${token}`;
     }
     return config;

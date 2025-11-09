@@ -74,7 +74,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       const token = await secureStorage.getItem('auth_token');
       console.log('AuthContext: Checking auth, token exists:', !!token);
       
-      if (token) {
+      // Validate token format (basic check - should be a non-empty string)
+      if (token && typeof token === 'string' && token.trim().length > 0) {
         // First try to load from cache for instant display
         let cachedUser = await loadCachedUser();
         if (cachedUser) {
@@ -132,11 +133,12 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
               await secureStorage.deleteItem('auth_token');
               // Clear cached user data
               await AsyncStorage.removeItem(USER_CACHE_KEY);
-              console.log('AuthContext: Token cleared due to', statusCode, 'error');
+              console.log('AuthContext: Token cleared due to', statusCode, 'error - user needs to login again');
             } catch (deleteError) {
               console.error('AuthContext: Failed to delete token:', deleteError);
             }
             setUser(null);
+            setIsLoading(false); // Ensure loading is set to false so login screen can show
           } else {
             // Server error, network error, timeout, or other errors
             // Don't clear token - might be temporary server issue or offline
