@@ -24,6 +24,9 @@
       }
     },
     "production": {
+      "env": {
+        "EXPO_PUBLIC_FORCE_PRODUCTION": "true"
+      },
       "android": {
         "buildType": "apk"
       },

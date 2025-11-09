@@ -7,20 +7,49 @@ import { AppConfig } from '../config/app.config';
 // API Base URL - Configured for TechChat app
 // Use the configuration from AppConfig
 const getApiBaseUrl = () => {
-  if (__DEV__) {
+  // Check if we should force production mode via environment variable
+  const forceProduction = process.env.EXPO_PUBLIC_FORCE_PRODUCTION === 'true' || 
+                          process.env.EXPO_PUBLIC_API_URL === 'production';
+  
+  // Check if we're in development mode
+  // In production builds (EAS build, standalone apps), __DEV__ is false
+  // But Expo Go always has __DEV__ = true, so we need to check environment variables
+  const isDev = __DEV__ && !forceProduction;
+  
+  // If production URL is explicitly set via environment variable, use it
+  if (process.env.EXPO_PUBLIC_API_URL && process.env.EXPO_PUBLIC_API_URL !== 'production') {
+    const envUrl = process.env.EXPO_PUBLIC_API_URL;
+    console.log('[API] Using API URL from environment variable:', envUrl);
+    return envUrl;
+  }
+  
+  if (isDev) {
     // For Android devices (both physical and emulator in Expo Go), use the physical device URL
     // This is because Expo Go on physical devices needs your computer's network IP
     if (Platform.OS === 'android') {
-      return AppConfig.api.development.physical;
+      const url = AppConfig.api.development.physical;
+      console.log('[API] Development mode - Using Android URL:', url);
+      return url;
     } else if (Platform.OS === 'ios') {
-      return AppConfig.api.development.ios;
+      const url = AppConfig.api.development.ios;
+      console.log('[API] Development mode - Using iOS URL:', url);
+      return url;
     }
   }
+  
   // In production, use the production URL
-  return AppConfig.api.production;
+  const productionUrl = AppConfig.api.production;
+  console.log('[API] Production mode - Using production URL:', productionUrl);
+  return productionUrl;
 };
 
 const API_BASE_URL = getApiBaseUrl();
+
+// Always log the API base URL being used (for debugging)
+console.log('[API] Base URL configured:', API_BASE_URL);
+console.log('[API] __DEV__ flag:', __DEV__);
+console.log('[API] Force Production:', process.env.EXPO_PUBLIC_FORCE_PRODUCTION);
+console.log('[API] Platform:', Platform.OS);
 
 // Create axios instance
 const api = axios.create({
@@ -121,12 +150,54 @@ api.interceptors.response.use(
     return response;
   },
   async (error) => {
-    // Handle 401 Unauthorized - redirect to login
-    if (error.response?.status === 401) {
-      // Token expired or invalid, redirect to login
-      await secureStorage.deleteItem('auth_token');
-      router.replace('/(auth)/login');
+    // Enhanced error logging - always log in development, or if debug is enabled
+    if (__DEV__ || process.env.EXPO_PUBLIC_DEBUG_API === 'true') {
+      if (error.response) {
+        // Server responded with error status
+        console.error('[API Error] Response Error:', {
+          status: error.response.status,
+          statusText: error.response.statusText,
+          url: error.config?.url,
+          baseURL: error.config?.baseURL,
+          method: error.config?.method,
+          data: error.response.data,
+          headers: error.response.headers,
+        });
+        
+        // Log full error response for 500 errors to help debug
+        if (error.response.status === 500) {
+          console.error('[API Error] 500 Server Error Details:', JSON.stringify(error.response.data, null, 2));
+        }
+      } else if (error.request) {
+        // Request was made but no response received
+        console.error('[API Error] Network Error:', {
+          message: error.message,
+          url: error.config?.url,
+          baseURL: error.config?.baseURL,
+          method: error.config?.method,
+          code: error.code,
+        });
+      } else {
+        // Error in request setup
+        console.error('[API Error] Request Setup Error:', error.message);
+      }
     }
+    
+    // Handle 401 Unauthorized - redirect to login
+    // Only redirect if not during initial auth check (to avoid blocking initialization)
+    if (error.response?.status === 401 && error.config?.url !== '/users/me') {
+      // Token expired or invalid, redirect to login
+      // Use setTimeout to avoid blocking the error rejection
+      setTimeout(async () => {
+        try {
+          await secureStorage.deleteItem('auth_token');
+          router.replace('/(auth)/login');
+        } catch (redirectError) {
+          console.error('Error during redirect:', redirectError);
+        }
+      }, 100);
+    }
+    
     return Promise.reject(error);
   }
 );

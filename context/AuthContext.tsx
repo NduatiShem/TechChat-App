@@ -49,9 +49,11 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       if (token) {
         try {
           // Add timeout protection for API call
+          // Use a shorter timeout in production to fail faster
+          const timeoutDuration = __DEV__ ? 10000 : 8000;
           const profilePromise = authAPI.getProfile();
-          const timeoutPromise = new Promise((_, reject) => 
-            setTimeout(() => reject(new Error('Profile fetch timeout')), 10000)
+          const timeoutPromise = new Promise<never>((_, reject) => 
+            setTimeout(() => reject(new Error('Profile fetch timeout')), timeoutDuration)
           );
           
           const response = await Promise.race([profilePromise, timeoutPromise]) as any;
@@ -70,28 +72,42 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           // If profile fetch fails, check error type
           const errorMessage = profileError?.message || String(profileError);
           const statusCode = profileError?.response?.status;
+          const errorData = profileError?.response?.data;
           
-          console.error('AuthContext: Profile fetch failed:', errorMessage);
+          // Log detailed error in development
+          if (__DEV__) {
+            console.error('AuthContext: Profile fetch failed:', {
+              message: errorMessage,
+              status: statusCode,
+              errorData: errorData,
+              url: profileError?.config?.url,
+              baseURL: profileError?.config?.baseURL,
+            });
+          }
           
-          // Only clear token if it's a 401 (unauthorized) or 403 (forbidden)
-          // Network errors shouldn't clear the token
+          // Handle different error status codes
           if (statusCode === 401 || statusCode === 403) {
+            // Unauthorized/Forbidden - token is invalid, clear it
             try {
               await secureStorage.deleteItem('auth_token');
+              console.log('AuthContext: Token cleared due to', statusCode, 'error');
             } catch (deleteError) {
               console.error('AuthContext: Failed to delete token:', deleteError);
             }
             setUser(null);
-          } else if (statusCode === undefined) {
-            // Network error or timeout - don't clear token, just set user to null
-            console.warn('AuthContext: Network error - keeping token for retry');
+          } else if (statusCode === 500) {
+            // Server error - don't clear token, might be temporary server issue
+            // But set user to null so user can try logging in again
+            console.warn('AuthContext: Server error (500) - keeping token, user needs to login again');
             setUser(null);
+            // Optionally clear token on 500 if you want to force re-login
+            // await secureStorage.deleteItem('auth_token');
           } else {
-            // Other errors - clear token to be safe
-            try {
-              await secureStorage.deleteItem('auth_token');
-            } catch (deleteError) {
-              console.error('AuthContext: Failed to delete token:', deleteError);
+            // Network error, timeout, or other errors - don't clear token
+            // User might be offline or server might be temporarily unavailable
+            // Keep token so user can retry when connection is restored
+            if (__DEV__) {
+              console.warn('AuthContext: Profile fetch failed (status:', statusCode, ') - keeping token for retry');
             }
             setUser(null);
           }
@@ -206,12 +222,32 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   useEffect(() => {
     // Wrap in try-catch to prevent crashes during initialization
     let mounted = true;
+    let timeoutId: NodeJS.Timeout | null = null;
     
     const initializeAuth = async () => {
+      // Set a fallback timeout to ensure loading is always set to false
+      // This prevents the app from getting stuck on loading screen
+      timeoutId = setTimeout(() => {
+        if (mounted) {
+          console.warn('AuthContext: Initialization timeout - forcing loading to false');
+          setIsLoading(false);
+        }
+      }, 15000); // 15 second maximum timeout
+      
       try {
         await checkAuth();
+        // If checkAuth completes successfully, clear the timeout
+        if (timeoutId) {
+          clearTimeout(timeoutId);
+          timeoutId = null;
+        }
       } catch (error) {
         console.error('AuthContext: Initialization error:', error);
+        // Clear timeout since we're handling the error
+        if (timeoutId) {
+          clearTimeout(timeoutId);
+          timeoutId = null;
+        }
         // Ensure loading is set to false even on error
         if (mounted) {
           setIsLoading(false);
@@ -223,6 +259,9 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     
     return () => {
       mounted = false;
+      if (timeoutId) {
+        clearTimeout(timeoutId);
+      }
     };
   }, []);
 

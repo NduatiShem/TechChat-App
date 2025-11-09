@@ -34,9 +34,15 @@
       "permissions": [
         "RECEIVE_BOOT_COMPLETED",
         "VIBRATE",
-        "WAKE_LOCK"
+        "WAKE_LOCK",
+        "INTERNET",
+        "ACCESS_NETWORK_STATE"
       ],
-      "softwareKeyboardLayoutMode": "adjustResize"
+      "softwareKeyboardLayoutMode": "adjustResize",
+      "usesCleartextTraffic": false,
+      "networkSecurityConfig": {
+        "cleartextTrafficPermitted": false
+      }
     },
     "web": {
       "favicon": "./assets/icons/Icon-48.png"

@@ -25,20 +25,38 @@ This directory contains GitHub Actions workflows for continuous integration and 
 
 **Purpose:** Code quality and maintainability checks
 
-### 3. Build Android (`build-android.yml`)
+### 3. Deploy to Server (`deploy-git.yml`) - **RECOMMENDED**
 **Triggers:**
 - Push to `main` branch
-- Version tags (v*)
 - Manual workflow dispatch
 
-**Build Profiles:**
-- `development`: Development builds with dev client
-- `preview`: Preview builds for testing
-- `production`: Production builds for release
+**Actions:**
+- Runs linting and type checking
+- Connects to server via SSH
+- Pulls latest changes from GitHub
+- Installs dependencies
 
-**Purpose:** Automated Android APK builds
+**Purpose:** Automated deployment to production server
 
-**Note:** iOS builds are handled manually when needed.
+**Required Secrets:**
+- `SERVER_HOST`: Server IP address or domain
+- `SERVER_USER`: SSH username
+- `SERVER_SSH_KEY`: Private SSH key for authentication
+- `SERVER_PORT`: SSH port (optional, defaults to 22)
+- `SERVER_DEPLOY_PATH`: Path to project directory on server
+
+### 4. Deploy to Server (`deploy.yml`) - Alternative
+**Triggers:**
+- Push to `main` branch
+- Manual workflow dispatch
+
+**Actions:**
+- Copies files to server via SCP
+- Runs deployment commands on server
+
+**Purpose:** Alternative deployment method using file copy
+
+**Note:** Android builds are now handled manually when needed using `eas build`.
 
 ### 4. Release (`release.yml`)
 **Triggers:** Version tags (v*.*.*)
@@ -74,6 +92,17 @@ This directory contains GitHub Actions workflows for continuous integration and 
 
 Add these secrets to your GitHub repository (Settings → Secrets and variables → Actions):
 
+### For Deployment (Required)
+1. **SERVER_HOST**: Your server IP address or domain (e.g., `123.45.67.89` or `healthclassique.tech-bridge.app`)
+2. **SERVER_USER**: SSH username (e.g., `root` or `ubuntu`)
+3. **SERVER_SSH_KEY**: Private SSH key for authentication
+   - Generate: `ssh-keygen -t rsa -b 4096 -C "github-actions"`
+   - Copy private key content to GitHub secret
+   - Add public key to server: `cat ~/.ssh/id_rsa.pub >> ~/.ssh/authorized_keys`
+4. **SERVER_PORT**: SSH port (optional, defaults to 22)
+5. **SERVER_DEPLOY_PATH**: Path to project directory on server (e.g., `/var/www/TechChat-App`)
+
+### For Building (Optional - if you need automated builds)
 1. **EXPO_TOKEN**: Your Expo access token
    - Get it from: https://expo.dev/accounts/[your-account]/settings/access-tokens
    - Required for: Building with EAS
@@ -107,16 +136,26 @@ Add these secrets to your GitHub repository (Settings → Secrets and variables 
 
 ## Usage
 
-### Automatic Builds
-- **On push to main**: Automatically builds Android preview versions
-- **On version tag**: Automatically builds Android production versions
+### Automatic Deployment
+- **On push to main**: Automatically deploys to production server
+- The workflow will:
+  1. Run linting and type checking
+  2. Connect to server via SSH
+  3. Pull latest changes from GitHub
+  4. Install dependencies
 
-### Manual Builds
+### Manual Deployment
 1. Go to Actions tab in GitHub
-2. Select "Build Android"
+2. Select "Deploy to Server (Git Pull)"
 3. Click "Run workflow"
-4. Select build profile
+4. Select branch (usually `main`)
 5. Click "Run workflow"
+
+### Manual Android Builds (When Needed)
+If you need to build Android APK, run locally:
+```bash
+eas build --profile production --platform android
+```
 
 ### Creating Releases
 1. Create and push a version tag:
@@ -125,7 +164,6 @@ Add these secrets to your GitHub repository (Settings → Secrets and variables 
    git push origin v1.0.0
    ```
 2. The release workflow will automatically:
-   - Build Android production version
    - Create a GitHub release
    - Generate changelog
 

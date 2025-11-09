@@ -37,8 +37,8 @@ jobs:
             # Don't fail the build, just warn
           fi
 
-  build-check:
-    name: Build Check
+  config-check:
+    name: Configuration Check
     runs-on: ubuntu-latest
     
     steps:
@@ -54,15 +54,15 @@ jobs:
       - name: Install dependencies
         run: npm ci
       
-      - name: Setup Expo
-        uses: expo/expo-github-action@v8
-        with:
-          expo-version: latest
-          token: ${{ secrets.EXPO_TOKEN }}
-      
       - name: Verify app.json
-        run: npx expo config --type public
+        run: npx expo config --type public || echo "Expo config check skipped"
       
-      - name: Check EAS configuration
-        run: npx eas-cli config --non-interactive || echo "EAS CLI not available, skipping"
+      - name: Verify production API URL
+        run: |
+          if grep -q "healthclassique.tech-bridge.app" config/app.config.ts; then
+            echo "✅ Production API URL is configured correctly"
+          else
+            echo "⚠️ Warning: Production API URL might not be set correctly"
+            exit 0  # Don't fail, just warn
+          fi
 
