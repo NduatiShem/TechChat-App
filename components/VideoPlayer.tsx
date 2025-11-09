@@ -1,6 +1,6 @@
-import React, { useState } from 'react';
+import React, { useState, useRef } from 'react';
 import { View, StyleSheet, TouchableOpacity, Modal, Text } from 'react-native';
-import { Video, ResizeMode, AVPlaybackStatus } from 'expo-av';
+import { Video, ResizeMode, AVPlaybackStatus, AVPlaybackSource } from 'expo-av';
 import { MaterialCommunityIcons } from '@expo/vector-icons';
 import { getYouTubeVideoId, getVimeoVideoId, isVideoUrl } from '@/utils/textUtils';
 import { WebView } from 'react-native-webview';
@@ -30,7 +30,7 @@ export default function VideoPlayer({
   const [isPlaying, setIsPlaying] = useState(false);
   const [showFullscreen, setShowFullscreen] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const videoRef = React.useRef<Video>(null);
+  const videoRef = useRef<Video>(null);
 
   // Check if it's a YouTube or Vimeo URL
   const youtubeId = getYouTubeVideoId(url);
@@ -154,19 +154,25 @@ export default function VideoPlayer({
 
   // Direct video file
   if (isDirectVideo) {
+    const videoSource: AVPlaybackSource = { uri: url };
+    
     return (
       <View style={[styles.container, style]}>
         <Video
           ref={videoRef}
-          source={{ uri: url }}
+          source={videoSource}
           style={styles.video}
           resizeMode={ResizeMode.CONTAIN}
           useNativeControls
           onPlaybackStatusUpdate={handlePlaybackStatusUpdate}
           onError={(error) => {
             setError('Failed to load video');
-            console.error('Video error:', error);
+            if (__DEV__) {
+              console.error('Video error:', error);
+            }
           }}
+          shouldPlay={false}
+          isLooping={false}
         />
         {error && (
           <View style={styles.errorContainer}>

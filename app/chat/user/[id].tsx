@@ -122,7 +122,7 @@ export default function UserChatScreen() {
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
   const [keyboardHeight, setKeyboardHeight] = useState(0);
   const flatListRef = useRef<FlatList<Message>>(null);
-  const isInitialLoad = useRef(true);
+  const hasScrolledForThisConversation = useRef<string | null>(null); // Track which conversation we've scrolled for
   
   // Pagination state
   const [currentPage, setCurrentPage] = useState(1);
@@ -140,7 +140,6 @@ export default function UserChatScreen() {
     const fetchMessages = async () => {
       setLoading(true);
       setHasScrolledToBottom(false); // Reset scroll flag when fetching new messages
-      isInitialLoad.current = true; // Reset initial load flag
       try {
         const res = await messagesAPI.getByUser(Number(id), 1, 10);
         
@@ -235,9 +234,6 @@ export default function UserChatScreen() {
         
         // Reset scroll flag to allow initial scroll
         setHasScrolledToBottom(false);
-        isInitialLoad.current = true;
-        
-        // Scroll will happen after content is rendered via onContentSizeChange and onLayout
         
         // Mark messages as read when user opens conversation
         // Use the new route: PUT /api/messages/mark-read/{userId}
@@ -247,8 +243,19 @@ export default function UserChatScreen() {
             // Update unread count to 0 for this conversation - this will update badge
             updateUnreadCount(Number(id), 0);
           } catch (error: any) {
-            // Ignore validation (422) or missing route errors
-            console.log('markMessagesAsRead failed:', error?.response?.status || error?.message || error);
+            // Handle errors gracefully - don't show to user
+            const statusCode = error?.response?.status;
+            
+            // 429 = Too Many Requests (rate limit) - expected, handled gracefully
+            // 422 = Validation error - expected in some cases
+            // 404 = Not found - endpoint might not exist yet
+            // Only log unexpected errors in development
+            if (statusCode !== 429 && statusCode !== 422 && statusCode !== 404) {
+              if (__DEV__) {
+                console.log('markMessagesAsRead failed:', statusCode || error?.message || error);
+              }
+            }
+            // Silently ignore rate limit and validation errors
           }
         }
         
@@ -302,6 +309,48 @@ export default function UserChatScreen() {
     fetchMessages();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]); // ENABLE_MARK_AS_READ and updateUnreadCount are stable, no need to include
+
+  // Simple approach: Scroll to bottom ONCE when messages are first loaded for this conversation
+  useEffect(() => {
+    // Only scroll if:
+    // 1. Not loading
+    // 2. We have messages
+    // 3. We haven't scrolled for this conversation yet
+    if (!loading && messages.length > 0 && hasScrolledForThisConversation.current !== id) {
+      // Mark that we've scrolled for this conversation
+      hasScrolledForThisConversation.current = id as string;
+      
+      // Wait for layout to be ready, then scroll once
+      const timeoutId = setTimeout(() => {
+        if (flatListRef.current && messages.length > 0) {
+          try {
+            // Try scrollToEnd first
+            (flatListRef.current as any).scrollToEnd({ animated: false });
+            setHasScrolledToBottom(true);
+            console.log('Scrolled to bottom on initial load');
+          } catch (error) {
+            // Fallback: scroll to last index
+            try {
+              const lastIndex = messages.length - 1;
+              if (lastIndex >= 0) {
+                (flatListRef.current as any).scrollToIndex({ 
+                  index: lastIndex, 
+                  animated: false,
+                  viewPosition: 1
+                });
+                setHasScrolledToBottom(true);
+                console.log('Scrolled to bottom via scrollToIndex');
+              }
+            } catch (scrollError) {
+              console.warn('Scroll failed:', scrollError);
+            }
+          }
+        }
+      }, 600); // Single delay - wait for content to render
+      
+      return () => clearTimeout(timeoutId);
+    }
+  }, [loading, messages.length, id]); // Only depend on loading, messages, and conversation id
 
   // Debug: Log all keys and check for duplicates before rendering FlatList
   useEffect(() => {
@@ -1661,6 +1710,7 @@ export default function UserChatScreen() {
               // Scroll will happen after content is rendered via onContentSizeChange
               onScroll={({ nativeEvent }) => {
                 const { contentOffset } = nativeEvent;
+                
                 // Use a threshold instead of exactly 0, as FlatList might not reach exactly 0
                 const isAtTop = contentOffset.y <= 50; // Within 50 pixels of the top
                 
@@ -1693,76 +1743,11 @@ export default function UserChatScreen() {
                   </View>
                 ) : null
               }
-              onContentSizeChange={(contentWidth, contentHeight) => {
-                // Scroll to bottom when content size changes (only on initial load)
-                if (flatListRef.current && messages.length > 0 && !loadingMore && !hasScrolledToBottom && isInitialLoad.current) {
-                  // Wait for content to be fully rendered before scrolling
-                  requestAnimationFrame(() => {
-                    setTimeout(() => {
-                      if (flatListRef.current && messages.length > 0 && isInitialLoad.current) {
-                        try {
-                          // Use scrollToEnd - it's more reliable when content is already rendered
-                          (flatListRef.current as any).scrollToEnd({ animated: false });
-                          setHasScrolledToBottom(true);
-                          isInitialLoad.current = false;
-                          console.log('Scrolled to bottom via onContentSizeChange');
-                        } catch (error) {
-                          console.warn('onContentSizeChange scrollToEnd failed:', error);
-                          // Try scrollToIndex as fallback
-                          try {
-                            const lastIndex = messages.length - 1;
-                            if (flatListRef.current && lastIndex >= 0) {
-                              (flatListRef.current as any).scrollToIndex({ 
-                                index: lastIndex, 
-                                animated: false,
-                                viewPosition: 1
-                              });
-                              setHasScrolledToBottom(true);
-                              isInitialLoad.current = false;
-                              console.log('Scrolled to bottom via onContentSizeChange (scrollToIndex fallback)');
-                            }
-                          } catch (scrollError) {
-                            console.warn('onContentSizeChange scroll failed:', scrollError);
-                          }
-                        }
-                      }
-                    }, 150);
-                  });
-                }
+              onContentSizeChange={() => {
+                // No auto-scroll here - useEffect handles initial scroll once
               }}
-              onLayout={(event) => {
-                // Scroll to bottom on initial layout if we haven't scrolled yet
-                if (flatListRef.current && messages.length > 0 && !loading && !hasScrolledToBottom && isInitialLoad.current) {
-                  // Wait a bit longer to ensure all items are rendered
-                  setTimeout(() => {
-                    if (flatListRef.current && messages.length > 0 && isInitialLoad.current) {
-                      try {
-                        // Use scrollToEnd - it's more reliable when content is already rendered
-                        (flatListRef.current as any).scrollToEnd({ animated: false });
-                        setHasScrolledToBottom(true);
-                        isInitialLoad.current = false;
-                        console.log('Scrolled to bottom via onLayout');
-                      } catch {
-                        // Fallback to scrollToIndex
-                        try {
-                          const lastIndex = messages.length - 1;
-                          if (flatListRef.current && lastIndex >= 0) {
-                            (flatListRef.current as any).scrollToIndex({ 
-                              index: lastIndex, 
-                              animated: false,
-                              viewPosition: 1
-                            });
-                            setHasScrolledToBottom(true);
-                            isInitialLoad.current = false;
-                            console.log('Scrolled to bottom via onLayout (scrollToIndex fallback)');
-                          }
-                        } catch {
-                          // Scroll failed
-                        }
-                      }
-                    }
-                  }, 300);
-                }
+              onLayout={() => {
+                // No auto-scroll here - useEffect handles initial scroll once
               }}
               ListEmptyComponent={() => (
                 <View style={{ 

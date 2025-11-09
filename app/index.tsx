@@ -132,39 +132,59 @@ export default function ConversationsScreen() {
         }
       }
       
-      // Ensure we have an array
+      // Convert object to array if needed (handle cases where backend returns object with numeric keys)
+      let conversationsArray: Conversation[] = [];
+      
       if (Array.isArray(conversationsData)) {
-        // Remove duplicates based on id
-        // Backend already filters active users, so we don't need to filter here
-        const uniqueConversations = conversationsData.filter((conversation, index, self) => 
-          conversation && 
-          conversation.id !== undefined && 
-          conversation.id !== null &&
-          index === self.findIndex(c => c.id === conversation.id)
-        );
+        conversationsArray = conversationsData;
+      } else if (conversationsData && typeof conversationsData === 'object') {
+        // Handle object with numeric keys like {"0": {...}, "1": {...}}
+        const keys = Object.keys(conversationsData);
+        const numericKeys = keys.filter(key => !isNaN(Number(key)));
         
-        // Sync unread counts from backend to notification context
-        // Update all conversations (including those with 0 unread)
-        uniqueConversations.forEach((conversation) => {
-          const conversationId = conversation.conversation_id || conversation.id;
-          const unreadCount = conversation.unread_count || 0;
-          // Update count for each conversation (this will automatically calculate total)
-          updateUnreadCount(Number(conversationId), unreadCount);
-        });
-        
-        setConversations(uniqueConversations);
-        setFilteredConversations(uniqueConversations);
-        // Cache conversations for offline use
-        await cacheConversations(uniqueConversations);
+        if (numericKeys.length > 0) {
+          // Convert object with numeric keys to array
+          conversationsArray = numericKeys.map(key => conversationsData[key]).filter(Boolean);
+          console.log('Converted object with numeric keys to array:', conversationsArray.length, 'conversations');
+        } else {
+          // Handle single object (wrap in array)
+          conversationsArray = [conversationsData].filter(Boolean);
+          console.log('Converted single object to array');
+        }
       } else {
-        console.error('Response data is not an array:', conversationsData);
+        console.error('Response data is not an array or object:', conversationsData);
         // Don't clear conversations if response format is unexpected - keep existing data
         // Only clear if we have no existing conversations
         if (conversations.length === 0) {
           setConversations([]);
           setFilteredConversations([]);
         }
+        setIsLoading(false);
+        return;
       }
+      
+      // Remove duplicates based on id
+      // Backend already filters active users, so we don't need to filter here
+      const uniqueConversations = conversationsArray.filter((conversation, index, self) => 
+        conversation && 
+        conversation.id !== undefined && 
+        conversation.id !== null &&
+        index === self.findIndex(c => c.id === conversation.id)
+      );
+      
+      // Sync unread counts from backend to notification context
+      // Update all conversations (including those with 0 unread)
+      uniqueConversations.forEach((conversation) => {
+        const conversationId = conversation.conversation_id || conversation.id;
+        const unreadCount = conversation.unread_count || 0;
+        // Update count for each conversation (this will automatically calculate total)
+        updateUnreadCount(Number(conversationId), unreadCount);
+      });
+      
+      setConversations(uniqueConversations);
+      setFilteredConversations(uniqueConversations);
+      // Cache conversations for offline use
+      await cacheConversations(uniqueConversations);
     } catch (error: any) {
       console.error('Failed to load conversations:', error);
       // If offline or network error, try to load from cache

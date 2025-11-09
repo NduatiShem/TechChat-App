@@ -135,7 +135,7 @@ export default function GroupChatScreen() {
   const [keyboardHeight, setKeyboardHeight] = useState(0);
 
   const flatListRef = useRef<FlatList>(null);
-  const isInitialLoad = useRef(true);
+  const hasScrolledForThisConversation = useRef<string | null>(null); // Track which conversation we've scrolled for
   
   // Pagination state
   const [currentPage, setCurrentPage] = useState(1);
@@ -149,7 +149,6 @@ export default function GroupChatScreen() {
     try {
       setLoading(true);
       setHasScrolledToBottom(false); // Reset scroll flag when fetching new messages
-      isInitialLoad.current = true; // Reset initial load flag
       const response = await messagesAPI.getByGroup(Number(id), 1, 10);
       // Handle Laravel pagination format
       const messagesData = response.data.messages?.data || response.data.messages || [];
@@ -198,9 +197,6 @@ export default function GroupChatScreen() {
       
       // Reset scroll flag to allow initial scroll
       setHasScrolledToBottom(false);
-      isInitialLoad.current = true;
-      
-      // Scroll will happen after content is rendered via onContentSizeChange and onLayout
       
       // Mark messages as read when user opens group conversation
       const groupId = Number(id);
@@ -209,9 +205,20 @@ export default function GroupChatScreen() {
           await groupsAPI.markMessagesAsRead(groupId);
           // Update unread count to 0 for this group - this will update badge
           updateUnreadCount(groupId, 0);
-        } catch {
-          // Ignore validation (422) or missing route errors
-          // Failed to mark messages as read
+        } catch (error: any) {
+          // Handle errors gracefully - don't show to user
+          const statusCode = error?.response?.status;
+          
+          // 429 = Too Many Requests (rate limit) - expected, handled gracefully
+          // 422 = Validation error - expected in some cases
+          // 404 = Not found - endpoint might not exist yet
+          // Only log unexpected errors in development
+          if (statusCode !== 429 && statusCode !== 422 && statusCode !== 404) {
+            if (__DEV__) {
+              console.log('markMessagesAsRead failed for group:', statusCode || error?.message || error);
+            }
+          }
+          // Silently ignore rate limit and validation errors
         }
       }
       
@@ -223,8 +230,47 @@ export default function GroupChatScreen() {
     }
   };
 
-  // Scroll to bottom when messages are first loaded (after content is rendered)
-  // This is handled by onContentSizeChange and onLayout to avoid blank screen
+  // Simple approach: Scroll to bottom ONCE when messages are first loaded for this conversation
+  useEffect(() => {
+    // Only scroll if:
+    // 1. Not loading
+    // 2. We have messages
+    // 3. We haven't scrolled for this conversation yet
+    if (!loading && messages.length > 0 && hasScrolledForThisConversation.current !== id) {
+      // Mark that we've scrolled for this conversation
+      hasScrolledForThisConversation.current = id as string;
+      
+      // Wait for layout to be ready, then scroll once
+      const timeoutId = setTimeout(() => {
+        if (flatListRef.current && messages.length > 0) {
+          try {
+            // Try scrollToEnd first
+            flatListRef.current.scrollToEnd({ animated: false });
+            setHasScrolledToBottom(true);
+            console.log('Scrolled to bottom on initial load');
+          } catch (error) {
+            // Fallback: scroll to last index
+            try {
+              const lastIndex = messages.length - 1;
+              if (lastIndex >= 0) {
+                flatListRef.current.scrollToIndex({ 
+                  index: lastIndex, 
+                  animated: false,
+                  viewPosition: 1
+                });
+                setHasScrolledToBottom(true);
+                console.log('Scrolled to bottom via scrollToIndex');
+              }
+            } catch (scrollError) {
+              console.warn('Scroll failed:', scrollError);
+            }
+          }
+        }
+      }, 600); // Single delay - wait for content to render
+      
+      return () => clearTimeout(timeoutId);
+    }
+  }, [loading, messages.length, id]); // Only depend on loading, messages, and conversation id
 
   // Mark messages as read when group chat is opened
   useFocusEffect(
@@ -239,10 +285,23 @@ export default function GroupChatScreen() {
           // Update unread count to 0 for this group
           updateUnreadCount(Number(id), 0);
           
-          // Group messages marked as read
-        } catch (error) {
-          console.error('Error marking group messages as read:', error);
-          // Don't show error to user - this is a background operation
+          if (__DEV__) {
+            console.log('Group messages marked as read');
+          }
+        } catch (error: any) {
+          // Handle errors gracefully - don't show to user
+          const statusCode = error?.response?.status;
+          
+          // 429 = Too Many Requests (rate limit) - expected, handled gracefully
+          // 422 = Validation error - expected in some cases
+          // 404 = Not found - endpoint might not exist yet
+          // Only log unexpected errors in development
+          if (statusCode !== 429 && statusCode !== 422 && statusCode !== 404) {
+            if (__DEV__) {
+              console.error('Error marking group messages as read:', statusCode || error?.message || error);
+            }
+          }
+          // Silently ignore rate limit and validation errors
         }
       };
 
@@ -1586,6 +1645,7 @@ export default function GroupChatScreen() {
                 keyboardDismissMode={Platform.OS === 'ios' ? 'interactive' : 'on-drag'}
               onScroll={({ nativeEvent }) => {
                 const { contentOffset } = nativeEvent;
+                
                 const isAtTop = contentOffset.y <= 50;
                 
                 // Debounce: only trigger once every 2 seconds
@@ -1617,77 +1677,11 @@ export default function GroupChatScreen() {
                   </View>
                 ) : null
               }
-              onContentSizeChange={(contentWidth, contentHeight) => {
-                // Only scroll if we haven't scrolled yet (initial load) or if not loading more (new messages)
-                if (flatListRef.current && messages.length > 0 && (!hasScrolledToBottom || !loadingMore)) {
-                  requestAnimationFrame(() => {
-                    setTimeout(() => {
-                      if (flatListRef.current && messages.length > 0) {
-                        try {
-                          // Use scrollToEnd as primary method - it's more reliable for scrolling to bottom
-                          flatListRef.current.scrollToEnd({ animated: false });
-                          if (!hasScrolledToBottom) {
-                            setHasScrolledToBottom(true);
-                            // Scrolled to bottom
-                          }
-                        } catch {
-                          // Scroll failed
-                          // Fallback: try scrollToIndex
-                          if (!hasScrolledToBottom) {
-                            try {
-                              const lastIndex = messages.length - 1;
-                              if (lastIndex >= 0) {
-                                flatListRef.current.scrollToIndex({ 
-                                  index: lastIndex, 
-                                  animated: false,
-                                  viewPosition: 1
-                                });
-                                setHasScrolledToBottom(true);
-                                // Scrolled to bottom (fallback)
-                              }
-                            } catch {
-                              // Scroll fallback failed
-                            }
-                          }
-                        }
-                      }
-                    }, 100);
-                  });
-                }
+              onContentSizeChange={() => {
+                // No auto-scroll here - useEffect handles initial scroll once
               }}
               onLayout={() => {
-                // Scroll to bottom on initial layout if we haven't scrolled yet
-                if (flatListRef.current && messages.length > 0 && !loading && !hasScrolledToBottom && isInitialLoad.current) {
-                  // Wait a bit longer to ensure all items are rendered
-                  setTimeout(() => {
-                    if (flatListRef.current && messages.length > 0 && isInitialLoad.current) {
-                      try {
-                        // Use scrollToEnd - it's more reliable when content is already rendered
-                        flatListRef.current.scrollToEnd({ animated: false });
-                        setHasScrolledToBottom(true);
-                        isInitialLoad.current = false;
-                        // Scrolled to bottom
-                      } catch {
-                        // Fallback to scrollToIndex
-                        try {
-                          const lastIndex = messages.length - 1;
-                          if (flatListRef.current && lastIndex >= 0) {
-                            flatListRef.current.scrollToIndex({ 
-                              index: lastIndex, 
-                              animated: false,
-                              viewPosition: 1
-                            });
-                            setHasScrolledToBottom(true);
-                            isInitialLoad.current = false;
-                            // Scrolled to bottom (fallback)
-                          }
-                        } catch {
-                          // Scroll failed
-                        }
-                      }
-                    }
-                  }, 300);
-                }
+                // No auto-scroll here - useEffect handles initial scroll once
               }}
             />
           </TouchableOpacity>
