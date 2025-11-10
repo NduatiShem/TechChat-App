@@ -39,7 +39,10 @@ export const useAuth = () => {
 
 export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [user, setUser] = useState<User | null>(null);
-  const [isLoading, setIsLoading] = useState(true);
+  // CRITICAL: Start with isLoading = false to prevent stuck loading screen
+  // We'll set it to true only when we're actively checking auth
+  // This ensures the app shows immediately, even on reload
+  const [isLoading, setIsLoading] = useState(false);
 
   // Cache user data to AsyncStorage
   const cacheUser = async (userData: User) => {
@@ -53,7 +56,13 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   // Load cached user data from AsyncStorage
   const loadCachedUser = async (): Promise<User | null> => {
     try {
-      const cachedData = await AsyncStorage.getItem(USER_CACHE_KEY);
+      // Add timeout protection for AsyncStorage in builds
+      const cachePromise = AsyncStorage.getItem(USER_CACHE_KEY);
+      const cacheTimeout = new Promise<never>((_, reject) => 
+        setTimeout(() => reject(new Error('Cache load timeout')), 2000)
+      );
+      
+      const cachedData = await Promise.race([cachePromise, cacheTimeout]) as string | null;
       if (cachedData) {
         const parsed = JSON.parse(cachedData);
         if (parsed && parsed.id) {
@@ -61,32 +70,73 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         }
       }
     } catch (error) {
-      console.error('Failed to load cached user:', error);
+      console.warn('Failed to load cached user (may be timeout):', error);
+      // Return null on error - app will continue without cached user
     }
     return null;
   };
 
   const checkAuth = async () => {
+    // CRITICAL: Set multiple safety timeouts to ensure isLoading is ALWAYS set to false
+    // This prevents the app from getting stuck on loading screen
+    const safetyTimeout1 = setTimeout(() => {
+      console.warn('AuthContext: checkAuth safety timeout 1 - forcing loading to false');
+      setIsLoading(false);
+    }, 2000); // 2 seconds max for the entire checkAuth operation
+    
+    const safetyTimeout2 = setTimeout(() => {
+      console.warn('AuthContext: checkAuth safety timeout 2 - forcing loading to false');
+      setIsLoading(false);
+    }, 3000); // 3 seconds backup
+    
     try {
       // Add small delay to ensure secureStorage is fully initialized
-      await new Promise(resolve => setTimeout(resolve, 50));
+      // Use a timeout to prevent hanging in builds
+      const initPromise = new Promise(resolve => setTimeout(resolve, 50));
+      const initTimeoutPromise = new Promise((_, reject) => 
+        setTimeout(() => reject(new Error('SecureStore initialization timeout')), 1500)
+      );
       
-      const token = await secureStorage.getItem('auth_token');
+      try {
+        await Promise.race([initPromise, initTimeoutPromise]);
+      } catch (timeoutError) {
+        console.warn('AuthContext: SecureStore initialization timeout, continuing anyway');
+      }
+      
+      // Get token with timeout protection - shorter timeout for builds
+      let token: string | null = null;
+      try {
+        const tokenPromise = secureStorage.getItem('auth_token');
+        const tokenTimeout = new Promise<never>((_, reject) => 
+          setTimeout(() => reject(new Error('Token fetch timeout')), 2000)
+        );
+        token = await Promise.race([tokenPromise, tokenTimeout]) as string | null;
+      } catch (tokenError) {
+        console.warn('AuthContext: Token fetch failed or timed out:', tokenError);
+        // Continue without token - user will need to login
+        token = null;
+      }
+      
       console.log('AuthContext: Checking auth, token exists:', !!token);
       
       // Validate token format (basic check - should be a non-empty string)
       if (token && typeof token === 'string' && token.trim().length > 0) {
         // First try to load from cache for instant display
-        let cachedUser = await loadCachedUser();
-        if (cachedUser) {
-          setUser(cachedUser);
-          setIsLoading(false);
+        let cachedUser: User | null = null;
+        try {
+          cachedUser = await loadCachedUser();
+          if (cachedUser) {
+            setUser(cachedUser);
+            setIsLoading(false); // Show app immediately with cached user
+          }
+        } catch (cacheError) {
+          console.warn('AuthContext: Failed to load cached user:', cacheError);
         }
 
         try {
           // Add timeout protection for API call
-          // Use a shorter timeout in production to fail faster
-          const timeoutDuration = __DEV__ ? 10000 : 8000;
+          // Use a shorter timeout in builds to fail faster
+          const timeoutDuration = __DEV__ ? 8000 : 5000;
           const profilePromise = authAPI.getProfile();
           const timeoutPromise = new Promise<never>((_, reject) => 
             setTimeout(() => reject(new Error('Profile fetch timeout')), timeoutDuration)
@@ -145,10 +195,14 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
             // Keep cached user if available (already loaded at the start)
             if (!cachedUser) {
               // Try to load from cache one more time
-              cachedUser = await loadCachedUser();
-              if (cachedUser) {
-                setUser(cachedUser);
-              } else {
+              try {
+                cachedUser = await loadCachedUser();
+                if (cachedUser) {
+                  setUser(cachedUser);
+                } else {
+                  setUser(null);
+                }
+              } catch (cacheError2) {
                 setUser(null);
               }
             }
@@ -177,6 +231,9 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       }
       setUser(null);
     } finally {
+      // Clear safety timeouts since we're done
+      clearTimeout(safetyTimeout1);
+      clearTimeout(safetyTimeout2);
       // Always set loading to false, even if there was an error
       setIsLoading(false);
     }
@@ -285,30 +342,117 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     // Wrap in try-catch to prevent crashes during initialization
     let mounted = true;
     let timeoutId: NodeJS.Timeout | null = null;
+    let forceTimeoutId: NodeJS.Timeout | null = null;
+    let immediateTimeoutId: NodeJS.Timeout | null = null;
+    let ultraFastTimeoutId: NodeJS.Timeout | null = null;
+    
+    // CRITICAL: Try to load from cache FIRST to show app immediately
+    // This prevents the loading screen from showing at all if we have cached data
+    const loadFromCacheFirst = async () => {
+      try {
+        const cachedUser = await loadCachedUser();
+        if (cachedUser && mounted) {
+          console.log('AuthContext: Loaded user from cache immediately');
+          setUser(cachedUser);
+          // Don't set isLoading to true - keep it false so app shows immediately
+        }
+      } catch (error) {
+        console.warn('AuthContext: Failed to load from cache:', error);
+      }
+    };
+    
+    // Load from cache immediately (non-blocking)
+    loadFromCacheFirst();
+    
+    // CRITICAL: Set multiple aggressive timeouts to ensure loading is ALWAYS false
+    // These are the last line of defense against stuck loading screens
+    // Ultra-fast timeout: 1 second (for reload scenarios)
+    ultraFastTimeoutId = setTimeout(() => {
+      if (mounted) {
+        console.warn('AuthContext: ULTRA-FAST timeout - forcing loading to false (reload safety)');
+        setIsLoading(false);
+      }
+    }, 1000); // 1 second - very aggressive for reloads
+    
+    // Immediate timeout: 2 seconds
+    immediateTimeoutId = setTimeout(() => {
+      if (mounted) {
+        console.warn('AuthContext: IMMEDIATE timeout - forcing loading to false (critical safety)');
+        setIsLoading(false);
+      }
+    }, 2000); // 2 seconds max - very aggressive
     
     const initializeAuth = async () => {
       // Set a fallback timeout to ensure loading is always set to false
       // This prevents the app from getting stuck on loading screen
+      // Use shorter timeout for builds (3 seconds) vs dev (5 seconds)
+      const maxTimeout = __DEV__ ? 5000 : 3000;
+      
       timeoutId = setTimeout(() => {
         if (mounted) {
           console.warn('AuthContext: Initialization timeout - forcing loading to false');
           setIsLoading(false);
         }
-      }, 15000); // 15 second maximum timeout
+      }, maxTimeout);
+      
+      // Additional aggressive timeout for builds - force loading to false after 2.5 seconds
+      if (!__DEV__) {
+        forceTimeoutId = setTimeout(() => {
+          if (mounted) {
+            console.warn('AuthContext: Force timeout - setting loading to false (build safety)');
+            setIsLoading(false);
+          }
+        }, 2500);
+      }
       
       try {
-        await checkAuth();
-        // If checkAuth completes successfully, clear the timeout
+        // Only set loading to true when we actually start checking auth
+        // This way, if checkAuth hangs, we've already shown the app
+        setIsLoading(true);
+        
+        // Wrap checkAuth in a timeout to prevent hanging
+        const checkAuthPromise = checkAuth();
+        const checkAuthTimeout = new Promise<never>((_, reject) => 
+          setTimeout(() => reject(new Error('checkAuth timeout')), maxTimeout - 500)
+        );
+        
+        await Promise.race([checkAuthPromise, checkAuthTimeout]);
+        
+        // If checkAuth completes successfully, clear the timeouts
         if (timeoutId) {
           clearTimeout(timeoutId);
           timeoutId = null;
         }
+        if (forceTimeoutId) {
+          clearTimeout(forceTimeoutId);
+          forceTimeoutId = null;
+        }
+        if (immediateTimeoutId) {
+          clearTimeout(immediateTimeoutId);
+          immediateTimeoutId = null;
+        }
+        if (ultraFastTimeoutId) {
+          clearTimeout(ultraFastTimeoutId);
+          ultraFastTimeoutId = null;
+        }
       } catch (error) {
         console.error('AuthContext: Initialization error:', error);
-        // Clear timeout since we're handling the error
+        // Clear timeouts since we're handling the error
         if (timeoutId) {
           clearTimeout(timeoutId);
           timeoutId = null;
+        }
+        if (forceTimeoutId) {
+          clearTimeout(forceTimeoutId);
+          forceTimeoutId = null;
+        }
+        if (immediateTimeoutId) {
+          clearTimeout(immediateTimeoutId);
+          immediateTimeoutId = null;
+        }
+        if (ultraFastTimeoutId) {
+          clearTimeout(ultraFastTimeoutId);
+          ultraFastTimeoutId = null;
         }
         // Ensure loading is set to false even on error
         if (mounted) {
@@ -317,12 +461,24 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       }
     };
     
-    initializeAuth();
+    // Small delay before starting auth check to allow cache to load first
+    setTimeout(() => {
+      initializeAuth();
+    }, 100);
     
     return () => {
       mounted = false;
       if (timeoutId) {
         clearTimeout(timeoutId);
+      }
+      if (forceTimeoutId) {
+        clearTimeout(forceTimeoutId);
+      }
+      if (immediateTimeoutId) {
+        clearTimeout(immediateTimeoutId);
+      }
+      if (ultraFastTimeoutId) {
+        clearTimeout(ultraFastTimeoutId);
       }
     };
   }, []);

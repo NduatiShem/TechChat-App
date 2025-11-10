@@ -289,7 +289,7 @@ function AppLayout() {
   // Hide splash screen once app is ready
   useEffect(() => {
     if (!isLoading) {
-      // App initialization is complete, hide splash screen
+      // App initialization is complete, hide splash screen immediately
       const hideSplash = async () => {
         try {
           await SplashScreen.hideAsync();
@@ -300,12 +300,43 @@ function AppLayout() {
         }
       };
       
-      // Small delay to ensure smooth transition
-      const timer = setTimeout(() => {
-        hideSplash();
-      }, 100);
+      // Hide immediately - no delay needed
+      hideSplash();
+    } else {
+      // If still loading, set multiple timeouts to hide splash anyway (safety for builds)
+      // This is critical to prevent stuck loading screens, especially on reload
+      const safetyTimer1 = setTimeout(async () => {
+        try {
+          await SplashScreen.hideAsync();
+          console.log('Splash screen hidden (loading safety timeout 1)');
+        } catch (error) {
+          console.error('Error hiding splash screen (safety timeout 1):', error);
+        }
+      }, 1000); // Hide after 1 second even if still loading (ultra-fast for reloads)
       
-      return () => clearTimeout(timer);
+      const safetyTimer2 = setTimeout(async () => {
+        try {
+          await SplashScreen.hideAsync();
+          console.log('Splash screen hidden (loading safety timeout 2)');
+        } catch (error) {
+          console.error('Error hiding splash screen (safety timeout 2):', error);
+        }
+      }, 2000); // Hide after 2 seconds even if still loading
+      
+      const safetyTimer3 = setTimeout(async () => {
+        try {
+          await SplashScreen.hideAsync();
+          console.log('Splash screen hidden (loading safety timeout 3)');
+        } catch (error) {
+          console.error('Error hiding splash screen (safety timeout 3):', error);
+        }
+      }, 3000); // Hide after 3 seconds even if still loading
+      
+      return () => {
+        clearTimeout(safetyTimer1);
+        clearTimeout(safetyTimer2);
+        clearTimeout(safetyTimer3);
+      };
     }
   }, [isLoading]);
 
@@ -332,7 +363,30 @@ function AppLayout() {
 export default function RootLayout() {
   // Ensure splash screen hides even if there's an error
   useEffect(() => {
-    // Fallback: Hide splash screen after 5 seconds max (in case of errors)
+    // CRITICAL: Multiple aggressive fallbacks to ensure splash screen ALWAYS hides
+    // This prevents the app from getting stuck on splash screen, especially on reload
+    
+    // Fallback 1: Hide after 1 second (ultra-aggressive for reloads)
+    const ultraFastTimer = setTimeout(async () => {
+      try {
+        await SplashScreen.hideAsync();
+        console.log('Splash screen hidden (ultra-fast fallback)');
+      } catch (error) {
+        console.error('Error hiding splash screen (ultra-fast fallback):', error);
+      }
+    }, 1000);
+    
+    // Fallback 2: Hide after 1.5 seconds (very aggressive)
+    const aggressiveTimer1 = setTimeout(async () => {
+      try {
+        await SplashScreen.hideAsync();
+        console.log('Splash screen hidden (aggressive fallback 1)');
+      } catch (error) {
+        console.error('Error hiding splash screen (aggressive fallback 1):', error);
+      }
+    }, 1500);
+
+    // Fallback 3: Hide after 2 seconds (critical safety)
     const fallbackTimer = setTimeout(async () => {
       try {
         await SplashScreen.hideAsync();
@@ -340,9 +394,24 @@ export default function RootLayout() {
       } catch (error) {
         console.error('Error hiding splash screen (fallback):', error);
       }
-    }, 5000);
+    }, 2000);
 
-    return () => clearTimeout(fallbackTimer);
+    // Fallback 4: Hide after 3 seconds (last resort)
+    const lastResortTimer = setTimeout(async () => {
+      try {
+        await SplashScreen.hideAsync();
+        console.log('Splash screen hidden (last resort)');
+      } catch (error) {
+        console.error('Error hiding splash screen (last resort):', error);
+      }
+    }, 3000);
+
+    return () => {
+      clearTimeout(ultraFastTimer);
+      clearTimeout(aggressiveTimer1);
+      clearTimeout(fallbackTimer);
+      clearTimeout(lastResortTimer);
+    };
   }, []);
 
   return (
