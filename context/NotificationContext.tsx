@@ -1,6 +1,7 @@
 import { authAPI } from '@/services/api';
 import { badgeService } from '@/services/badgeService';
 import { notificationService } from '@/services/notificationService';
+import { useAuth } from '@/context/AuthContext';
 import Constants from 'expo-constants';
 import * as Device from 'expo-device';
 import * as Notifications from 'expo-notifications';
@@ -53,11 +54,13 @@ interface NotificationProviderProps {
 }
 
 export const NotificationProvider: React.FC<NotificationProviderProps> = ({ children }) => {
+  const { isAuthenticated } = useAuth();
   const [unreadCount, setUnreadCount] = useState(0);
   const [groupUnreadCount, setGroupUnreadCount] = useState(0); // Total unread count for groups only
   const [conversationCounts, setConversationCounts] = useState<Record<number, number>>({});
   const [expoPushToken, setExpoPushToken] = useState<string | null>(null);
   const [appState, setAppState] = useState(AppState.currentState);
+  const [tokenRegistrationAttempted, setTokenRegistrationAttempted] = useState(false);
 
   const updateUnreadCount = (conversationId: number, count: number) => {
     setConversationCounts(prev => {
@@ -163,15 +166,39 @@ export const NotificationProvider: React.FC<NotificationProviderProps> = ({ chil
       }
       
       if (token?.data) {
-        console.log('Expo Push Token:', token.data);
+        console.log('✅ Expo Push Token generated:', token.data);
         setExpoPushToken(token.data);
         
-        // Register token with backend
-        try {
-          await authAPI.registerFcmToken(token.data);
-          console.log('Expo push token registered with backend');
-        } catch (error) {
-          console.error('Failed to register Expo push token with backend:', error);
+        // Don't register token here if user is not authenticated
+        // It will be registered when user logs in (see useEffect above)
+        if (isAuthenticated) {
+          try {
+            console.log('📤 Attempting to register FCM token with backend...');
+            const response = await authAPI.registerFcmToken(token.data);
+            console.log('✅ Expo push token registered with backend successfully:', response);
+            setTokenRegistrationAttempted(true);
+          } catch (error: any) {
+            console.error('❌ Failed to register Expo push token with backend:', error);
+            console.error('Error details:', {
+              message: error?.message,
+              status: error?.response?.status,
+              statusText: error?.response?.statusText,
+              data: error?.response?.data,
+              url: error?.config?.url,
+            });
+            
+            // Log specific error types
+            if (error?.response?.status === 401) {
+              console.warn('⚠️ Authentication error - token will be registered after login');
+            } else if (error?.response?.status === 404) {
+              console.error('❌ Backend endpoint not found - check if /api/user/fcm-token exists');
+            } else if (error?.response?.status === 500) {
+              console.error('❌ Backend server error - check Laravel logs');
+            }
+            setTokenRegistrationAttempted(false);
+          }
+        } else {
+          console.log('⏳ User not authenticated - FCM token will be registered after login');
         }
         
         return token.data;
@@ -233,6 +260,32 @@ export const NotificationProvider: React.FC<NotificationProviderProps> = ({ chil
       console.error('Error showing foreground notification:', error);
     }
   };
+
+  // Register FCM token when user becomes authenticated
+  useEffect(() => {
+    const registerTokenIfAuthenticated = async () => {
+      // Only register if user is authenticated and we have a token
+      if (isAuthenticated && expoPushToken && !tokenRegistrationAttempted) {
+        try {
+          console.log('🔐 User authenticated - registering FCM token...');
+          setTokenRegistrationAttempted(true);
+          await authAPI.registerFcmToken(expoPushToken);
+          console.log('✅ FCM token registered after authentication');
+        } catch (error: any) {
+          console.error('❌ Failed to register FCM token after authentication:', error);
+          console.error('Error details:', {
+            message: error?.message,
+            status: error?.response?.status,
+            data: error?.response?.data,
+          });
+          // Reset flag so we can try again
+          setTokenRegistrationAttempted(false);
+        }
+      }
+    };
+
+    registerTokenIfAuthenticated();
+  }, [isAuthenticated, expoPushToken, tokenRegistrationAttempted]);
 
   useEffect(() => {
     // Initialize notifications with better error handling
