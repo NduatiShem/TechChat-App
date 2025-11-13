@@ -346,13 +346,30 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     let immediateTimeoutId: NodeJS.Timeout | null = null;
     let ultraFastTimeoutId: NodeJS.Timeout | null = null;
     
-    // CRITICAL: Try to load from cache FIRST to show app immediately
-    // This prevents the loading screen from showing at all if we have cached data
+    // CRITICAL: Only load from cache if we have a valid token
+    // This prevents showing cached user when token is invalid/missing
     const loadFromCacheFirst = async () => {
       try {
+        // First check if token exists
+        const token = await secureStorage.getItem('auth_token');
+        if (!token || typeof token !== 'string' || token.trim().length === 0) {
+          // No token - clear cache and don't show cached user
+          console.log('AuthContext: No token found, clearing cache');
+          try {
+            await AsyncStorage.removeItem(USER_CACHE_KEY);
+            if (mounted) {
+              setUser(null);
+            }
+          } catch (clearError) {
+            console.warn('AuthContext: Failed to clear cache:', clearError);
+          }
+          return;
+        }
+        
+        // Token exists - load cached user for instant display
         const cachedUser = await loadCachedUser();
         if (cachedUser && mounted) {
-          console.log('AuthContext: Loaded user from cache immediately');
+          console.log('AuthContext: Loaded user from cache (token exists)');
           setUser(cachedUser);
           // Don't set isLoading to true - keep it false so app shows immediately
         }

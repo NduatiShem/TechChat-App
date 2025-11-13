@@ -222,7 +222,13 @@ export const authAPI = {
   changePassword: (current_password: string, new_password: string, new_password_confirmation: string) =>
     api.post('/user/change-password', { current_password, new_password, new_password_confirmation }),
   
-  registerFcmToken: (fcmToken: string) => api.post('/user/fcm-token', { fcm_token: fcmToken }),
+  registerFcmToken: (payload: {
+    fcm_token?: string;
+    expo_push_token?: string;
+    device_type?: string;
+    app_version?: string | null;
+    runtime_version?: string | null;
+  }) => api.post('/user/fcm-token', payload),
   
   uploadAvatar: (formData: FormData) => {
     // Use EXACT same pattern as messagesAPI.sendMessage

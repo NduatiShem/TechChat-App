@@ -31,6 +31,7 @@
         "backgroundColor": "#283891"
       },
       "package": "com.techchat.app",
+      "googleServicesFile": "./google-services.json",
       "permissions": [
         "RECEIVE_BOOT_COMPLETED",
         "VIBRATE",
@@ -38,7 +39,7 @@
         "INTERNET",
         "ACCESS_NETWORK_STATE"
       ],
-      "softwareKeyboardLayoutMode": "adjustResize"
+      "softwareKeyboardLayoutMode": "resize"
     },
     "web": {
       "favicon": "./assets/icons/Icon-48.png"
@@ -48,6 +49,7 @@
       "expo-router",
       "expo-dev-client",
       "./plugins/withAndroidKeyboard.js",
+      "./plugins/withGoogleServices.js",
       [
         "expo-notifications",
         {

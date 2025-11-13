@@ -111,7 +111,7 @@ export default function GroupChatScreen() {
   const { id } = useLocalSearchParams();
   const { currentTheme } = useTheme();
   const { user } = useAuth();
-  const { updateUnreadCount } = useNotifications();
+  const { updateUnreadCount, setActiveConversation, clearActiveConversation } = useNotifications();
   const insets = useSafeAreaInsets();
   const ENABLE_MARK_AS_READ = true; // Enable mark as read functionality for groups
   const ENABLE_DELETE_MESSAGE = true; // Enable delete - route exists
@@ -275,6 +275,12 @@ export default function GroupChatScreen() {
   // Mark messages as read when group chat is opened
   useFocusEffect(
     useCallback(() => {
+      // Set this conversation as active to suppress notifications
+      const conversationId = Number(id);
+      if (conversationId) {
+        setActiveConversation(conversationId);
+      }
+
       const markGroupMessagesAsRead = async () => {
         if (!ENABLE_MARK_AS_READ || !id || !user) return;
         
@@ -310,8 +316,12 @@ export default function GroupChatScreen() {
         markGroupMessagesAsRead();
       }, 300);
 
-      return () => clearTimeout(timer);
-    }, [id, user, ENABLE_MARK_AS_READ, updateUnreadCount])
+      return () => {
+        clearTimeout(timer);
+        // Clear active conversation when screen loses focus
+        clearActiveConversation();
+      };
+    }, [id, user, ENABLE_MARK_AS_READ, updateUnreadCount, setActiveConversation, clearActiveConversation])
   );
 
   // Load more messages function

@@ -8,7 +8,7 @@ import { MaterialCommunityIcons } from "@expo/vector-icons";
 import { Stack, Tabs, usePathname } from "expo-router";
 import * as SplashScreen from "expo-splash-screen";
 import { StatusBar } from "expo-status-bar";
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ActivityIndicator, AppState, View } from "react-native";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 import "../global.css";
@@ -283,8 +283,34 @@ function AppLayout() {
   const { isAuthenticated, isLoading, user } = useAuth();
   const { currentTheme } = useTheme();
   const isDark = currentTheme === 'dark';
+  
+  // Additional safety check: Verify token exists before showing main app
+  // This prevents showing main app when token is missing (even if cached user exists)
+  // MUST be declared at top level (before any returns) to follow Rules of Hooks
+  const [hasToken, setHasToken] = useState<boolean | null>(null);
 
   console.log('AppLayout: isLoading:', isLoading, 'isAuthenticated:', isAuthenticated, 'user:', user?.name);
+
+  // Check token existence
+  // Run when isLoading changes OR when isAuthenticated changes (e.g., after login)
+  useEffect(() => {
+    const checkToken = async () => {
+      try {
+        const { secureStorage } = await import('@/utils/secureStore');
+        const token = await secureStorage.getItem('auth_token');
+        const tokenExists = !!(token && typeof token === 'string' && token.trim().length > 0);
+        console.log('AppLayout: Token check result:', tokenExists, 'isAuthenticated:', isAuthenticated);
+        setHasToken(tokenExists);
+      } catch (error) {
+        console.error('AppLayout: Error checking token:', error);
+        setHasToken(false); // Assume no token on error
+      }
+    };
+    
+    if (!isLoading) {
+      checkToken();
+    }
+  }, [isLoading, isAuthenticated]); // Also check when authentication state changes
 
   // Hide splash screen once app is ready
   useEffect(() => {
@@ -340,8 +366,8 @@ function AppLayout() {
     }
   }, [isLoading]);
 
-  // Show loading screen while checking authentication
-  if (isLoading) {
+  // Show loading screen while checking authentication or token
+  if (isLoading || hasToken === null) {
     return (
       <View className={`flex-1 justify-center items-center ${isDark ? 'bg-gray-900' : 'bg-white'}`}>
         <ActivityIndicator size="large" color="#283891" />
@@ -349,13 +375,14 @@ function AppLayout() {
     );
   }
 
-  // Show auth screens if not authenticated
-  if (!isAuthenticated) {
-    console.log('AppLayout: Showing auth screens');
+  // Show auth screens if not authenticated OR if no token exists
+  // This ensures we never show main app without a valid token
+  if (!isAuthenticated || !hasToken) {
+    console.log('AppLayout: Showing auth screens', { isAuthenticated, hasToken });
     return <AuthLayout />;
   }
 
-  // Show main app if authenticated
+  // Show main app if authenticated AND token exists
   console.log('AppLayout: Showing main app');
   return <AppTabsLayout />;
 }

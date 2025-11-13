@@ -69,6 +69,7 @@ export default function ProfileScreen() {
     setTheme(themes[nextIndex]);
   };
 
+
   const handlePickAvatar = async () => {
     try {
       // Request permission first

@@ -99,7 +99,7 @@ export default function UserChatScreen() {
   const { id } = useLocalSearchParams();
   const { currentTheme } = useTheme();
   const { user } = useAuth();
-  const { updateUnreadCount } = useNotifications();
+  const { updateUnreadCount, setActiveConversation, clearActiveConversation } = useNotifications();
   const insets = useSafeAreaInsets();
   const ENABLE_MARK_AS_READ = true; // Enable mark as read functionality
   const ENABLE_DELETE_MESSAGE = true; // Enable delete - route exists
@@ -409,6 +409,12 @@ export default function UserChatScreen() {
   // Mark messages as read when conversation is opened
   useFocusEffect(
     useCallback(() => {
+      // Set this conversation as active to suppress notifications
+      const conversationId = Number(id);
+      if (conversationId) {
+        setActiveConversation(conversationId);
+      }
+
       const markMessagesAsRead = async () => {
         if (!ENABLE_MARK_AS_READ || !id || !user) return;
         
@@ -446,8 +452,12 @@ export default function UserChatScreen() {
         markMessagesAsRead();
       }, 300);
 
-      return () => clearTimeout(timer);
-    }, [id, user, ENABLE_MARK_AS_READ, updateUnreadCount])
+      return () => {
+        clearTimeout(timer);
+        // Clear active conversation when screen loses focus
+        clearActiveConversation();
+      };
+    }, [id, user, ENABLE_MARK_AS_READ, updateUnreadCount, setActiveConversation, clearActiveConversation])
   );
 
   // Handle mobile hardware back button

@@ -39,6 +39,5 @@ yarn-error.*
 # Firebase / FCM credentials (NEVER commit these!)
 *-firebase-adminsdk-*.json
 firebase-service-account.json
-google-services.json
 
 app-example
