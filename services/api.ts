@@ -308,8 +308,28 @@ export const usersAPI = {
 export const groupsAPI = {
   getAll: () => api.get('/groups'),
   
-  create: (data: { name: string; description?: string; avatar?: string; members: number[] }) =>
-    api.post('/groups', data),
+  create: (data: { name: string; description?: string; avatar?: string; members?: number[]; user_ids?: number[] }) => {
+    const { name, description, avatar } = data;
+    const memberIds = data.user_ids ?? data.members ?? [];
+
+    const payload: Record<string, any> = {
+      name,
+    };
+
+    if (description) {
+      payload.description = description;
+    }
+
+    if (avatar) {
+      payload.avatar = avatar;
+    }
+
+    if (memberIds.length > 0) {
+      payload.user_ids = memberIds;
+    }
+
+    return api.post('/groups', payload);
+  },
   
   getGroup: (id: number) => api.get(`/groups/${id}`),
   

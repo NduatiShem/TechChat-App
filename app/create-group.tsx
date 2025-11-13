@@ -101,7 +101,7 @@ export default function CreateGroupScreen() {
       await groupsAPI.create({
         name: groupName.trim(),
         description: description.trim() || undefined,
-        members: selectedUsers,
+        user_ids: selectedUsers,
       });
 
       Alert.alert(
