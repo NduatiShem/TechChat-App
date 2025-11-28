@@ -679,13 +679,36 @@ export default function UserChatScreen() {
         fullResData: res.data
       });
       
+      // Ensure the message has a valid ID - if not, use a temporary unique ID
+      if (!newMessage.id || newMessage.id === 0) {
+        console.warn('Message response missing ID, using temporary ID');
+        newMessage.id = Date.now() + Math.random(); // Temporary unique ID
+      }
+      
       setMessages(prev => {
         // Check if message already exists to prevent duplicates
-        const messageExists = prev.some(msg => msg.id === newMessage.id);
-        if (messageExists) {
-          return prev;
+        // Only check if newMessage has a valid ID
+        if (newMessage.id && newMessage.id !== 0) {
+          const messageExists = prev.some(msg => msg.id === newMessage.id);
+          if (messageExists) {
+            console.log('Message already exists in state, skipping:', newMessage.id);
+            return prev;
+          }
         }
-        const updatedMessages = [...prev, newMessage];
+        
+        console.log('Adding new message to state:', {
+          messageId: newMessage.id,
+          messageText: newMessage.message?.substring(0, 50),
+          currentMessagesCount: prev.length,
+          newMessagesCount: prev.length + 1
+        });
+        
+        // Add new message and sort by created_at to ensure correct order
+        const updatedMessages = [...prev, newMessage].sort((a, b) => {
+          const dateA = new Date(a.created_at).getTime();
+          const dateB = new Date(b.created_at).getTime();
+          return dateA - dateB; // Ascending order (oldest first)
+        });
         
         // Scroll to bottom after message is added to state
         // Use requestAnimationFrame and setTimeout to ensure state update is reflected
@@ -1702,11 +1725,17 @@ export default function UserChatScreen() {
               ref={flatListRef}
               data={messages}
               renderItem={renderItem}
+              extraData={messages.length} // Force re-render when messages array changes
               keyExtractor={(item, index) => {
-                if (item && item.id !== undefined && item.id !== null) {
-                  return `message-${item.id}-${index}`;
+                // Use message ID if available, otherwise use index with a stable fallback
+                if (item && item.id !== undefined && item.id !== null && item.id !== 0) {
+                  return `message-${item.id}`;
                 }
-                return `message-fallback-${index}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+                // For messages without IDs, use index and created_at if available
+                const fallbackKey = item?.created_at 
+                  ? `message-fallback-${index}-${item.created_at}` 
+                  : `message-fallback-${index}-${Math.random().toString(36).slice(2)}`;
+                return fallbackKey;
               }}
               style={{ flex: 1 }}
               contentContainerStyle={{ 
