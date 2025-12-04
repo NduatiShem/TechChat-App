@@ -284,6 +284,9 @@ export const messagesAPI = {
   getUnreadCount: () => api.get('/messages/unread-count'),
   
   deleteMessage: (messageId: number) => api.delete(`/messages/${messageId}`),
+  
+  editMessage: (messageId: number, message: string) => 
+    api.put(`/messages/${messageId}`, { message }),
 };
 
 // Conversations API

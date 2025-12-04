@@ -17,10 +17,10 @@ import { MaterialCommunityIcons, MaterialIcons } from '@expo/vector-icons';
 import { useFocusEffect } from '@react-navigation/native';
 import { Picker } from 'emoji-mart-native';
 import * as DocumentPicker from 'expo-document-picker';
-import * as ImagePicker from 'expo-image-picker';
 import * as FileSystem from 'expo-file-system/legacy';
-import * as Sharing from 'expo-sharing';
+import * as ImagePicker from 'expo-image-picker';
 import { router, useLocalSearchParams } from 'expo-router';
+import * as Sharing from 'expo-sharing';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { ActivityIndicator, Alert, BackHandler, FlatList, Image, Keyboard, KeyboardAvoidingView, Modal, Platform, StatusBar, Text, TextInput, TouchableOpacity, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -37,6 +37,7 @@ interface Message {
   group_id?: number;
   created_at: string;
   read_at?: string | null;
+  edited_at?: string | null;
   attachments?: {
     id: number;
     name: string;
@@ -121,6 +122,8 @@ export default function UserChatScreen() {
   const [replyingTo, setReplyingTo] = useState<any>(null);
   const [showImagePreview, setShowImagePreview] = useState<string | null>(null);
   const [showMessageOptions, setShowMessageOptions] = useState<number | null>(null);
+  const [editingMessage, setEditingMessage] = useState<Message | null>(null);
+  const [editText, setEditText] = useState('');
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
   const [keyboardHeight, setKeyboardHeight] = useState(0);
   const flatListRef = useRef<FlatList<Message>>(null);
@@ -1046,6 +1049,74 @@ export default function UserChatScreen() {
     }
   };
 
+  // Check if message can be edited (within 15 minutes)
+  const canEditMessage = (message: Message): boolean => {
+    if (!message.created_at) return false;
+    const messageDate = new Date(message.created_at);
+    const now = new Date();
+    const diffInMinutes = (now.getTime() - messageDate.getTime()) / (1000 * 60);
+    return diffInMinutes <= 15; // 15 minute limit
+  };
+
+  // Handle edit message
+  const handleEditMessage = (message: Message) => {
+    if (!canEditMessage(message)) {
+      Alert.alert(
+        'Cannot Edit',
+        'You can only edit messages within 15 minutes of sending them.',
+        [{ text: 'OK' }]
+      );
+      setShowMessageOptions(null);
+      return;
+    }
+    
+    setEditingMessage(message);
+    setEditText(message.message || '');
+    setShowMessageOptions(null);
+  };
+
+  // Handle save edited message
+  const handleSaveEdit = async () => {
+    if (!editingMessage || !editText.trim()) {
+      setEditingMessage(null);
+      setEditText('');
+      return;
+    }
+
+    try {
+      const response = await messagesAPI.editMessage(editingMessage.id, editText.trim());
+      
+      // Update message in local state
+      setMessages(prev => prev.map(msg => 
+        msg.id === editingMessage.id 
+          ? { ...msg, message: editText.trim(), edited_at: response.data.edited_at || new Date().toISOString() }
+          : msg
+      ));
+      
+      setEditingMessage(null);
+      setEditText('');
+    } catch (error: any) {
+      console.error('Error editing message:', error);
+      
+      if (error?.response?.status === 403) {
+        Alert.alert('Permission Denied', 'You can only edit your own messages.');
+      } else if (error?.response?.status === 400) {
+        Alert.alert('Cannot Edit', error?.response?.data?.message || 'This message can no longer be edited.');
+      } else {
+        Alert.alert('Error', 'Failed to edit message. Please try again.');
+      }
+      
+      setEditingMessage(null);
+      setEditText('');
+    }
+  };
+
+  // Handle cancel edit
+  const handleCancelEdit = () => {
+    setEditingMessage(null);
+    setEditText('');
+  };
+
   // Handle delete message
   const handleDeleteMessage = async (messageId: number) => {
     if (!ENABLE_DELETE_MESSAGE) {
@@ -1591,7 +1662,10 @@ export default function UserChatScreen() {
                   fontSize: 10, 
                   color: isMine ? '#E0E7FF' : '#6B7280',
                   marginRight: 4,
-                }}>{timestamp}</Text>
+                }}>
+                  {timestamp}
+                  {item.edited_at && ' • Edited'}
+                </Text>
                 {/* Show read receipt only for messages we sent */}
                 {isMine && (
                   <MessageStatus 
@@ -1636,6 +1710,22 @@ export default function UserChatScreen() {
               >
                 <MaterialIcons name="reply" size={16} color={isDark ? '#fff' : '#000'} />
                 <Text style={{ marginLeft: 8, color: isDark ? '#fff' : '#000', fontSize: 14 }}>Reply</Text>
+              </TouchableOpacity>
+            )}
+            
+            {/* Show Edit option for your own messages (within time limit) */}
+            {isMine && canEditMessage(item) && (
+              <TouchableOpacity
+                onPress={() => handleEditMessage(item)}
+                style={{
+                  flexDirection: 'row',
+                  alignItems: 'center',
+                  paddingVertical: 8,
+                  paddingHorizontal: 12,
+                }}
+              >
+                <MaterialIcons name="edit" size={16} color={isDark ? '#fff' : '#000'} />
+                <Text style={{ marginLeft: 8, color: isDark ? '#fff' : '#000', fontSize: 14 }}>Edit</Text>
               </TouchableOpacity>
             )}
             
@@ -1964,8 +2054,35 @@ export default function UserChatScreen() {
             />
           </TouchableOpacity>
         )}
+        {/* Edit Message Preview */}
+        {editingMessage && (
+          <View style={{
+            backgroundColor: isDark ? '#374151' : '#F3F4F6',
+            paddingHorizontal: 16,
+            paddingVertical: 12,
+            borderTopWidth: 1,
+            borderTopColor: isDark ? '#4B5563' : '#D1D5DB',
+            flexDirection: 'row',
+            alignItems: 'center',
+          }}>
+            <MaterialIcons name="edit" size={20} color="#283891" />
+            <Text style={{ 
+              marginLeft: 8, 
+              color: isDark ? '#fff' : '#111827',
+              fontSize: 14,
+              fontWeight: '500',
+              flex: 1,
+            }}>
+              Editing message
+            </Text>
+            <TouchableOpacity onPress={handleCancelEdit}>
+              <MaterialCommunityIcons name="close-circle" size={24} color="#6B7280" />
+            </TouchableOpacity>
+          </View>
+        )}
+        
         {/* Reply Preview */}
-        {replyingTo && (
+        {replyingTo && !editingMessage && (
           <ReplyPreview
             replyTo={replyingTo}
             onCancel={handleCancelReply}
@@ -2045,26 +2162,28 @@ export default function UserChatScreen() {
               minHeight: 50,
             }}
           >
-            {/* Emoji Button */}
-            <TouchableOpacity 
-              onPress={() => setShowEmoji(v => !v)} 
-              style={{ 
-                width: 42, 
-                height: 42, 
-                borderRadius: 21, 
-                alignItems: 'center', 
-                justifyContent: 'center',
-                marginRight: 4,
-              }}
-            >
-              <MaterialCommunityIcons name="emoticon-outline" size={24} color="#6B7280" />
-            </TouchableOpacity>
+            {/* Emoji Button - Hide when editing */}
+            {!editingMessage && (
+              <TouchableOpacity 
+                onPress={() => setShowEmoji(v => !v)} 
+                style={{ 
+                  width: 42, 
+                  height: 42, 
+                  borderRadius: 21, 
+                  alignItems: 'center', 
+                  justifyContent: 'center',
+                  marginRight: 4,
+                }}
+              >
+                <MaterialCommunityIcons name="emoticon-outline" size={24} color="#6B7280" />
+              </TouchableOpacity>
+            )}
 
             {/* Text Input */}
             <TextInput
-              value={input}
-              onChangeText={setInput}
-              placeholder="Message"
+              value={editingMessage ? editText : input}
+              onChangeText={editingMessage ? setEditText : setInput}
+              placeholder={editingMessage ? "Edit message..." : "Message"}
               placeholderTextColor={isDark ? '#9CA3AF' : '#6B7280'}
               style={{
                 flex: 1,
@@ -2079,43 +2198,62 @@ export default function UserChatScreen() {
               }}
               editable={!sending}
               multiline
-              onSubmitEditing={handleSend}
-              returnKeyType="send"
+              onSubmitEditing={editingMessage ? handleSaveEdit : handleSend}
+              returnKeyType={editingMessage ? "done" : "send"}
               blurOnSubmit={false}
             />
 
-            {/* Gallery Button (WhatsApp-style) */}
-            <TouchableOpacity 
-              onPress={pickImage} 
-              style={{ 
-                width: 42, 
-                height: 42, 
-                borderRadius: 21, 
-                alignItems: 'center', 
-                justifyContent: 'center',
-                marginRight: 4,
-              }}
-            >
-              <MaterialCommunityIcons name="image" size={24} color="#6B7280" />
-            </TouchableOpacity>
+            {/* Gallery Button (WhatsApp-style) - Hide when editing */}
+            {!editingMessage && (
+              <TouchableOpacity 
+                onPress={pickImage} 
+                style={{ 
+                  width: 42, 
+                  height: 42, 
+                  borderRadius: 21, 
+                  alignItems: 'center', 
+                  justifyContent: 'center',
+                  marginRight: 4,
+                }}
+              >
+                <MaterialCommunityIcons name="image" size={24} color="#6B7280" />
+              </TouchableOpacity>
+            )}
 
-            {/* Attachment Button */}
-            <TouchableOpacity 
-              onPress={pickFile} 
-              style={{ 
-                width: 42, 
-                height: 42, 
-                borderRadius: 21, 
-                alignItems: 'center', 
-                justifyContent: 'center',
-                marginRight: 4,
-              }}
-            >
-              <MaterialCommunityIcons name="paperclip" size={24} color="#6B7280" />
-            </TouchableOpacity>
+            {/* Attachment Button - Hide when editing */}
+            {!editingMessage && (
+              <TouchableOpacity 
+                onPress={pickFile} 
+                style={{ 
+                  width: 42, 
+                  height: 42, 
+                  borderRadius: 21, 
+                  alignItems: 'center', 
+                  justifyContent: 'center',
+                  marginRight: 4,
+                }}
+              >
+                <MaterialCommunityIcons name="paperclip" size={24} color="#6B7280" />
+              </TouchableOpacity>
+            )}
 
-            {/* Send/Mic Button */}
-            {(!input.trim() && !attachment && !voiceRecording) ? (
+            {/* Send/Mic/Edit Button */}
+            {editingMessage ? (
+              <TouchableOpacity 
+                onPress={handleSaveEdit} 
+                disabled={!editText.trim() || sending} 
+                style={{ 
+                  width: 42, 
+                  height: 42, 
+                  borderRadius: 21, 
+                  backgroundColor: (!editText.trim() || sending) ? '#A5B4FC' : '#39B54A',
+                  alignItems: 'center', 
+                  justifyContent: 'center',
+                }}
+              >
+                <MaterialIcons name="check" size={24} color="#fff" />
+              </TouchableOpacity>
+            ) : (!input.trim() && !attachment && !voiceRecording) ? (
               <TouchableOpacity 
                 onPress={handleVoiceRecording} 
                 style={{ 
