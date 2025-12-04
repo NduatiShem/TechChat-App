@@ -1,18 +1,18 @@
+import GroupAvatar from '@/components/GroupAvatar';
+import LinkText from '@/components/LinkText';
 import ReplyBubble from '@/components/ReplyBubble';
 import ReplyPreview from '@/components/ReplyPreview';
 import UserAvatar from '@/components/UserAvatar';
-import GroupAvatar from '@/components/GroupAvatar';
+import VideoPlayer from '@/components/VideoPlayer';
 import VoiceMessageBubble from '@/components/VoiceMessageBubble';
 import VoicePlayer from '@/components/VoicePlayer';
 import VoiceRecorder from '@/components/VoiceRecorder';
-import LinkText from '@/components/LinkText';
-import VideoPlayer from '@/components/VideoPlayer';
-import { isVideoAttachment } from '@/utils/textUtils';
 import { AppConfig } from '@/config/app.config';
 import { useAuth } from '@/context/AuthContext';
 import { useNotifications } from '@/context/NotificationContext';
 import { useTheme } from '@/context/ThemeContext';
 import { groupsAPI, messagesAPI, usersAPI } from '@/services/api';
+import { isVideoAttachment } from '@/utils/textUtils';
 import { MaterialCommunityIcons, MaterialIcons } from '@expo/vector-icons';
 import { useFocusEffect } from '@react-navigation/native';
 import { Picker } from 'emoji-mart-native';
@@ -145,9 +145,11 @@ export default function GroupChatScreen() {
   const [hasScrolledToBottom, setHasScrolledToBottom] = useState(false);
 
   // Fetch messages
-  const fetchMessages = async () => {
+  const fetchMessages = useCallback(async (showLoading = true) => {
     try {
-      setLoading(true);
+      if (showLoading) {
+        setLoading(true);
+      }
       setHasScrolledToBottom(false); // Reset scroll flag when fetching new messages
       const response = await messagesAPI.getByGroup(Number(id), 1, 10);
       // Handle Laravel pagination format
@@ -193,7 +195,9 @@ export default function GroupChatScreen() {
       setGroupInfo(response.data.selectedConversation);
       
       // Set loading to false - scroll will happen after content is rendered
-      setLoading(false);
+      if (showLoading) {
+        setLoading(false);
+      }
       
       // Reset scroll flag to allow initial scroll
       setHasScrolledToBottom(false);
@@ -225,54 +229,86 @@ export default function GroupChatScreen() {
       // Scroll will be handled by useEffect and onContentSizeChange after images render
     } catch (error) {
       console.error('Failed to fetch messages:', error);
-      Alert.alert('Error', 'Failed to load messages');
-      setLoading(false);
+      if (showLoading) {
+        Alert.alert('Error', 'Failed to load messages');
+        setLoading(false);
+      }
     }
-  };
+  }, [id, updateUnreadCount, ENABLE_MARK_AS_READ]);
 
-  // Simple approach: Scroll to bottom ONCE when messages are first loaded for this conversation
+  // Initial fetch on mount
   useEffect(() => {
-    // Only scroll if:
-    // 1. Not loading
-    // 2. We have messages
-    // 3. We haven't scrolled for this conversation yet
-    if (!loading && messages.length > 0 && hasScrolledForThisConversation.current !== id) {
-      // Mark that we've scrolled for this conversation
-      hasScrolledForThisConversation.current = id as string;
-      
-      // Wait for layout to be ready, then scroll once
-      const timeoutId = setTimeout(() => {
-        if (flatListRef.current && messages.length > 0) {
-          try {
-            // Try scrollToEnd first
-            flatListRef.current.scrollToEnd({ animated: false });
-            setHasScrolledToBottom(true);
-            console.log('Scrolled to bottom on initial load');
-          } catch (error) {
-            // Fallback: scroll to last index
-            try {
-              const lastIndex = messages.length - 1;
-              if (lastIndex >= 0) {
-                flatListRef.current.scrollToIndex({ 
-                  index: lastIndex, 
-                  animated: false,
-                  viewPosition: 1
-                });
-                setHasScrolledToBottom(true);
-                console.log('Scrolled to bottom via scrollToIndex');
-              }
-            } catch (scrollError) {
-              console.warn('Scroll failed:', scrollError);
-            }
-          }
-        }
-      }, 600); // Single delay - wait for content to render
-      
-      return () => clearTimeout(timeoutId);
-    }
-  }, [loading, messages.length, id]); // Only depend on loading, messages, and conversation id
+    fetchMessages(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [id]); // Only depend on id, fetchMessages is stable
 
-  // Mark messages as read when group chat is opened
+  // Function to scroll to bottom - can be called multiple times
+  const scrollToBottom = useCallback((animated = false, delay = 100) => {
+    if (!flatListRef.current || messages.length === 0) return;
+    
+    const scroll = () => {
+      if (!flatListRef.current || messages.length === 0) return;
+      
+      try {
+        // Try scrollToEnd first
+        flatListRef.current.scrollToEnd({ animated });
+        setHasScrolledToBottom(true);
+        console.log('Scrolled to bottom');
+      } catch (error) {
+        // Fallback: scroll to last index
+        try {
+          const lastIndex = messages.length - 1;
+          if (lastIndex >= 0) {
+            flatListRef.current.scrollToIndex({ 
+              index: lastIndex, 
+              animated,
+              viewPosition: 1 // 1 = bottom
+            });
+            setHasScrolledToBottom(true);
+            console.log('Scrolled to bottom via scrollToIndex');
+          }
+        } catch (scrollError) {
+          console.warn('Scroll failed:', scrollError);
+          // Last resort: try scrolling after a longer delay
+          setTimeout(() => {
+            if (flatListRef.current && messages.length > 0) {
+              try {
+                flatListRef.current.scrollToEnd({ animated: false });
+              } catch (e) {
+                console.warn('Final scroll attempt failed:', e);
+              }
+            }
+          }, 500);
+        }
+      }
+    };
+    
+    if (delay > 0) {
+      setTimeout(scroll, delay);
+    } else {
+      scroll();
+    }
+  }, [messages.length]);
+
+  // Scroll to bottom when messages are loaded or conversation changes
+  useEffect(() => {
+    // Reset scroll flag when conversation changes
+    if (hasScrolledForThisConversation.current !== id) {
+      hasScrolledForThisConversation.current = id as string;
+      setHasScrolledToBottom(false);
+    }
+    
+    // Scroll when messages are loaded and not loading
+    if (!loading && messages.length > 0) {
+      // Multiple attempts with increasing delays to handle content rendering
+      scrollToBottom(false, 100);
+      scrollToBottom(false, 300);
+      scrollToBottom(false, 600);
+      scrollToBottom(false, 1000);
+    }
+  }, [loading, messages.length, id, scrollToBottom]);
+
+  // Mark messages as read and refresh messages when group chat is opened
   useFocusEffect(
     useCallback(() => {
       // Set this conversation as active to suppress notifications
@@ -280,6 +316,20 @@ export default function GroupChatScreen() {
       if (conversationId) {
         setActiveConversation(conversationId);
       }
+
+      // Refresh messages when screen gains focus to get any new messages
+      // Don't show loading spinner if messages already exist (to avoid flickering)
+      const hasExistingMessages = messages.length > 0;
+      
+      // Reset scroll flag so we scroll to bottom after refresh
+      setHasScrolledToBottom(false);
+      
+      fetchMessages(!hasExistingMessages);
+      
+      // Scroll to bottom after a delay to ensure messages are loaded
+      setTimeout(() => {
+        scrollToBottom(false, 0);
+      }, 500);
 
       const markGroupMessagesAsRead = async () => {
         if (!ENABLE_MARK_AS_READ || !id || !user) return;
@@ -321,7 +371,7 @@ export default function GroupChatScreen() {
         // Clear active conversation when screen loses focus
         clearActiveConversation();
       };
-    }, [id, user, ENABLE_MARK_AS_READ, updateUnreadCount, setActiveConversation, clearActiveConversation])
+    }, [id, user, ENABLE_MARK_AS_READ, updateUnreadCount, setActiveConversation, clearActiveConversation, fetchMessages, messages.length, scrollToBottom])
   );
 
   // Load more messages function
@@ -433,7 +483,20 @@ export default function GroupChatScreen() {
     // Don't send if there's no content at all
     if (!input.trim() && !attachment && !voiceRecording) return;
     
+    // Prevent multiple simultaneous sends
+    if (sending) {
+      console.warn('Message send already in progress, ignoring duplicate send');
+      return;
+    }
+    
     setSending(true);
+    
+    // Safety timeout: ensure sending state is reset even if something goes wrong
+    const safetyTimeout = setTimeout(() => {
+      console.warn('Message send timeout - resetting sending state');
+      setSending(false);
+    }, 35000); // 35 seconds (slightly longer than API timeout)
+    
     try {
       let formData = new FormData();
       
@@ -488,7 +551,20 @@ export default function GroupChatScreen() {
         formData.append('is_voice_message', 'true');
       }
       
-      const res = await messagesAPI.sendMessage(formData);
+      // Add timeout wrapper for message sending to prevent hanging
+      const sendMessageWithTimeout = async () => {
+        try {
+          return await messagesAPI.sendMessage(formData);
+        } catch (error: any) {
+          // If it's a timeout, throw a more descriptive error
+          if (error.code === 'ECONNABORTED' || error.message?.includes('timeout')) {
+            throw new Error('Request timeout - message send took too long');
+          }
+          throw error;
+        }
+      };
+      
+      const res = await sendMessageWithTimeout();
       
       // Update last_seen_at when user sends a message (activity indicator)
       try {
@@ -628,9 +704,25 @@ export default function GroupChatScreen() {
           );
         }
       } else {
-        Alert.alert('Error', 'Failed to send message. Please try again.');
+        // Check if it's a timeout error
+        if (error.code === 'ECONNABORTED' || error.message?.includes('timeout')) {
+          Alert.alert(
+            'Connection Timeout',
+            'The message is taking too long to send. Please check your internet connection and try again.',
+            [{ text: 'OK' }]
+          );
+        } else if (error.message === 'Network Error' || !error.response) {
+          Alert.alert(
+            'Network Error',
+            'Unable to connect to the server. Please check your internet connection and try again.',
+            [{ text: 'OK' }]
+          );
+        } else {
+          Alert.alert('Error', 'Failed to send message. Please try again.');
+        }
       }
     } finally {
+      clearTimeout(safetyTimeout);
       setSending(false);
     }
   };
@@ -1716,10 +1808,16 @@ export default function GroupChatScreen() {
                 ) : null
               }
               onContentSizeChange={() => {
-                // No auto-scroll here - useEffect handles initial scroll once
+                // Scroll to bottom when content size changes (e.g., images load)
+                if (!loading && messages.length > 0 && !hasScrolledToBottom) {
+                  scrollToBottom(false, 0);
+                }
               }}
               onLayout={() => {
-                // No auto-scroll here - useEffect handles initial scroll once
+                // Scroll to bottom when layout is ready
+                if (!loading && messages.length > 0 && !hasScrolledToBottom) {
+                  scrollToBottom(false, 0);
+                }
               }}
             />
           </TouchableOpacity>

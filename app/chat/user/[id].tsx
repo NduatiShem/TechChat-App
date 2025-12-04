@@ -1,18 +1,18 @@
+import LinkText from '@/components/LinkText';
 import MessageStatus from '@/components/MessageStatus';
 import ReplyBubble from '@/components/ReplyBubble';
 import ReplyPreview from '@/components/ReplyPreview';
 import UserAvatar from '@/components/UserAvatar';
+import VideoPlayer from '@/components/VideoPlayer';
 import VoiceMessageBubble from '@/components/VoiceMessageBubble';
 import VoicePlayer from '@/components/VoicePlayer';
 import VoiceRecorder from '@/components/VoiceRecorder';
-import LinkText from '@/components/LinkText';
-import VideoPlayer from '@/components/VideoPlayer';
-import { isVideoAttachment } from '@/utils/textUtils';
 import { AppConfig } from '@/config/app.config';
 import { useAuth } from '@/context/AuthContext';
 import { useNotifications } from '@/context/NotificationContext';
 import { useTheme } from '@/context/ThemeContext';
 import { messagesAPI, usersAPI } from '@/services/api';
+import { isVideoAttachment } from '@/utils/textUtils';
 import { MaterialCommunityIcons, MaterialIcons } from '@expo/vector-icons';
 import { useFocusEffect } from '@react-navigation/native';
 import { Picker } from 'emoji-mart-native';
@@ -136,221 +136,253 @@ export default function UserChatScreen() {
   }, [userInfo]);
 
   // Fetch messages and user info
-  useEffect(() => {
-    const fetchMessages = async () => {
+  const fetchMessages = useCallback(async (showLoading = true) => {
+    if (showLoading) {
       setLoading(true);
-      setHasScrolledToBottom(false); // Reset scroll flag when fetching new messages
-      try {
-        const res = await messagesAPI.getByUser(Number(id), 1, 10);
-        
-        // Handle Laravel pagination format
-        const messagesData = res.data.messages?.data || res.data.messages || [];
-        const pagination = res.data.messages || {};
-        
-        // Debug each message's attachments
-        messagesData.forEach((message: any, index: number) => {
-          if (message.attachments && message.attachments.length > 0) {
-            // Message has attachments
-          }
-        });
-        
-        // Check if there are more messages using Laravel pagination
-        // Try multiple possible pagination formats
-        const hasMore = pagination.current_page < pagination.last_page || 
-                       pagination.current_page < pagination.lastPage ||
-                       (pagination.current_page && pagination.last_page && pagination.current_page < pagination.last_page) ||
-                       (messagesData.length >= 10); // Fallback: if we got 10 messages, assume there might be more
-        
-        setHasMoreMessages(hasMore);
-        
-        // Debug: Log messages with reply_to_id to check backend response
-        const messagesWithReply = messagesData.filter((msg: any) => msg.reply_to_id);
-        if (messagesWithReply.length > 0) {
-          console.log('Messages with reply_to_id:', messagesWithReply.map((msg: any) => ({
-            id: msg.id,
-            message: msg.message,
-            reply_to_id: msg.reply_to_id,
-            has_reply_to_object: !!msg.reply_to,
-            reply_to: msg.reply_to
-          })));
+    }
+    setHasScrolledToBottom(false); // Reset scroll flag when fetching new messages
+    try {
+      const res = await messagesAPI.getByUser(Number(id), 1, 10);
+      
+      // Handle Laravel pagination format
+      const messagesData = res.data.messages?.data || res.data.messages || [];
+      const pagination = res.data.messages || {};
+      
+      // Debug each message's attachments
+      messagesData.forEach((message: any, index: number) => {
+        if (message.attachments && message.attachments.length > 0) {
+          // Message has attachments
         }
-        
-        // Process messages to ensure reply_to data is properly structured
-        // If a message has reply_to_id but no reply_to object, we need to find the original message
-        const processedMessages = messagesData.map((msg: any) => {
-          // If message already has reply_to object, use it (backend loaded it correctly)
-          if (msg.reply_to) {
-            console.log('Message has reply_to from backend:', msg.id, msg.reply_to);
-            return msg;
-          }
-          
-          // If message has reply_to_id but no reply_to object, try to find it in the messages list
-          if (msg.reply_to_id) {
-            console.log('Message has reply_to_id but no reply_to object, searching in messages list:', msg.id, msg.reply_to_id);
-            const repliedMessage = messagesData.find((m: any) => m.id === msg.reply_to_id);
-            if (repliedMessage) {
-              // Construct reply_to object from the found message
-              msg.reply_to = {
-                id: repliedMessage.id,
-                message: repliedMessage.message,
-                sender: repliedMessage.sender || {
-                  id: repliedMessage.sender_id,
-                  name: repliedMessage.sender?.name || 'Unknown User'
-                },
-                attachments: repliedMessage.attachments || []
-              };
-              console.log('Constructed reply_to from local messages:', msg.id, msg.reply_to);
-            } else {
-              console.warn('Could not find replied message in current batch:', msg.id, 'replying to:', msg.reply_to_id);
-            }
-          }
-          
+      });
+      
+      // Check if there are more messages using Laravel pagination
+      // Try multiple possible pagination formats
+      const hasMore = pagination.current_page < pagination.last_page || 
+                     pagination.current_page < pagination.lastPage ||
+                     (pagination.current_page && pagination.last_page && pagination.current_page < pagination.last_page) ||
+                     (messagesData.length >= 10); // Fallback: if we got 10 messages, assume there might be more
+      
+      setHasMoreMessages(hasMore);
+      
+      // Debug: Log messages with reply_to_id to check backend response
+      const messagesWithReply = messagesData.filter((msg: any) => msg.reply_to_id);
+      if (messagesWithReply.length > 0) {
+        console.log('Messages with reply_to_id:', messagesWithReply.map((msg: any) => ({
+          id: msg.id,
+          message: msg.message,
+          reply_to_id: msg.reply_to_id,
+          has_reply_to_object: !!msg.reply_to,
+          reply_to: msg.reply_to
+        })));
+      }
+      
+      // Process messages to ensure reply_to data is properly structured
+      // If a message has reply_to_id but no reply_to object, we need to find the original message
+      const processedMessages = messagesData.map((msg: any) => {
+        // If message already has reply_to object, use it (backend loaded it correctly)
+        if (msg.reply_to) {
+          console.log('Message has reply_to from backend:', msg.id, msg.reply_to);
           return msg;
-        });
+        }
         
-        // Sort messages by created_at in ascending order (oldest first)
-        const sortedMessages = processedMessages.sort((a: Message, b: Message) => 
-          new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
-        );
-        
-        // Find the newest message index for initial scroll
-        const newestMessageId = pagination.newest_message_id;
-        
-        // If we have newest_message_id, find its index after sorting
-        if (newestMessageId) {
-          const newestIndex = sortedMessages.findIndex((msg: Message) => msg.id === newestMessageId);
-          if (newestIndex >= 0) {
-            console.log('Found newest message at index:', newestIndex, 'ID:', newestMessageId);
+        // If message has reply_to_id but no reply_to object, try to find it in the messages list
+        if (msg.reply_to_id) {
+          console.log('Message has reply_to_id but no reply_to object, searching in messages list:', msg.id, msg.reply_to_id);
+          const repliedMessage = messagesData.find((m: any) => m.id === msg.reply_to_id);
+          if (repliedMessage) {
+            // Construct reply_to object from the found message
+            msg.reply_to = {
+              id: repliedMessage.id,
+              message: repliedMessage.message,
+              sender: repliedMessage.sender || {
+                id: repliedMessage.sender_id,
+                name: repliedMessage.sender?.name || 'Unknown User'
+              },
+              attachments: repliedMessage.attachments || []
+            };
+            console.log('Constructed reply_to from local messages:', msg.id, msg.reply_to);
           } else {
-            console.log('Newest message ID not found in sorted messages, using last index');
+            console.warn('Could not find replied message in current batch:', msg.id, 'replying to:', msg.reply_to_id);
           }
         }
         
-        setMessages(sortedMessages);
-        setUserInfo(res.data.selectedConversation);
-        
-        // Set loading to false - scroll will happen after content is rendered
-        setLoading(false);
-        
-        // Reset scroll flag to allow initial scroll
-        setHasScrolledToBottom(false);
-        
-        // Mark messages as read when user opens conversation
-        // Use the new route: PUT /api/messages/mark-read/{userId}
-        if (ENABLE_MARK_AS_READ) {
-          try {
-            await messagesAPI.markMessagesAsRead(Number(id));
-            // Update unread count to 0 for this conversation - this will update badge
-            updateUnreadCount(Number(id), 0);
-          } catch (error: any) {
-            // Handle errors gracefully - don't show to user
-            const statusCode = error?.response?.status;
-            
-            // 429 = Too Many Requests (rate limit) - expected, handled gracefully
-            // 422 = Validation error - expected in some cases
-            // 404 = Not found - endpoint might not exist yet
-            // Only log unexpected errors in development
-            if (statusCode !== 429 && statusCode !== 422 && statusCode !== 404) {
-              if (__DEV__) {
-                console.log('markMessagesAsRead failed:', statusCode || error?.message || error);
-              }
-            }
-            // Silently ignore rate limit and validation errors
-          }
+        return msg;
+      });
+      
+      // Sort messages by created_at in ascending order (oldest first)
+      const sortedMessages = processedMessages.sort((a: Message, b: Message) => 
+        new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
+      );
+      
+      // Find the newest message index for initial scroll
+      const newestMessageId = pagination.newest_message_id;
+      
+      // If we have newest_message_id, find its index after sorting
+      if (newestMessageId) {
+        const newestIndex = sortedMessages.findIndex((msg: Message) => msg.id === newestMessageId);
+        if (newestIndex >= 0) {
+          console.log('Found newest message at index:', newestIndex, 'ID:', newestMessageId);
+        } else {
+          console.log('Newest message ID not found in sorted messages, using last index');
         }
-        
-        // Calculate online status from last_seen_at from user data
-        // last_seen_at is on the User model, so check in user data within selectedConversation
-        if (res.data.selectedConversation) {
-          const conversation = res.data.selectedConversation;
-          // Debug: Log what data we're receiving
-          console.log('Conversation data:', {
-            id: conversation.id,
-            name: conversation.name,
-            user: conversation.user,
-            last_seen_at: conversation.user?.last_seen_at || conversation.last_seen_at,
-          });
-          
-          // Get last_seen_at from user data (user.last_seen_at) or fallback to conversation level
-          const lastSeenTimestamp = conversation.user?.last_seen_at || 
-                                    conversation.last_seen_at || 
-                                    conversation.last_seen || 
-                                    conversation.lastSeen;
-          
-          if (lastSeenTimestamp) {
-            try {
-              const lastSeenDate = new Date(lastSeenTimestamp);
-              const now = new Date();
-              const diffInMs = now.getTime() - lastSeenDate.getTime();
-              const diffInMinutes = diffInMs / (1000 * 60);
-              
-              // Consider user online if active within last 5 minutes
-              const isUserOnline = !isNaN(lastSeenDate.getTime()) && diffInMinutes >= 0 && diffInMinutes <= 5;
-              setIsOnline(isUserOnline);
-              
-              console.log('Calculated online status:', isUserOnline, 'Last seen:', diffInMinutes.toFixed(2), 'minutes ago');
-            } catch (error) {
-              console.error('Error calculating online status:', error);
-              setIsOnline(false);
-            }
-          } else {
-            // No last_seen_at data available
-            console.warn('No last_seen_at data found in conversation response');
-            setIsOnline(false);
-          }
-        }
-        
-        // Scroll will be handled by useEffect and onContentSizeChange after images render
-      } catch {
-        setMessages([]);
+      }
+      
+      setMessages(sortedMessages);
+      setUserInfo(res.data.selectedConversation);
+      
+      // Set loading to false - scroll will happen after content is rendered
+      if (showLoading) {
         setLoading(false);
       }
-    };
-    fetchMessages();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [id]); // ENABLE_MARK_AS_READ and updateUnreadCount are stable, no need to include
-
-  // Simple approach: Scroll to bottom ONCE when messages are first loaded for this conversation
-  useEffect(() => {
-    // Only scroll if:
-    // 1. Not loading
-    // 2. We have messages
-    // 3. We haven't scrolled for this conversation yet
-    if (!loading && messages.length > 0 && hasScrolledForThisConversation.current !== id) {
-      // Mark that we've scrolled for this conversation
-      hasScrolledForThisConversation.current = id as string;
       
-      // Wait for layout to be ready, then scroll once
-      const timeoutId = setTimeout(() => {
-        if (flatListRef.current && messages.length > 0) {
-          try {
-            // Try scrollToEnd first
-            (flatListRef.current as any).scrollToEnd({ animated: false });
-            setHasScrolledToBottom(true);
-            console.log('Scrolled to bottom on initial load');
-          } catch (error) {
-            // Fallback: scroll to last index
-            try {
-              const lastIndex = messages.length - 1;
-              if (lastIndex >= 0) {
-                (flatListRef.current as any).scrollToIndex({ 
-                  index: lastIndex, 
-                  animated: false,
-                  viewPosition: 1
-                });
-                setHasScrolledToBottom(true);
-                console.log('Scrolled to bottom via scrollToIndex');
-              }
-            } catch (scrollError) {
-              console.warn('Scroll failed:', scrollError);
+      // Reset scroll flag to allow initial scroll
+      setHasScrolledToBottom(false);
+      
+      // Mark messages as read when user opens conversation
+      // Use the new route: PUT /api/messages/mark-read/{userId}
+      if (ENABLE_MARK_AS_READ) {
+        try {
+          await messagesAPI.markMessagesAsRead(Number(id));
+          // Update unread count to 0 for this conversation - this will update badge
+          updateUnreadCount(Number(id), 0);
+        } catch (error: any) {
+          // Handle errors gracefully - don't show to user
+          const statusCode = error?.response?.status;
+          
+          // 429 = Too Many Requests (rate limit) - expected, handled gracefully
+          // 422 = Validation error - expected in some cases
+          // 404 = Not found - endpoint might not exist yet
+          // Only log unexpected errors in development
+          if (statusCode !== 429 && statusCode !== 422 && statusCode !== 404) {
+            if (__DEV__) {
+              console.log('markMessagesAsRead failed:', statusCode || error?.message || error);
             }
           }
+          // Silently ignore rate limit and validation errors
         }
-      }, 600); // Single delay - wait for content to render
+      }
       
-      return () => clearTimeout(timeoutId);
+      // Calculate online status from last_seen_at from user data
+      // last_seen_at is on the User model, so check in user data within selectedConversation
+      if (res.data.selectedConversation) {
+        const conversation = res.data.selectedConversation;
+        // Debug: Log what data we're receiving
+        console.log('Conversation data:', {
+          id: conversation.id,
+          name: conversation.name,
+          user: conversation.user,
+          last_seen_at: conversation.user?.last_seen_at || conversation.last_seen_at,
+        });
+        
+        // Get last_seen_at from user data (user.last_seen_at) or fallback to conversation level
+        const lastSeenTimestamp = conversation.user?.last_seen_at || 
+                                  conversation.last_seen_at || 
+                                  conversation.last_seen || 
+                                  conversation.lastSeen;
+        
+        if (lastSeenTimestamp) {
+          try {
+            const lastSeenDate = new Date(lastSeenTimestamp);
+            const now = new Date();
+            const diffInMs = now.getTime() - lastSeenDate.getTime();
+            const diffInMinutes = diffInMs / (1000 * 60);
+            
+            // Consider user online if active within last 5 minutes
+            const isUserOnline = !isNaN(lastSeenDate.getTime()) && diffInMinutes >= 0 && diffInMinutes <= 5;
+            setIsOnline(isUserOnline);
+            
+            console.log('Calculated online status:', isUserOnline, 'Last seen:', diffInMinutes.toFixed(2), 'minutes ago');
+          } catch (error) {
+            console.error('Error calculating online status:', error);
+            setIsOnline(false);
+          }
+        } else {
+          // No last_seen_at data available
+          console.warn('No last_seen_at data found in conversation response');
+          setIsOnline(false);
+        }
+      }
+      
+      // Scroll will be handled by useEffect and onContentSizeChange after images render
+    } catch {
+      setMessages([]);
+      if (showLoading) {
+        setLoading(false);
+      }
     }
-  }, [loading, messages.length, id]); // Only depend on loading, messages, and conversation id
+    }, [id, updateUnreadCount, ENABLE_MARK_AS_READ]);
+
+  // Initial fetch on mount
+  useEffect(() => {
+    fetchMessages(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [id]); // Only depend on id, fetchMessages is stable
+
+  // Function to scroll to bottom - can be called multiple times
+  const scrollToBottom = useCallback((animated = false, delay = 100) => {
+    if (!flatListRef.current || messages.length === 0) return;
+    
+    const scroll = () => {
+      if (!flatListRef.current || messages.length === 0) return;
+      
+      try {
+        // Try scrollToEnd first
+        (flatListRef.current as any).scrollToEnd({ animated });
+        setHasScrolledToBottom(true);
+        console.log('Scrolled to bottom');
+      } catch (error) {
+        // Fallback: scroll to last index
+        try {
+          const lastIndex = messages.length - 1;
+          if (lastIndex >= 0) {
+            (flatListRef.current as any).scrollToIndex({ 
+              index: lastIndex, 
+              animated,
+              viewPosition: 1 // 1 = bottom
+            });
+            setHasScrolledToBottom(true);
+            console.log('Scrolled to bottom via scrollToIndex');
+          }
+        } catch (scrollError) {
+          console.warn('Scroll failed:', scrollError);
+          // Last resort: try scrolling after a longer delay
+          setTimeout(() => {
+            if (flatListRef.current && messages.length > 0) {
+              try {
+                (flatListRef.current as any).scrollToEnd({ animated: false });
+              } catch (e) {
+                console.warn('Final scroll attempt failed:', e);
+              }
+            }
+          }, 500);
+        }
+      }
+    };
+    
+    if (delay > 0) {
+      setTimeout(scroll, delay);
+    } else {
+      scroll();
+    }
+  }, [messages.length]);
+
+  // Scroll to bottom when messages are loaded or conversation changes
+  useEffect(() => {
+    // Reset scroll flag when conversation changes
+    if (hasScrolledForThisConversation.current !== id) {
+      hasScrolledForThisConversation.current = id as string;
+      setHasScrolledToBottom(false);
+    }
+    
+    // Scroll when messages are loaded and not loading
+    if (!loading && messages.length > 0) {
+      // Multiple attempts with increasing delays to handle content rendering
+      scrollToBottom(false, 100);
+      scrollToBottom(false, 300);
+      scrollToBottom(false, 600);
+      scrollToBottom(false, 1000);
+    }
+  }, [loading, messages.length, id, scrollToBottom]);
 
   // Debug: Log all keys and check for duplicates before rendering FlatList
   useEffect(() => {
@@ -406,7 +438,7 @@ export default function UserChatScreen() {
   // Scroll to bottom when messages are first loaded (after content is rendered)
   // This is handled by onContentSizeChange and onLayout to avoid blank screen
 
-  // Mark messages as read when conversation is opened
+  // Mark messages as read and refresh messages when conversation is opened
   useFocusEffect(
     useCallback(() => {
       // Set this conversation as active to suppress notifications
@@ -414,6 +446,20 @@ export default function UserChatScreen() {
       if (conversationId) {
         setActiveConversation(conversationId);
       }
+
+      // Refresh messages when screen gains focus to get any new messages
+      // Don't show loading spinner if messages already exist (to avoid flickering)
+      const hasExistingMessages = messages.length > 0;
+      
+      // Reset scroll flag so we scroll to bottom after refresh
+      setHasScrolledToBottom(false);
+      
+      fetchMessages(!hasExistingMessages);
+      
+      // Scroll to bottom after a delay to ensure messages are loaded
+      setTimeout(() => {
+        scrollToBottom(false, 0);
+      }, 500);
 
       const markMessagesAsRead = async () => {
         if (!ENABLE_MARK_AS_READ || !id || !user) return;
@@ -457,7 +503,7 @@ export default function UserChatScreen() {
         // Clear active conversation when screen loses focus
         clearActiveConversation();
       };
-    }, [id, user, ENABLE_MARK_AS_READ, updateUnreadCount, setActiveConversation, clearActiveConversation])
+    }, [id, user, ENABLE_MARK_AS_READ, updateUnreadCount, setActiveConversation, clearActiveConversation, fetchMessages, messages.length, scrollToBottom])
   );
 
   // Handle mobile hardware back button
@@ -567,7 +613,20 @@ export default function UserChatScreen() {
     // Don't send if there's no content at all
     if (!input.trim() && !attachment && !voiceRecording) return;
     
+    // Prevent multiple simultaneous sends
+    if (sending) {
+      console.warn('Message send already in progress, ignoring duplicate send');
+      return;
+    }
+    
     setSending(true);
+    
+    // Safety timeout: ensure sending state is reset even if something goes wrong
+    const safetyTimeout = setTimeout(() => {
+      console.warn('Message send timeout - resetting sending state');
+      setSending(false);
+    }, 35000); // 35 seconds (slightly longer than API timeout)
+    
     try {
       let formData = new FormData();
       
@@ -623,7 +682,20 @@ export default function UserChatScreen() {
         formData.append('is_voice_message', 'true');
       }
       
-      const res = await messagesAPI.sendMessage(formData);
+      // Add timeout wrapper for message sending to prevent hanging
+      const sendMessageWithTimeout = async () => {
+        try {
+          return await messagesAPI.sendMessage(formData);
+        } catch (error: any) {
+          // If it's a timeout, throw a more descriptive error
+          if (error.code === 'ECONNABORTED' || error.message?.includes('timeout')) {
+            throw new Error('Request timeout - message send took too long');
+          }
+          throw error;
+        }
+      };
+      
+      const res = await sendMessageWithTimeout();
       
       // Update last_seen_at when user sends a message (activity indicator)
       try {
@@ -790,9 +862,25 @@ export default function UserChatScreen() {
           );
         }
       } else {
-        Alert.alert('Error', 'Failed to send message. Please try again.');
+        // Check if it's a timeout error
+        if (error.code === 'ECONNABORTED' || error.message?.includes('timeout')) {
+          Alert.alert(
+            'Connection Timeout',
+            'The message is taking too long to send. Please check your internet connection and try again.',
+            [{ text: 'OK' }]
+          );
+        } else if (error.message === 'Network Error' || !error.response) {
+          Alert.alert(
+            'Network Error',
+            'Unable to connect to the server. Please check your internet connection and try again.',
+            [{ text: 'OK' }]
+          );
+        } else {
+          Alert.alert('Error', 'Failed to send message. Please try again.');
+        }
       }
     } finally {
+      clearTimeout(safetyTimeout);
       setSending(false);
     }
   };
@@ -1783,10 +1871,16 @@ export default function UserChatScreen() {
                 ) : null
               }
               onContentSizeChange={() => {
-                // No auto-scroll here - useEffect handles initial scroll once
+                // Scroll to bottom when content size changes (e.g., images load)
+                if (!loading && messages.length > 0 && !hasScrolledToBottom) {
+                  scrollToBottom(false, 0);
+                }
               }}
               onLayout={() => {
-                // No auto-scroll here - useEffect handles initial scroll once
+                // Scroll to bottom when layout is ready
+                if (!loading && messages.length > 0 && !hasScrolledToBottom) {
+                  scrollToBottom(false, 0);
+                }
               }}
               ListEmptyComponent={() => (
                 <View style={{ 
