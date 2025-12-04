@@ -11,6 +11,8 @@ import { StatusBar } from "expo-status-bar";
 import { useEffect, useRef, useState } from "react";
 import { ActivityIndicator, AppState, View } from "react-native";
 import { SafeAreaProvider } from "react-native-safe-area-context";
+import { useBackgroundUpdateCheck } from "@/hooks/useBackgroundUpdateCheck";
+import { UpdateNotification } from "@/components/UpdateNotification";
 import "../global.css";
 
 // Prevent splash screen from auto-hiding
@@ -284,6 +286,9 @@ function AppLayout() {
   const { currentTheme } = useTheme();
   const isDark = currentTheme === 'dark';
   
+  // Background update check - runs after app is fully loaded, non-blocking
+  const { updateAvailable, isChecking, applyUpdate } = useBackgroundUpdateCheck();
+  
   // Additional safety check: Verify token exists before showing main app
   // This prevents showing main app when token is missing (even if cached user exists)
   // MUST be declared at top level (before any returns) to follow Rules of Hooks
@@ -384,7 +389,15 @@ function AppLayout() {
 
   // Show main app if authenticated AND token exists
   console.log('AppLayout: Showing main app');
-  return <AppTabsLayout />;
+  return (
+    <>
+      <UpdateNotification
+        updateAvailable={updateAvailable}
+        onApplyUpdate={applyUpdate}
+      />
+      <AppTabsLayout />
+    </>
+  );
 }
 
 export default function RootLayout() {

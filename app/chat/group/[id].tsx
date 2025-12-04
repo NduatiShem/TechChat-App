@@ -18,6 +18,8 @@ import { useFocusEffect } from '@react-navigation/native';
 import { Picker } from 'emoji-mart-native';
 import * as DocumentPicker from 'expo-document-picker';
 import * as ImagePicker from 'expo-image-picker';
+import * as FileSystem from 'expo-file-system/legacy';
+import * as Sharing from 'expo-sharing';
 import { router, useLocalSearchParams } from 'expo-router';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
@@ -810,6 +812,80 @@ export default function GroupChatScreen() {
     setReplyingTo(null);
   };
 
+  // Handle file download
+  const handleFileDownload = async (attachment: any) => {
+    try {
+      const fileUrl = attachment.url || attachment.path || attachment.uri;
+      let downloadUrl = fileUrl;
+      
+      if (fileUrl && !fileUrl.startsWith('http')) {
+        const cleanUrl = fileUrl.startsWith('/') ? fileUrl.substring(1) : fileUrl;
+        downloadUrl = `${getBaseUrl()}/${cleanUrl}`;
+      }
+      
+      if (!downloadUrl) {
+        Alert.alert('Error', 'File URL not available');
+        return;
+      }
+
+      const fileName = attachment.name || 'download';
+      
+      // Show loading alert
+      Alert.alert('Downloading', `Downloading ${fileName}...`, [], { cancelable: true });
+      
+      // Create a local file path with unique name to avoid conflicts
+      // Sanitize filename and encode URL properly for iOS compatibility
+      const timestamp = Date.now();
+      const sanitizedFileName = fileName.replace(/[^a-zA-Z0-9.-]/g, '_');
+      const fileUri = `${FileSystem.documentDirectory}${timestamp}_${sanitizedFileName}`;
+      
+      // Ensure download URL is properly encoded
+      const encodedDownloadUrl = encodeURI(downloadUrl);
+      
+      // Download the file using legacy API
+      const downloadResult = await FileSystem.downloadAsync(encodedDownloadUrl, fileUri);
+      
+      // Dismiss loading alert by showing result
+      if (downloadResult.status === 200) {
+        // Check if sharing is available
+        const isAvailable = await Sharing.isAvailableAsync();
+        
+        if (isAvailable) {
+          // Share/open the file (allows user to save, open with other apps, etc.)
+          await Sharing.shareAsync(downloadResult.uri, {
+            mimeType: attachment.mime || 'application/octet-stream',
+            dialogTitle: `Save ${fileName}`,
+            UTI: attachment.mime || 'public.data',
+          });
+        } else {
+          // Fallback: Show success message with file location
+          Alert.alert(
+            'Download Complete',
+            `File saved: ${fileName}\n\nYou can find it in your device's file manager.`,
+            [{ text: 'OK' }]
+          );
+        }
+      } else {
+        throw new Error(`Download failed with status ${downloadResult.status}`);
+      }
+    } catch (error: any) {
+      console.error('File download error:', error);
+      
+      // Check for specific error types
+      let errorMessage = 'Failed to download file. Please check your internet connection and try again.';
+      
+      if (error?.message?.includes('Network')) {
+        errorMessage = 'Network error. Please check your internet connection.';
+      } else if (error?.message?.includes('404')) {
+        errorMessage = 'File not found on server.';
+      } else if (error?.message) {
+        errorMessage = error.message;
+      }
+      
+      Alert.alert('Download Failed', errorMessage, [{ text: 'OK' }]);
+    }
+  };
+
   // Handle delete message
   const handleDeleteMessage = async (messageId: number) => {
     if (!ENABLE_DELETE_MESSAGE) {
@@ -1302,20 +1378,7 @@ export default function GroupChatScreen() {
                   {/* File info container - Middle (takes most space) */}
                   <TouchableOpacity 
                     style={{ flex: 1, minWidth: 0, flexShrink: 1 }}
-                    onPress={async () => {
-                      const fileUrl = firstAttachment.url || firstAttachment.path || firstAttachment.uri;
-                      let downloadUrl = fileUrl;
-                      if (fileUrl && !fileUrl.startsWith('http')) {
-                        const cleanUrl = fileUrl.startsWith('/') ? fileUrl.substring(1) : fileUrl;
-                        downloadUrl = `${getBaseUrl()}/${cleanUrl}`;
-                      }
-                      
-                      const fileName = firstAttachment.name || 'download';
-                      
-                      Alert.alert('File Download', `File: ${fileName}\nURL: ${downloadUrl}`, [
-                        { text: 'OK', style: 'default' }
-                      ]);
-                    }}
+                    onPress={() => handleFileDownload(firstAttachment)}
                   >
                     {/* First row: File name */}
                     <Text 
