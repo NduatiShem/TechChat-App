@@ -142,6 +142,15 @@ export default function GroupChatScreen() {
   const flatListRef = useRef<FlatList>(null);
   const hasScrolledForThisConversation = useRef<string | null>(null); // Track which conversation we've scrolled for
   
+  // Background retry state - track retry attempts and timeout
+  const retryAttemptRef = useRef<number>(0);
+  const retryTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const messagesLengthRef = useRef<number>(0); // Track messages length for retry logic
+  const isPaginatingRef = useRef<boolean>(false); // Track if user is currently paginating (loading older messages)
+  const lastFocusTimeRef = useRef<number>(0); // Track when screen last gained focus
+  const MAX_RETRY_ATTEMPTS = 5; // Maximum retry attempts
+  const INITIAL_RETRY_DELAY = 1000; // Start with 1 second delay
+  
   // Pagination state
   const [currentPage, setCurrentPage] = useState(1);
   const [hasMoreMessages, setHasMoreMessages] = useState(true);
@@ -197,6 +206,7 @@ export default function GroupChatScreen() {
         new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
       );
       setMessages(sortedMessages);
+      messagesLengthRef.current = sortedMessages.length; // Update ref
       setGroupInfo(response.data.selectedConversation);
       
       // Set loading to false - scroll will happen after content is rendered
@@ -232,20 +242,106 @@ export default function GroupChatScreen() {
       }
       
       // Scroll will be handled by useEffect and onContentSizeChange after images render
-    } catch (error) {
-      console.error('Failed to fetch messages:', error);
+      
+      // Successfully fetched - reset retry attempts
+      retryAttemptRef.current = 0;
+      if (retryTimeoutRef.current) {
+        clearTimeout(retryTimeoutRef.current);
+        retryTimeoutRef.current = null;
+      }
+    } catch (error: any) {
+      // Preserve existing messages - don't clear them on error
+      // Only clear messages if this is the initial load and we have no messages
+      // Use ref to get current messages length (avoids stale closure issues)
+      const hasExistingMessages = messagesLengthRef.current > 0;
+      
       if (showLoading) {
-        Alert.alert('Error', 'Failed to load messages');
         setLoading(false);
       }
+      
+      // Check if this is a network-related error that we should retry
+      const isNetworkError = 
+        !error.response || // No response (network error)
+        error.code === 'ECONNABORTED' || // Timeout
+        error.message?.includes('Network Error') ||
+        error.message?.includes('timeout') ||
+        error.response?.status >= 500; // Server errors (500, 502, 503, etc.)
+      
+      // Only retry network errors, not auth errors (401) or client errors (400, 404)
+      const shouldRetry = isNetworkError && 
+                         retryAttemptRef.current < MAX_RETRY_ATTEMPTS &&
+                         !showLoading; // Don't retry if user is waiting for initial load
+      
+      if (shouldRetry) {
+        // Calculate exponential backoff delay: 1s, 2s, 4s, 8s, 16s
+        const delay = INITIAL_RETRY_DELAY * Math.pow(2, retryAttemptRef.current);
+        retryAttemptRef.current += 1;
+        
+        if (__DEV__) {
+          console.log(`[GroupChat] Retrying fetchMessages (attempt ${retryAttemptRef.current}/${MAX_RETRY_ATTEMPTS}) in ${delay}ms`);
+        }
+        
+        // Retry in background without showing loading spinner
+        retryTimeoutRef.current = setTimeout(() => {
+          fetchMessages(false); // Don't show loading spinner for retries
+        }, delay);
+      } else {
+        // Max retries reached or non-retryable error
+        if (retryAttemptRef.current >= MAX_RETRY_ATTEMPTS) {
+          if (__DEV__) {
+            console.warn('[GroupChat] Max retry attempts reached. Stopping background retries.');
+          }
+        }
+        
+        // Only show alert and clear messages if this was initial load and we have no existing messages
+        if (!hasExistingMessages && showLoading) {
+          Alert.alert('Error', 'Failed to load messages');
+          setMessages([]);
+        }
+        
+        // Log error for debugging (only in dev mode)
+        if (__DEV__) {
+          console.error('[GroupChat] Failed to fetch messages:', {
+            error: error.message,
+            status: error.response?.status,
+            retryAttempts: retryAttemptRef.current,
+            hasExistingMessages
+          });
+        }
+      }
     }
-  }, [id, updateUnreadCount, ENABLE_MARK_AS_READ]);
+    }, [id, updateUnreadCount, ENABLE_MARK_AS_READ]);
 
+  // Update messages length ref when messages change
+  useEffect(() => {
+    messagesLengthRef.current = messages.length;
+  }, [messages.length]);
+  
   // Initial fetch on mount
   useEffect(() => {
+    // Reset retry state when conversation changes
+    retryAttemptRef.current = 0;
+    messagesLengthRef.current = 0; // Reset messages length ref
+    isPaginatingRef.current = false; // Reset pagination flag
+    lastFocusTimeRef.current = 0; // Reset focus time
+    if (retryTimeoutRef.current) {
+      clearTimeout(retryTimeoutRef.current);
+      retryTimeoutRef.current = null;
+    }
+    
     fetchMessages(true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]); // Only depend on id, fetchMessages is stable
+  
+  // Cleanup retry timeout on unmount
+  useEffect(() => {
+    return () => {
+      if (retryTimeoutRef.current) {
+        clearTimeout(retryTimeoutRef.current);
+        retryTimeoutRef.current = null;
+      }
+    };
+  }, []);
 
   // Function to scroll to bottom - can be called multiple times
   const scrollToBottom = useCallback((animated = false, delay = 100) => {
@@ -322,6 +418,36 @@ export default function GroupChatScreen() {
         setActiveConversation(conversationId);
       }
 
+      const now = Date.now();
+      const timeSinceLastFocus = now - lastFocusTimeRef.current;
+      lastFocusTimeRef.current = now;
+
+      // Don't refresh if:
+      // 1. User is currently loading more messages (paginating)
+      // 2. User just focused (within 2 seconds) - likely a false trigger
+      // 3. We're on a page > 1 (user has paginated) - don't reset their pagination
+      const shouldSkipRefresh = 
+        loadingMore || 
+        isPaginatingRef.current || 
+        currentPage > 1 ||
+        (timeSinceLastFocus < 2000 && messages.length > 0);
+
+      if (shouldSkipRefresh) {
+        // Still mark messages as read, but don't refresh
+        if (ENABLE_MARK_AS_READ && id && user) {
+          const markGroupMessagesAsRead = async () => {
+            try {
+              await groupsAPI.markMessagesAsRead(Number(id));
+              updateUnreadCount(Number(id), 0);
+            } catch (error) {
+              // Silently ignore errors
+            }
+          };
+          markGroupMessagesAsRead();
+        }
+        return;
+      }
+
       // Refresh messages when screen gains focus to get any new messages
       // Don't show loading spinner if messages already exist (to avoid flickering)
       const hasExistingMessages = messages.length > 0;
@@ -376,13 +502,14 @@ export default function GroupChatScreen() {
         // Clear active conversation when screen loses focus
         clearActiveConversation();
       };
-    }, [id, user, ENABLE_MARK_AS_READ, updateUnreadCount, setActiveConversation, clearActiveConversation, fetchMessages, messages.length, scrollToBottom])
+    }, [id, user, ENABLE_MARK_AS_READ, updateUnreadCount, setActiveConversation, clearActiveConversation, fetchMessages, messages.length, scrollToBottom, loadingMore, currentPage])
   );
 
   // Load more messages function
   const loadMoreMessages = async () => {
     if (loadingMore || !hasMoreMessages) return;
     
+    isPaginatingRef.current = true; // Mark that we're paginating
     setLoadingMore(true);
     try {
       const nextPage = currentPage + 1;
@@ -444,6 +571,10 @@ export default function GroupChatScreen() {
       console.error('Error loading more messages:', error);
     } finally {
       setLoadingMore(false);
+      // Reset pagination flag after a delay to allow scroll position to stabilize
+      setTimeout(() => {
+        isPaginatingRef.current = false;
+      }, 1000);
     }
   };
 
