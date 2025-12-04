@@ -148,6 +148,12 @@ export default function GroupChatScreen() {
   const messagesLengthRef = useRef<number>(0); // Track messages length for retry logic
   const isPaginatingRef = useRef<boolean>(false); // Track if user is currently paginating (loading older messages)
   const lastFocusTimeRef = useRef<number>(0); // Track when screen last gained focus
+  
+  // Background polling state - for checking new messages
+  const pollingIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const latestMessageIdRef = useRef<number | null>(null); // Track latest message ID to detect new messages
+  const isPollingRef = useRef<boolean>(false); // Track if polling is active
+  const POLLING_INTERVAL = 3000; // Poll every 3 seconds
   const MAX_RETRY_ATTEMPTS = 5; // Maximum retry attempts
   const INITIAL_RETRY_DELAY = 1000; // Start with 1 second delay
   
@@ -207,6 +213,13 @@ export default function GroupChatScreen() {
       );
       setMessages(sortedMessages);
       messagesLengthRef.current = sortedMessages.length; // Update ref
+      
+      // Update latest message ID for polling detection
+      if (sortedMessages.length > 0) {
+        const latestMsg = sortedMessages[sortedMessages.length - 1]; // Last message is newest (after sorting)
+        latestMessageIdRef.current = latestMsg.id;
+      }
+      
       setGroupInfo(response.data.selectedConversation);
       
       // Set loading to false - scroll will happen after content is rendered
@@ -315,7 +328,151 @@ export default function GroupChatScreen() {
   // Update messages length ref when messages change
   useEffect(() => {
     messagesLengthRef.current = messages.length;
+    // Update latest message ID when messages change
+    if (messages.length > 0) {
+      const latestMsg = messages[messages.length - 1];
+      latestMessageIdRef.current = latestMsg.id;
+    }
   }, [messages.length]);
+  
+  // Background polling for new messages - silent, non-intrusive
+  const pollForNewMessages = useCallback(async () => {
+    // Don't poll if:
+    // 1. Already polling (prevent concurrent polls)
+    // 2. User is loading more messages (pagination)
+    // 3. User is sending a message
+    // 4. No latest message ID tracked yet
+    if (
+      isPollingRef.current ||
+      loadingMore ||
+      isPaginatingRef.current ||
+      sending ||
+      !latestMessageIdRef.current
+    ) {
+      return;
+    }
+
+    isPollingRef.current = true;
+    try {
+      // Fetch latest messages (page 1) silently
+      const response = await messagesAPI.getByGroup(Number(id), 1, 10);
+      const messagesData = response.data.messages?.data || response.data.messages || [];
+      
+      if (messagesData.length === 0) {
+        isPollingRef.current = false;
+        return;
+      }
+
+      // Sort messages to find the newest
+      const sortedNewMessages = messagesData.sort((a: Message, b: Message) => 
+        new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
+      );
+      
+      const newestMessage = sortedNewMessages[sortedNewMessages.length - 1];
+      
+      // Check if we have new messages (newer than our latest)
+      if (newestMessage.id > latestMessageIdRef.current) {
+        // Find all new messages (those with ID > latestMessageIdRef.current)
+        const newMessages = sortedNewMessages.filter((msg: Message) => 
+          msg.id > latestMessageIdRef.current!
+        );
+        
+        if (newMessages.length > 0) {
+          // Process new messages to ensure reply_to data is structured
+          const processedNewMessages = newMessages.map((msg: any) => {
+            if (msg.reply_to) {
+              return msg;
+            }
+            
+            if (msg.reply_to_id) {
+              // Try to find replied message in existing messages or new messages
+              const allMessages = [...messages, ...newMessages];
+              const repliedMessage = allMessages.find((m: any) => m.id === msg.reply_to_id);
+              if (repliedMessage) {
+                msg.reply_to = {
+                  id: repliedMessage.id,
+                  message: repliedMessage.message,
+                  sender: repliedMessage.sender || {
+                    id: repliedMessage.sender_id,
+                    name: repliedMessage.sender?.name || 'Unknown User'
+                  },
+                  attachments: repliedMessage.attachments || []
+                };
+              }
+            }
+            return msg;
+          });
+          
+          // Add new messages to existing messages (append at end, they're already sorted)
+          setMessages(prev => {
+            // Check for duplicates before adding
+            const existingIds = new Set(prev.map(m => m.id));
+            const uniqueNewMessages = processedNewMessages.filter(msg => !existingIds.has(msg.id));
+            
+            if (uniqueNewMessages.length === 0) {
+              return prev; // No new unique messages
+            }
+            
+            // Combine and sort all messages
+            const allMessages = [...prev, ...uniqueNewMessages].sort((a: Message, b: Message) => 
+              new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
+            );
+            
+            // Update latest message ID
+            const latestMsg = allMessages[allMessages.length - 1];
+            latestMessageIdRef.current = latestMsg.id;
+            messagesLengthRef.current = allMessages.length;
+            
+            return allMessages;
+          });
+          
+          // Auto-scroll to bottom only if user is already at bottom (not scrolling up)
+          if (flatListRef.current && hasScrolledToBottom) {
+            setTimeout(() => {
+              scrollToBottom(false, 0);
+            }, 100);
+          }
+        }
+      }
+    } catch (error: any) {
+      // Silently handle errors - don't interrupt user
+      // Only log in dev mode
+      if (__DEV__) {
+        console.log('[GroupChat] Polling error (silent):', error.message);
+      }
+    } finally {
+      isPollingRef.current = false;
+    }
+  }, [id, loadingMore, sending, messages, hasScrolledToBottom, scrollToBottom]);
+
+  // Start/stop polling based on screen focus and user activity
+  useEffect(() => {
+    // Don't start polling if:
+    // - User is loading more messages
+    // - User is sending a message
+    // - No messages loaded yet
+    if (loadingMore || sending || messages.length === 0 || !latestMessageIdRef.current) {
+      // Clear polling if it exists
+      if (pollingIntervalRef.current) {
+        clearInterval(pollingIntervalRef.current);
+        pollingIntervalRef.current = null;
+      }
+      return;
+    }
+
+    // Start polling
+    pollingIntervalRef.current = setInterval(() => {
+      pollForNewMessages();
+    }, POLLING_INTERVAL);
+
+    // Cleanup on unmount or when dependencies change
+    return () => {
+      if (pollingIntervalRef.current) {
+        clearInterval(pollingIntervalRef.current);
+        pollingIntervalRef.current = null;
+      }
+    };
+  }, [id, loadingMore, sending, messages.length, pollForNewMessages]);
   
   // Initial fetch on mount
   useEffect(() => {
@@ -324,6 +481,16 @@ export default function GroupChatScreen() {
     messagesLengthRef.current = 0; // Reset messages length ref
     isPaginatingRef.current = false; // Reset pagination flag
     lastFocusTimeRef.current = 0; // Reset focus time
+    latestMessageIdRef.current = null; // Reset latest message ID
+    isPollingRef.current = false; // Reset polling flag
+    
+    // Clear polling interval
+    if (pollingIntervalRef.current) {
+      clearInterval(pollingIntervalRef.current);
+      pollingIntervalRef.current = null;
+    }
+    
+    // Clear retry timeout
     if (retryTimeoutRef.current) {
       clearTimeout(retryTimeoutRef.current);
       retryTimeoutRef.current = null;
@@ -333,12 +500,16 @@ export default function GroupChatScreen() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]); // Only depend on id, fetchMessages is stable
   
-  // Cleanup retry timeout on unmount
+  // Cleanup retry timeout and polling on unmount
   useEffect(() => {
     return () => {
       if (retryTimeoutRef.current) {
         clearTimeout(retryTimeoutRef.current);
         retryTimeoutRef.current = null;
+      }
+      if (pollingIntervalRef.current) {
+        clearInterval(pollingIntervalRef.current);
+        pollingIntervalRef.current = null;
       }
     };
   }, []);
@@ -773,6 +944,12 @@ export default function GroupChatScreen() {
           const dateB = new Date(b.created_at).getTime();
           return dateA - dateB; // Ascending order (oldest first)
         });
+        
+        // Update latest message ID when user sends a message
+        if (updatedMessages.length > 0) {
+          const latestMsg = updatedMessages[updatedMessages.length - 1];
+          latestMessageIdRef.current = latestMsg.id;
+        }
         
         // Scroll to bottom after message is added to state
         // Use requestAnimationFrame and setTimeout to ensure state update is reflected
