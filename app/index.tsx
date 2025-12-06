@@ -4,22 +4,25 @@ import { useAuth } from '@/context/AuthContext';
 import { useNotifications } from '@/context/NotificationContext';
 import { useTheme } from '@/context/ThemeContext';
 import { conversationsAPI } from '@/services/api';
+import { getConversations as getDbConversations, initDatabase, isDatabaseEmpty, saveConversations as saveDbConversations } from '@/services/database';
+import { syncConversations } from '@/services/syncService';
+import { runAsyncStorageMigration } from '@/utils/migrateAsyncStorage';
 import { MaterialCommunityIcons } from '@expo/vector-icons';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import NetInfo from '@react-native-community/netinfo';
 import { useFocusEffect } from '@react-navigation/native';
 import { router } from 'expo-router';
 import React, { useCallback, useEffect, useState } from 'react';
 import {
-  ActivityIndicator,
-  FlatList,
-  RefreshControl,
-  Text,
-  TextInput,
-  TouchableOpacity,
-  View,
+    ActivityIndicator,
+    FlatList,
+    RefreshControl,
+    Text,
+    TextInput,
+    TouchableOpacity,
+    View,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import NetInfo from '@react-native-community/netinfo';
-import AsyncStorage from '@react-native-async-storage/async-storage';
 
 interface Conversation {
   id: number;
@@ -65,30 +68,74 @@ export default function ConversationsScreen() {
   const { requestPermissions, conversationCounts, updateUnreadCount } = useNotifications();
 
   const isDark = currentTheme === 'dark';
+  const [dbInitialized, setDbInitialized] = useState(false);
 
-  // Cache conversations to AsyncStorage
-  const cacheConversations = async (conversationsToCache: Conversation[]) => {
-    try {
-      await AsyncStorage.setItem(CONVERSATIONS_CACHE_KEY, JSON.stringify(conversationsToCache));
-    } catch (error) {
-      console.error('Failed to cache conversations:', error);
-    }
-  };
-
-  // Load cached conversations from AsyncStorage
-  const loadCachedConversations = async (): Promise<Conversation[]> => {
-    try {
-      const cachedData = await AsyncStorage.getItem(CONVERSATIONS_CACHE_KEY);
-      if (cachedData) {
-        const parsed = JSON.parse(cachedData);
-        if (Array.isArray(parsed)) {
-          return parsed;
+  // Initialize database on mount
+  useEffect(() => {
+    let mounted = true;
+    const initDb = async () => {
+      try {
+        await initDatabase();
+        // Run migration from AsyncStorage on first launch
+        await runAsyncStorageMigration();
+        if (mounted) {
+          setDbInitialized(true);
+        }
+      } catch (error) {
+        console.error('[Conversations] Failed to initialize database:', error);
+        // Fallback: still allow app to work with AsyncStorage
+        if (mounted) {
+          setDbInitialized(true);
         }
       }
+    };
+    initDb();
+    return () => {
+      mounted = false;
+    };
+  }, []);
+
+  // Load conversations from SQLite (local-first)
+  const loadCachedConversations = async (): Promise<Conversation[]> => {
+    try {
+      if (!dbInitialized) return [];
+      
+      const dbConvs = await getDbConversations();
+      
+      // Transform database format to UI format
+      return dbConvs.map(conv => ({
+        id: conv.conversation_id,
+        conversation_id: conv.conversation_id,
+        user_id: conv.user_id,
+        name: conv.name,
+        email: conv.email,
+        avatar_url: conv.avatar_url,
+        is_user: conv.conversation_type === 'individual',
+        is_group: conv.conversation_type === 'group',
+        last_message: conv.last_message,
+        last_message_date: conv.last_message_date,
+        last_message_sender_id: conv.last_message_sender_id,
+        last_message_read_at: conv.last_message_read_at,
+        unread_count: conv.unread_count,
+        created_at: conv.created_at,
+        updated_at: conv.updated_at,
+      }));
     } catch (error) {
-      console.error('Failed to load cached conversations:', error);
+      console.error('[Conversations] Error loading from database:', error);
+      // Fallback to AsyncStorage
+      try {
+        const cachedData = await AsyncStorage.getItem(CONVERSATIONS_CACHE_KEY);
+        if (cachedData) {
+          const parsed = JSON.parse(cachedData);
+          if (Array.isArray(parsed)) {
+            return parsed;
+          }
+        }
+      } catch (fallbackError) {
+        console.error('[Conversations] Fallback to AsyncStorage failed:', fallbackError);
+      }
+      return [];
     }
-    return [];
   };
 
   const loadConversations = async (forceRefresh = false) => {
@@ -183,8 +230,35 @@ export default function ConversationsScreen() {
       
       setConversations(uniqueConversations);
       setFilteredConversations(uniqueConversations);
-      // Cache conversations for offline use
-      await cacheConversations(uniqueConversations);
+      
+      // Save to SQLite database
+      try {
+        const conversationsToSave = uniqueConversations.map(conv => ({
+          conversation_id: conv.conversation_id || conv.id,
+          conversation_type: conv.is_group ? 'group' : 'individual',
+          user_id: conv.is_group ? undefined : (conv.user_id || conv.id),
+          group_id: conv.is_group ? (conv.id || conv.conversation_id) : undefined,
+          name: conv.name,
+          email: conv.email,
+          avatar_url: conv.avatar_url,
+          last_message: conv.last_message,
+          last_message_date: conv.last_message_date || conv.updated_at,
+          last_message_sender_id: conv.last_message_sender_id,
+          last_message_read_at: conv.last_message_read_at,
+          unread_count: conv.unread_count ?? 0,
+          created_at: conv.created_at,
+          updated_at: conv.updated_at || conv.last_message_date || new Date().toISOString(),
+        }));
+        await saveDbConversations(conversationsToSave);
+      } catch (dbError) {
+        console.error('[Conversations] Error saving to database:', dbError);
+        // Fallback to AsyncStorage
+        try {
+          await AsyncStorage.setItem(CONVERSATIONS_CACHE_KEY, JSON.stringify(uniqueConversations));
+        } catch (asyncError) {
+          console.error('[Conversations] Error saving to AsyncStorage:', asyncError);
+        }
+      }
     } catch (error: any) {
       console.error('Failed to load conversations:', error);
       // If offline or network error, try to load from cache
@@ -268,35 +342,110 @@ export default function ConversationsScreen() {
   }, [user, isOnline]);
 
   useEffect(() => {
-    // Only load conversations if user is authenticated
-    if (user) {
-      // First try to load from cache for instant display
-      loadCachedConversations().then(cached => {
-        if (cached.length > 0) {
-          setConversations(cached);
-          setFilteredConversations(cached);
-          setIsLoading(false);
+    // Only load conversations if user is authenticated and database is initialized
+    if (user && dbInitialized) {
+      const loadData = async () => {
+        try {
+          // Check if database is empty (first-time user)
+          const isEmpty = await isDatabaseEmpty();
+          
+          if (isEmpty) {
+            // First-time user: Fetch from API first, then save to SQLite
+            if (__DEV__) {
+              console.log('[Conversations] First-time user detected, fetching from API...');
+            }
+            setIsLoading(true);
+            
+            const syncResult = await syncConversations();
+            
+            if (syncResult.success) {
+              // Load from database after sync
+              const synced = await loadCachedConversations();
+              if (synced.length > 0) {
+                setConversations(synced);
+                setFilteredConversations(synced);
+              }
+              setIsLoading(false);
+            } else {
+              // Fallback to regular API load if sync fails
+              await loadConversations();
+            }
+          } else {
+            // Returning user: Load from SQLite instantly
+            if (__DEV__) {
+              console.log('[Conversations] Returning user, loading from SQLite...');
+            }
+            loadCachedConversations().then(cached => {
+              if (cached.length > 0) {
+                setConversations(cached);
+                setFilteredConversations(cached);
+                setIsLoading(false);
+              } else {
+                // If no cached data, fetch from API
+                loadConversations();
+              }
+            });
+            
+            // Then sync from API in background (will update database if successful)
+            syncConversations().then(result => {
+              if (result.success) {
+                // Reload from database to get synced data
+                loadCachedConversations().then(synced => {
+                  if (synced.length > 0) {
+                    setConversations(synced);
+                    setFilteredConversations(synced);
+                  }
+                });
+              }
+            }).catch((error) => {
+              if (__DEV__) {
+                console.error('[Conversations] Background sync failed:', error);
+              }
+            });
+          }
+        } catch (error) {
+          console.error('[Conversations] Error in loadData:', error);
+          // Fallback to regular API load
+          await loadConversations();
         }
-      });
+      };
       
-      // Then load from API (will update cache if successful)
-      loadConversations();
+      loadData();
+      
       // Request notification permissions when the app loads
       requestPermissions();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [user]); // loadConversations and requestPermissions are stable, no need to include
+  }, [user, dbInitialized]); // loadConversations and requestPermissions are stable, no need to include
 
   // Reload conversations when screen comes into focus (e.g., returning from chat)
   // This ensures unread counts are updated after marking messages as read
   useFocusEffect(
     useCallback(() => {
-      // Only reload if user is authenticated
-      if (user) {
-        loadConversations();
+      // Only reload if user is authenticated and database is initialized
+      if (user && dbInitialized) {
+        // Load from local DB first for instant display
+        loadCachedConversations().then(cached => {
+          if (cached.length > 0) {
+            setConversations(cached);
+            setFilteredConversations(cached);
+          }
+        });
+        
+        // Then sync in background
+        syncConversations().then(result => {
+          if (result.success) {
+            loadCachedConversations().then(synced => {
+              if (synced.length > 0) {
+                setConversations(synced);
+                setFilteredConversations(synced);
+              }
+            });
+          }
+        });
       }
       // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [user]) // loadConversations is stable, no need to include
+    }, [user, dbInitialized]) // loadConversations is stable, no need to include
   );
 
   const formatDate = (dateString: string) => {

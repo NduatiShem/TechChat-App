@@ -20,6 +20,7 @@ interface VoiceMessageBubbleProps {
   senderName?: string;
   textPart?: string; // Optional text part for voice messages with text
   readAt?: string | null; // Read receipt timestamp
+  syncStatus?: 'synced' | 'pending' | 'failed'; // Message sync status
 }
 
 export default function VoiceMessageBubble({ 
@@ -29,7 +30,8 @@ export default function VoiceMessageBubble({
   timestamp,
   senderName,
   textPart,
-  readAt
+  readAt,
+  syncStatus = 'synced'
 }: VoiceMessageBubbleProps) {
   const [sound, setSound] = useState<Audio.Sound | null>(null);
   const [isPlaying, setIsPlaying] = useState(false);
@@ -391,6 +393,7 @@ export default function VoiceMessageBubble({
         {isMine && (
           <MessageStatus 
             readAt={readAt} 
+            syncStatus={syncStatus}
             isDark={isDark}
             size={12}
           />

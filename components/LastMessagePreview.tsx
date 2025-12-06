@@ -15,6 +15,7 @@ interface LastMessagePreviewProps {
   }[];
   isFromMe?: boolean; // Whether this message is from the current user
   readAt?: string | null; // Read receipt timestamp
+  syncStatus?: 'synced' | 'pending' | 'failed'; // Message sync status
 }
 
 export default function LastMessagePreview({ 
@@ -23,7 +24,8 @@ export default function LastMessagePreview({
   maxLength = 50,
   attachments = [],
   isFromMe = false,
-  readAt = null
+  readAt = null,
+  syncStatus = 'synced'
 }: LastMessagePreviewProps) {
   // Ensure message is always a string
   const safeMessage = message || '';
@@ -40,6 +42,7 @@ export default function LastMessagePreview({
           {isFromMe && (
             <MessageStatus 
               readAt={readAt} 
+              syncStatus={syncStatus}
               isDark={isDark}
               size={12}
             />
@@ -215,6 +218,7 @@ export default function LastMessagePreview({
           {isFromMe && (
             <MessageStatus 
               readAt={readAt} 
+              syncStatus={syncStatus}
               isDark={isDark}
               size={12}
             />
@@ -241,6 +245,7 @@ export default function LastMessagePreview({
           {isFromMe && (
             <MessageStatus 
               readAt={readAt} 
+              syncStatus={syncStatus}
               isDark={isDark}
               size={12}
             />
