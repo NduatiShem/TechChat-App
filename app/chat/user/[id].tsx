@@ -12,6 +12,9 @@ import { useAuth } from '@/context/AuthContext';
 import { useNotifications } from '@/context/NotificationContext';
 import { useTheme } from '@/context/ThemeContext';
 import { messagesAPI, usersAPI } from '@/services/api';
+import { getDb, getMessages as getDbMessages, hasMessagesForConversation, initDatabase, saveMessages as saveDbMessages, updateMessageStatus } from '@/services/database';
+import { startRetryService } from '@/services/messageRetryService';
+import { syncConversationMessages, syncOlderMessages } from '@/services/syncService';
 import { isVideoAttachment } from '@/utils/textUtils';
 import { MaterialCommunityIcons, MaterialIcons } from '@expo/vector-icons';
 import { useFocusEffect } from '@react-navigation/native';
@@ -38,6 +41,7 @@ interface Message {
   created_at: string;
   read_at?: string | null;
   edited_at?: string | null;
+  sync_status?: 'synced' | 'pending' | 'failed';
   attachments?: {
     id: number;
     name: string;
@@ -110,6 +114,29 @@ export default function UserChatScreen() {
   // Remove the navigation effect - let the AppLayout handle authentication state changes
   const isDark = currentTheme === 'dark';
   const [messages, setMessages] = useState<Message[]>([]);
+  
+  // Helper function to deduplicate messages by ID
+  const deduplicateMessages = useCallback((messagesArray: Message[]): Message[] => {
+    const seenIds = new Set<number>();
+    const uniqueMessages: Message[] = [];
+    
+    for (const msg of messagesArray) {
+      // Only add if we haven't seen this ID before and ID is valid
+      if (msg && msg.id !== undefined && msg.id !== null && msg.id !== 0) {
+        if (!seenIds.has(msg.id)) {
+          seenIds.add(msg.id);
+          uniqueMessages.push(msg);
+        }
+      } else {
+        // For messages without valid IDs, keep them but they should be rare
+        uniqueMessages.push(msg);
+      }
+    }
+    
+            return uniqueMessages.sort((a: Message, b: Message) => 
+              new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
+            );
+  }, []);
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(true);
   const [sending, setSending] = useState(false);
@@ -144,16 +171,83 @@ export default function UserChatScreen() {
   const MAX_RETRY_ATTEMPTS = 5; // Maximum retry attempts
   const INITIAL_RETRY_DELAY = 1000; // Start with 1 second delay
   
+  // Scroll management refs
+  const userScrolledRef = useRef<boolean>(false); // Track if user manually scrolled
+  const isInitialLoadRef = useRef<boolean>(true); // Track if this is the initial load
+  const lastScrollOffsetRef = useRef<number>(0); // Track last scroll offset to detect user scrolling
+  const shouldAutoScrollRef = useRef<boolean>(true); // Flag to determine if auto-scroll should happen
+  
   // Pagination state
   const [currentPage, setCurrentPage] = useState(1);
   const [hasMoreMessages, setHasMoreMessages] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [lastScrollTrigger, setLastScrollTrigger] = useState(0);
+  const [initialScrollIndex, setInitialScrollIndex] = useState<number | undefined>(undefined);
+  const [dbInitialized, setDbInitialized] = useState(false);
+  const [loadedMessagesCount, setLoadedMessagesCount] = useState(0);
+  const MESSAGES_PER_PAGE = 50; // Load 50 messages at a time
+
+  // Initialize database on mount
+  useEffect(() => {
+    let mounted = true;
+    const initDb = async () => {
+      try {
+        await initDatabase();
+        if (mounted) {
+          setDbInitialized(true);
+        }
+      } catch (error) {
+        console.error('[UserChat] Failed to initialize database:', error);
+        if (mounted) {
+          setDbInitialized(true); // Still allow app to work
+        }
+      }
+    };
+    initDb();
+    return () => {
+      mounted = false;
+    };
+  }, []);
 
   // Debug: Log when userInfo changes
   useEffect(() => {
     // UserInfo state changed
   }, [userInfo]);
+
+  // Load messages from local database first (instant display)
+  const loadMessagesFromDb = useCallback(async (limit: number = MESSAGES_PER_PAGE, offset: number = 0): Promise<Message[]> => {
+    try {
+      if (!dbInitialized) return [];
+      
+      const dbMessages = await getDbMessages(Number(id), 'individual', limit, offset);
+      
+      // Transform database format to UI format
+      return dbMessages.map(msg => ({
+        id: msg.server_id || msg.id,
+        message: msg.message || '',
+        sender_id: msg.sender_id,
+        receiver_id: msg.receiver_id,
+        group_id: msg.group_id,
+        created_at: msg.created_at,
+        read_at: msg.read_at,
+        edited_at: msg.edited_at,
+        sync_status: msg.sync_status, // Include sync_status for tick display
+        attachments: msg.attachments?.map(att => ({
+          id: att.server_id || att.id,
+          name: att.name,
+          mime: att.mime,
+          url: att.url,
+          size: att.size,
+          type: att.type,
+        })),
+        reply_to: msg.reply_to,
+        sender: msg.sender, // Include sender info if available
+      }));
+    } catch (error) {
+      console.error('[UserChat] Error loading messages from database:', error);
+      return [];
+    }
+  }, [id, dbInitialized]);
 
   // Fetch messages and user info
   const fetchMessages = useCallback(async (showLoading = true) => {
@@ -161,6 +255,59 @@ export default function UserChatScreen() {
       setLoading(true);
     }
     setHasScrolledToBottom(false); // Reset scroll flag when fetching new messages
+    
+    // Check if this is first-time opening this conversation (no messages in DB)
+    if (dbInitialized) {
+      const hasMessages = await hasMessagesForConversation(Number(id), 'individual');
+      
+      if (!hasMessages) {
+        // First-time: Fetch from API first, then save to SQLite
+        if (__DEV__) {
+          console.log('[UserChat] First-time opening conversation, fetching from API...');
+        }
+        try {
+          const syncResult = await syncConversationMessages(Number(id), 'individual', user?.id || 0);
+          if (syncResult.success && syncResult.newMessagesCount > 0) {
+            // Load from database after sync
+            const syncedMessages = await loadMessagesFromDb(MESSAGES_PER_PAGE, 0);
+            if (syncedMessages.length > 0) {
+              const sorted = syncedMessages.sort((a, b) => 
+                new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
+              );
+              setMessages(sorted);
+              setLoadedMessagesCount(sorted.length);
+              if (sorted.length > 0) {
+                const latestMsg = sorted[sorted.length - 1];
+                latestMessageIdRef.current = latestMsg.id;
+              }
+            }
+          }
+        } catch (syncError) {
+          console.error('[UserChat] Error in first-time sync:', syncError);
+        }
+      } else {
+        // Returning: Load from local database for instant display
+        const localMessages = await loadMessagesFromDb(MESSAGES_PER_PAGE, 0);
+        if (localMessages.length > 0) {
+          const sortedMessages = localMessages.sort((a, b) => 
+            new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
+          );
+          setMessages(sortedMessages);
+          setLoadedMessagesCount(sortedMessages.length);
+          if (showLoading) {
+            setLoading(false);
+          }
+          
+          // Update latest message ID
+          if (sortedMessages.length > 0) {
+            const latestMsg = sortedMessages[sortedMessages.length - 1];
+            latestMessageIdRef.current = latestMsg.id;
+          }
+        }
+      }
+    }
+    
+    // Then sync from API in background (for updates)
     try {
       const res = await messagesAPI.getByUser(Number(id), 1, 10);
       
@@ -234,12 +381,15 @@ export default function UserChatScreen() {
         new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
       );
       
+      // Deduplicate messages before setting state
+      const uniqueMessages = deduplicateMessages(sortedMessages);
+      
       // Find the newest message index for initial scroll
       const newestMessageId = pagination.newest_message_id;
       
       // If we have newest_message_id, find its index after sorting
       if (newestMessageId) {
-        const newestIndex = sortedMessages.findIndex((msg: Message) => msg.id === newestMessageId);
+        const newestIndex = uniqueMessages.findIndex((msg: Message) => msg.id === newestMessageId);
         if (newestIndex >= 0) {
           console.log('Found newest message at index:', newestIndex, 'ID:', newestMessageId);
         } else {
@@ -247,13 +397,57 @@ export default function UserChatScreen() {
         }
       }
       
-      setMessages(sortedMessages);
-      messagesLengthRef.current = sortedMessages.length; // Update ref
+      // Save messages to database
+      if (dbInitialized) {
+        try {
+          const messagesToSave = uniqueMessages.map((msg: any) => ({
+            server_id: msg.id,
+            conversation_id: Number(id),
+            conversation_type: 'individual' as const,
+            sender_id: msg.sender_id,
+            receiver_id: msg.receiver_id,
+            message: msg.message,
+            created_at: msg.created_at,
+            read_at: msg.read_at,
+            edited_at: msg.edited_at,
+            reply_to_id: msg.reply_to_id,
+            sync_status: 'synced' as const,
+            attachments: msg.attachments,
+          }));
+          await saveDbMessages(messagesToSave);
+        } catch (dbError) {
+          console.error('[UserChat] Error saving messages to database:', dbError);
+        }
+      }
       
-      // Update latest message ID for polling detection
-      if (sortedMessages.length > 0) {
-        const latestMsg = sortedMessages[sortedMessages.length - 1]; // Last message is newest (after sorting)
+      // Only update UI if we didn't already load from DB (to avoid flicker)
+      if (!dbInitialized || messages.length === 0) {
+        // Ensure all messages have sync_status (default to 'synced' for API messages)
+        const messagesWithStatus = uniqueMessages.map(msg => ({
+          ...msg,
+          sync_status: msg.sync_status || 'synced' as const,
+        }));
+        setMessages(messagesWithStatus);
+        messagesLengthRef.current = messagesWithStatus.length;
+      } else {
+        // Reload from DB to get merged data (includes sync_status)
+        const mergedMessages = await loadMessagesFromDb(MESSAGES_PER_PAGE, 0);
+        if (mergedMessages.length > 0) {
+          const sorted = mergedMessages.sort((a, b) => 
+            new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
+          );
+          setMessages(sorted);
+          messagesLengthRef.current = sorted.length;
+        }
+      }
+      
+      // Set initialScrollIndex to last message for automatic scroll on mount
+      if (uniqueMessages.length > 0) {
+        setInitialScrollIndex(uniqueMessages.length - 1);
+        const latestMsg = uniqueMessages[uniqueMessages.length - 1]; // Last message is newest (after sorting)
         latestMessageIdRef.current = latestMsg.id;
+      } else {
+        setInitialScrollIndex(undefined);
       }
       
       setUserInfo(res.data.selectedConversation);
@@ -494,21 +688,28 @@ export default function UserChatScreen() {
               new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
             );
             
+            // Deduplicate to ensure no duplicates (extra safety)
+            const uniqueMessages = deduplicateMessages(allMessages);
+            
             // Update latest message ID
-            const latestMsg = allMessages[allMessages.length - 1];
+            const latestMsg = uniqueMessages[uniqueMessages.length - 1];
             latestMessageIdRef.current = latestMsg.id;
             messagesLengthRef.current = allMessages.length;
             
             return allMessages;
           });
           
-          // Auto-scroll to bottom only if user is already at bottom (not scrolling up)
-          // Check if user is near bottom (within 100px)
-          if (flatListRef.current && hasScrolledToBottom) {
-            setTimeout(() => {
-              scrollToBottom(false, 0);
-            }, 100);
-          }
+            // Auto-scroll to bottom when receiving new messages
+            // Only scroll if user is near bottom (hasn't manually scrolled up)
+            // Use shouldAutoScrollRef to check if user is at bottom
+            if (shouldAutoScrollRef.current && !userScrolledRef.current) {
+              // Small delay to let state update complete
+              requestAnimationFrame(() => {
+                setTimeout(() => {
+                  scrollToBottom(false, 0, false); // animated = false, delay = 0, force = false
+                }, 100);
+              });
+            }
         }
       }
     } catch (error: any) {
@@ -551,6 +752,17 @@ export default function UserChatScreen() {
     };
   }, [id, loadingMore, sending, messages.length, pollForNewMessages]);
   
+  // Start retry service on mount
+  useEffect(() => {
+    if (dbInitialized) {
+      startRetryService(30000); // Retry every 30 seconds
+    }
+    
+    return () => {
+      // Cleanup handled by stopRetryService if needed
+    };
+  }, [dbInitialized]);
+  
   // Initial fetch on mount
   useEffect(() => {
     // Reset retry state when conversation changes
@@ -577,7 +789,7 @@ export default function UserChatScreen() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]); // Only depend on id, fetchMessages is stable
   
-  // Cleanup retry timeout and polling on unmount
+  // Cleanup retry timeout, polling, and scroll timeouts on unmount
   useEffect(() => {
     return () => {
       if (retryTimeoutRef.current) {
@@ -591,71 +803,77 @@ export default function UserChatScreen() {
     };
   }, []);
 
-  // Function to scroll to bottom - can be called multiple times
-  const scrollToBottom = useCallback((animated = false, delay = 100) => {
-    if (!flatListRef.current || messages.length === 0) return;
+  // Simple scroll to bottom function using scrollToIndex
+  const scrollToBottom = useCallback((animated = false, delay = 0, force = false) => {
+    // Check if we should auto-scroll (unless forced)
+    if (!force && !shouldAutoScrollRef.current) {
+      return;
+    }
     
-    const scroll = () => {
-      if (!flatListRef.current || messages.length === 0) return;
+    if (!flatListRef.current || messages.length === 0) {
+      return;
+    }
+    
+    const performScroll = () => {
+      if (!flatListRef.current || messages.length === 0) {
+        return;
+      }
       
       try {
-        // Try scrollToEnd first
-        (flatListRef.current as any).scrollToEnd({ animated });
-        setHasScrolledToBottom(true);
-        console.log('Scrolled to bottom');
-      } catch (error) {
-        // Fallback: scroll to last index
-        try {
-          const lastIndex = messages.length - 1;
-          if (lastIndex >= 0) {
-            (flatListRef.current as any).scrollToIndex({ 
-              index: lastIndex, 
-              animated,
-              viewPosition: 1 // 1 = bottom
-            });
-            setHasScrolledToBottom(true);
-            console.log('Scrolled to bottom via scrollToIndex');
-          }
-        } catch (scrollError) {
-          console.warn('Scroll failed:', scrollError);
-          // Last resort: try scrolling after a longer delay
-          setTimeout(() => {
-            if (flatListRef.current && messages.length > 0) {
-              try {
-                (flatListRef.current as any).scrollToEnd({ animated: false });
-              } catch (e) {
-                console.warn('Final scroll attempt failed:', e);
+        // Use requestAnimationFrame to ensure render cycle is complete
+        requestAnimationFrame(() => {
+          if (!flatListRef.current || messages.length === 0) return;
+          
+          try {
+            const lastIndex = messages.length - 1;
+            if (lastIndex >= 0) {
+              (flatListRef.current as any).scrollToIndex({ 
+                index: lastIndex, 
+                animated,
+                viewPosition: 1 // 1 = bottom (0 = top, 1 = bottom)
+              });
+              setHasScrolledToBottom(true);
+              if (!force) {
+                shouldAutoScrollRef.current = false; // Reset after successful scroll
               }
             }
-          }, 500);
-        }
+          } catch (error) {
+            // Fallback: try scrollToEnd if scrollToIndex fails
+            try {
+              (flatListRef.current as any).scrollToEnd({ animated });
+              setHasScrolledToBottom(true);
+              if (!force) {
+                shouldAutoScrollRef.current = false;
+              }
+            } catch (scrollError) {
+              console.warn('Scroll failed:', scrollError);
+            }
+          }
+        });
+      } catch (error) {
+        console.warn('Scroll setup failed:', error);
       }
     };
     
     if (delay > 0) {
-      setTimeout(scroll, delay);
+      setTimeout(performScroll, delay);
     } else {
-      scroll();
+      performScroll();
     }
   }, [messages.length]);
 
   // Scroll to bottom when messages are loaded or conversation changes
   useEffect(() => {
-    // Reset scroll flag when conversation changes
+    // Reset scroll flags when conversation changes
     if (hasScrolledForThisConversation.current !== id) {
       hasScrolledForThisConversation.current = id as string;
       setHasScrolledToBottom(false);
+      isInitialLoadRef.current = true;
+      userScrolledRef.current = false;
+      shouldAutoScrollRef.current = true;
+      lastScrollOffsetRef.current = 0;
     }
-    
-    // Scroll when messages are loaded and not loading
-    if (!loading && messages.length > 0) {
-      // Multiple attempts with increasing delays to handle content rendering
-      scrollToBottom(false, 100);
-      scrollToBottom(false, 300);
-      scrollToBottom(false, 600);
-      scrollToBottom(false, 1000);
-    }
-  }, [loading, messages.length, id, scrollToBottom]);
+  }, [id]);
 
   // Debug: Log all keys and check for duplicates before rendering FlatList
   useEffect(() => {
@@ -760,8 +978,10 @@ export default function UserChatScreen() {
       fetchMessages(!hasExistingMessages);
       
       // Scroll to bottom after a delay to ensure messages are loaded
+      // Enable auto-scroll when conversation is focused
+      shouldAutoScrollRef.current = true;
       setTimeout(() => {
-        scrollToBottom(false, 0);
+        scrollToBottom(false, 0, false);
       }, 500);
 
       const markMessagesAsRead = async () => {
@@ -823,73 +1043,110 @@ export default function UserChatScreen() {
     }, [])
   );
 
-  // Load more messages function
+  // Load more messages function (incremental pagination)
   const loadMoreMessages = async () => {
     if (loadingMore || !hasMoreMessages) return;
     
     isPaginatingRef.current = true; // Mark that we're paginating
     setLoadingMore(true);
+    
     try {
-      const nextPage = currentPage + 1;
-      const res = await messagesAPI.getByUser(Number(id), nextPage, 10);
+      // Load older messages from database first (incremental pagination)
+      const currentOffset = loadedMessagesCount;
+      let newMessages: Message[] = [];
       
-      // Handle Laravel pagination format
-      const newMessages = res.data.messages?.data || res.data.messages || [];
-      const pagination = res.data.messages || {};
-      
-      if (newMessages.length === 0) {
-        setHasMoreMessages(false);
-        return;
+      if (dbInitialized) {
+        // Load next batch from database
+        newMessages = await loadMessagesFromDb(MESSAGES_PER_PAGE, currentOffset);
+        
+        if (newMessages.length > 0) {
+          // Prepend older messages to existing messages
+          setMessages(prev => {
+            const existingIds = new Set(prev.map(m => m.id));
+            const uniqueNewMessages = newMessages.filter(msg => !existingIds.has(msg.id));
+            
+            if (uniqueNewMessages.length === 0) {
+              return prev;
+            }
+            
+            // Combine and sort
+            const allMessages = [...uniqueNewMessages, ...prev];
+            return deduplicateMessages(allMessages);
+          });
+          
+          setLoadedMessagesCount(prev => prev + newMessages.length);
+          
+          // If we got fewer messages than requested, we've reached the end
+          if (newMessages.length < MESSAGES_PER_PAGE) {
+            setHasMoreMessages(false);
+          }
+        } else {
+          // No more messages in database, check if we need to sync from API
+          setHasMoreMessages(false);
+        }
       }
       
-      // Process messages to ensure reply_to data is properly structured
-      // If a message has reply_to_id but no reply_to object, we need to find the original message
-      const processedNewMessages = newMessages.map((msg: any) => {
-        // If message already has reply_to object, use it
-        if (msg.reply_to) {
-          return msg;
+      // Sync older messages from API in background (for next time)
+      if (hasMoreMessages && dbInitialized) {
+        const nextPage = currentPage + 1;
+        syncOlderMessages(Number(id), 'individual', nextPage, MESSAGES_PER_PAGE).then(result => {
+          if (result.success && result.messagesCount > 0) {
+            // Reload from database to get synced messages
+            loadMessagesFromDb(MESSAGES_PER_PAGE * 2, 0).then(synced => {
+              if (synced.length > loadedMessagesCount) {
+                setMessages(synced.sort((a, b) => 
+                  new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
+                ));
+                setLoadedMessagesCount(synced.length);
+                setHasMoreMessages(result.hasMore);
+              }
+            });
+          } else if (!result.hasMore) {
+            setHasMoreMessages(false);
+          }
+        }).catch(error => {
+          console.error('[UserChat] Error syncing older messages:', error);
+        });
+      } else if (!dbInitialized) {
+        // Fallback to API if database not initialized
+        const nextPage = currentPage + 1;
+        const res = await messagesAPI.getByUser(Number(id), nextPage, MESSAGES_PER_PAGE);
+        const apiMessages = res.data.messages?.data || res.data.messages || [];
+        const pagination = res.data.messages || {};
+        
+        if (apiMessages.length === 0) {
+          setHasMoreMessages(false);
+          return;
         }
         
-        // If message has reply_to_id but no reply_to object, we'll resolve it after combining with existing messages
-        return msg;
-      });
-      
-      // Sort new messages by created_at in ascending order (oldest first)
-      const sortedNewMessages = processedNewMessages.sort((a: Message, b: Message) => 
-        new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
-      );
-      
-      // Prepend new messages to existing messages (older messages go at the beginning)
-      // Also process all messages to ensure reply_to references are resolved
-      setMessages(prev => {
-        const allMessages = [...sortedNewMessages, ...prev];
-        // Process all messages to resolve reply_to references
-        return allMessages.map((msg: any) => {
-          // If message has reply_to_id but no reply_to object, find it in all messages
-          if (msg.reply_to_id && !msg.reply_to) {
-            const repliedMessage = allMessages.find((m: any) => m.id === msg.reply_to_id);
-            if (repliedMessage) {
-              msg.reply_to = {
-                id: repliedMessage.id,
-                message: repliedMessage.message,
-                sender: repliedMessage.sender || {
-                  id: repliedMessage.sender_id,
-                  name: repliedMessage.sender?.name || 'Unknown User'
-                },
-                attachments: repliedMessage.attachments || []
-              };
-            }
-          }
-          return msg;
+        const processedMessages = apiMessages.map((msg: any) => ({
+          id: msg.id,
+          message: msg.message || '',
+          sender_id: msg.sender_id,
+          receiver_id: msg.receiver_id,
+          created_at: msg.created_at,
+          read_at: msg.read_at,
+          edited_at: msg.edited_at,
+          attachments: msg.attachments,
+          reply_to: msg.reply_to,
+        }));
+        
+        setMessages(prev => {
+          const existingIds = new Set(prev.map(m => m.id));
+          const uniqueNew = processedMessages.filter((msg: any) => !existingIds.has(msg.id));
+          return deduplicateMessages([...uniqueNew, ...prev]);
         });
-      });
-      setCurrentPage(nextPage);
+        
+        setCurrentPage(nextPage);
+        const hasMore = pagination.current_page < pagination.last_page || 
+                       (apiMessages.length >= MESSAGES_PER_PAGE);
+        setHasMoreMessages(hasMore);
+      }
       
       // Maintain scroll position after loading more messages
       setTimeout(() => {
-        if (flatListRef.current) {
-          // Calculate the new scroll position to maintain the user's view
-          const newScrollPosition = sortedNewMessages.length * 100; // Approximate height per message
+        if (flatListRef.current && newMessages.length > 0) {
+          const newScrollPosition = newMessages.length * 100; // Approximate height per message
           (flatListRef.current as any).scrollToOffset({ 
             offset: newScrollPosition, 
             animated: false 
@@ -897,19 +1154,10 @@ export default function UserChatScreen() {
         }
       }, 100);
       
-      // Check if there are more messages using Laravel pagination
-      const hasMore = pagination.current_page < pagination.last_page || 
-                     pagination.current_page < pagination.lastPage ||
-                     (pagination.current_page && pagination.last_page && pagination.current_page < pagination.last_page) ||
-                     (newMessages.length >= 10); // Fallback: if we got 10 messages, assume there might be more
-      
-      setHasMoreMessages(hasMore);
-      
     } catch (error) {
-      console.error('Error loading more messages:', error);
+      console.error('[UserChat] Error loading more messages:', error);
     } finally {
       setLoadingMore(false);
-      // Reset pagination flag after a delay to allow scroll position to stabilize
       setTimeout(() => {
         isPaginatingRef.current = false;
       }, 1000);
@@ -929,273 +1177,289 @@ export default function UserChatScreen() {
     
     setSending(true);
     
-    // Safety timeout: ensure sending state is reset even if something goes wrong
-    const safetyTimeout = setTimeout(() => {
-      console.warn('Message send timeout - resetting sending state');
-      setSending(false);
-    }, 35000); // 35 seconds (slightly longer than API timeout)
+    // Prepare message text
+    let messageText = input.trim();
+    if (attachment && !messageText) {
+      if (attachment.type?.startsWith('image/') || attachment.isImage) {
+        messageText = '[IMAGE]';
+      } else {
+        messageText = '[FILE]';
+      }
+    }
+    
+    if (voiceRecording) {
+      const voiceMessage = `[VOICE_MESSAGE:${voiceRecording.duration}]`;
+      messageText = messageText ? `${messageText} ${voiceMessage}` : voiceMessage;
+    }
+    
+    // Generate temporary local ID for the message
+    const tempLocalId = Date.now() + Math.random();
+    const now = new Date().toISOString();
+    
+    // Create message object for local storage
+    const localMessage = {
+      id: tempLocalId, // Temporary local ID
+      conversation_id: Number(id),
+      conversation_type: 'individual' as const,
+      sender_id: Number(user?.id || 0),
+      receiver_id: Number(id),
+      message: messageText || null,
+      created_at: now,
+      read_at: null,
+      edited_at: null,
+      reply_to_id: replyingTo?.id || null,
+      sync_status: 'pending' as const,
+      attachments: attachment ? [{
+        name: attachment.name || 'attachment',
+        mime: attachment.type || 'application/octet-stream',
+        url: attachment.uri, // Local URI for now
+        local_path: attachment.uri,
+      }] : voiceRecording ? [{
+        name: 'voice_message.m4a',
+        mime: 'audio/m4a',
+        url: voiceRecording.uri,
+        local_path: voiceRecording.uri,
+      }] : undefined,
+    };
+    
+    // Create message for UI display
+    const uiMessage: any = {
+      id: tempLocalId,
+      conversation_id: Number(id),
+      sender_id: Number(user?.id || 0),
+      receiver_id: Number(id),
+      message: messageText || null,
+      created_at: now,
+      read_at: null,
+      edited_at: null,
+      reply_to_id: replyingTo?.id || null,
+      reply_to: replyingTo || undefined,
+      sender: {
+        id: Number(user?.id || 0),
+        name: user?.name || 'You',
+        avatar_url: user?.avatar_url,
+      },
+      sync_status: 'pending' as const, // Start as pending (single gray tick)
+      attachments: localMessage.attachments,
+    };
     
     try {
-      let formData = new FormData();
-      
-      // Handle file/image attachment
-      let messageText = input.trim();
-      
-      // If attachment exists and no text, add marker similar to voice messages
-      if (attachment && !messageText) {
-        if (attachment.type?.startsWith('image/') || attachment.isImage) {
-          messageText = '[IMAGE]';
-        } else {
-          messageText = '[FILE]';
-        }
-      }
-      
-      formData.append('receiver_id', String(id));
-      
-      // Add reply_to_id if replying to a message
-      if (replyingTo) {
-        formData.append('reply_to_id', replyingTo.id.toString());
-      }
-      
-      // Handle file/image attachment
-      if (attachment) {
-        formData.append('attachments[]', {
-          uri: attachment.uri,
-          name: attachment.name,
-          type: attachment.type,
-        } as any);
-      }
-      
-      // Add text message if present (or marker for attachment)
-      if (messageText && !voiceRecording) {
-        formData.append('message', messageText);
-      }
-      
-      // Handle voice recording - attach file + keep marker text
-      if (voiceRecording) {
-        const voiceMessage = `[VOICE_MESSAGE:${voiceRecording.duration}]`;
-        const combinedMessage = messageText ? `${messageText} ${voiceMessage}` : voiceMessage;
-        formData.append('message', combinedMessage);
-
-        // Important: send as attachments[] so Laravel sees an array
-        // Use a stable filename and correct MIME
-        formData.append('attachments[]', {
-          uri: voiceRecording.uri,
-          name: 'voice_message.m4a',
-          type: 'audio/m4a',
-        } as any);
-
-        // Optional metadata (controller will ignore unknown fields)
-        formData.append('voice_duration', voiceRecording.duration.toString());
-        formData.append('is_voice_message', 'true');
-      }
-      
-      // Add timeout wrapper for message sending to prevent hanging
-      const sendMessageWithTimeout = async () => {
+      // STEP 1: Save to SQLite first with pending status (instant local storage)
+      if (dbInitialized) {
         try {
-          return await messagesAPI.sendMessage(formData);
-        } catch (error: any) {
-          // If it's a timeout, throw a more descriptive error
-          if (error.code === 'ECONNABORTED' || error.message?.includes('timeout')) {
-            throw new Error('Request timeout - message send took too long');
+          await saveDbMessages([{
+            id: tempLocalId,
+            conversation_id: Number(id),
+            conversation_type: 'individual',
+            sender_id: Number(user?.id || 0),
+            receiver_id: Number(id),
+            message: messageText || null,
+            created_at: now,
+            read_at: null,
+            edited_at: null,
+            reply_to_id: replyingTo?.id || null,
+            sync_status: 'pending',
+            attachments: localMessage.attachments,
+          }]);
+          
+          if (__DEV__) {
+            console.log('[UserChat] Saved message to SQLite with pending status:', tempLocalId);
           }
-          throw error;
+        } catch (dbError) {
+          console.error('[UserChat] Error saving to SQLite:', dbError);
+          // Continue anyway - we'll still try to send to API
         }
-      };
-      
-      const res = await sendMessageWithTimeout();
-      
-      // Update last_seen_at when user sends a message (activity indicator)
-      try {
-        await usersAPI.updateLastSeen();
-      } catch (error) {
-        // Silently fail - don't block message sending if last_seen update fails
-        console.warn('Failed to update last_seen_at:', error);
       }
       
-      // Prepare message text to preserve what was sent
-      let messageTextToPreserve = input.trim();
-      if (voiceRecording) {
-        messageTextToPreserve = input.trim() ? `${input.trim()} [VOICE_MESSAGE:${voiceRecording.duration}]` : `[VOICE_MESSAGE:${voiceRecording.duration}]`;
-      } else if (attachment && !input.trim()) {
-        // Add marker for attachment without text
-        messageTextToPreserve = attachment.type?.startsWith('image/') || attachment.isImage ? '[IMAGE]' : '[FILE]';
-      }
-      
-      // Ensure the message has sender_id set correctly from backend response
-      // Also preserve reply_to data if it exists in response or from replyingTo state
-      const newMessage = {
-        ...res.data,
-        message: res.data.message || messageTextToPreserve, // Preserve message text
-        sender_id: res.data.sender_id || Number(user?.id), // Ensure sender_id is set as number
-        receiver_id: res.data.receiver_id || Number(id), // Ensure receiver_id is set
-        sender: res.data.sender || {
-          id: Number(user?.id),
-          name: user?.name,
-          avatar_url: user?.avatar_url
-        },
-        // Preserve reply_to from backend response, or construct from replyingTo state
-        reply_to: res.data.reply_to || (replyingTo ? {
-          id: replyingTo.id,
-          message: replyingTo.message,
-          sender: replyingTo.sender || {
-            id: replyingTo.sender_id,
-            name: replyingTo.sender?.name || 'Unknown User'
-          },
-          attachments: replyingTo.attachments || []
-        } : undefined)
-      };
-      
-      console.log('New message sent (individual):', {
-        id: newMessage.id,
-        message: newMessage.message,
-        originalInput: input.trim(),
-        messageTextToPreserve: messageTextToPreserve,
-        resDataMessage: res.data?.message,
-        sender_id: newMessage.sender_id,
-        user_id: user?.id,
-        isMine: newMessage.sender_id === user?.id,
-        sender: newMessage.sender,
-        fullResData: res.data
-      });
-      
-      // Ensure the message has a valid ID - if not, use a temporary unique ID
-      if (!newMessage.id || newMessage.id === 0) {
-        console.warn('Message response missing ID, using temporary ID');
-        newMessage.id = Date.now() + Math.random(); // Temporary unique ID
-      }
-      
+      // STEP 2: Show message immediately in UI (optimistic update)
       setMessages(prev => {
-        // Check if message already exists to prevent duplicates
-        // Only check if newMessage has a valid ID
-        if (newMessage.id && newMessage.id !== 0) {
-          const messageExists = prev.some(msg => msg.id === newMessage.id);
-          if (messageExists) {
-            console.log('Message already exists in state, skipping:', newMessage.id);
-            return prev;
-          }
-        }
-        
-        console.log('Adding new message to state:', {
-          messageId: newMessage.id,
-          messageText: newMessage.message?.substring(0, 50),
-          currentMessagesCount: prev.length,
-          newMessagesCount: prev.length + 1
-        });
-        
-        // Add new message and sort by created_at to ensure correct order
-        const updatedMessages = [...prev, newMessage].sort((a, b) => {
+        const updatedMessages = [...prev, uiMessage].sort((a, b) => {
           const dateA = new Date(a.created_at).getTime();
           const dateB = new Date(b.created_at).getTime();
-          return dateA - dateB; // Ascending order (oldest first)
+          return dateA - dateB;
         });
         
-        // Update latest message ID when user sends a message
-        if (updatedMessages.length > 0) {
-          const latestMsg = updatedMessages[updatedMessages.length - 1];
+        const uniqueMessages = deduplicateMessages(updatedMessages);
+        
+        if (uniqueMessages.length > 0) {
+          const latestMsg = uniqueMessages[uniqueMessages.length - 1];
           latestMessageIdRef.current = latestMsg.id;
         }
         
-        // Scroll to bottom after message is added to state
-        // Use requestAnimationFrame and setTimeout to ensure state update is reflected
+        // Scroll to bottom
+        shouldAutoScrollRef.current = true;
+        userScrolledRef.current = false;
         requestAnimationFrame(() => {
           setTimeout(() => {
-            if (flatListRef.current) {
-              try {
-                (flatListRef.current as any).scrollToEnd({ animated: true });
-              } catch (error) {
-                // If scrollToEnd fails, try scrolling to the last item by index
-                console.warn('scrollToEnd failed, trying scrollToIndex:', error);
-                try {
-                  // Wait for layout to complete, then scroll to last index
-                  setTimeout(() => {
-                    if (flatListRef.current) {
-                      const lastIndex = updatedMessages.length - 1;
-                      (flatListRef.current as any).scrollToIndex({ 
-                        index: lastIndex, 
-                        animated: true,
-                        viewPosition: 1 // 1 means bottom (0 = top, 1 = bottom)
-                      });
-                    }
-                  }, 100);
-                } catch (scrollError) {
-                  console.warn('scrollToIndex also failed:', scrollError);
-                }
-              }
-            }
-          }, (attachment || voiceRecording) ? 300 : 100);
+            scrollToBottom(true, 0, true);
+          }, attachment || voiceRecording ? 200 : 50);
         });
         
-        // Also scroll after content size changes (for images/files)
-        requestAnimationFrame(() => {
-          setTimeout(() => {
-            if (flatListRef.current) {
-              try {
-                (flatListRef.current as any).scrollToEnd({ animated: true });
-              } catch (error) {
-                console.warn('Second scrollToEnd failed:', error);
-              }
-            }
-          }, (attachment || voiceRecording) ? 400 : 200);
-        });
-        
-        return updatedMessages;
+        return uniqueMessages;
       });
+      
+      // Clear input immediately for better UX
       setInput('');
       setAttachment(null);
       setVoiceRecording(null);
-      setReplyingTo(null); // Clear reply state
+      setReplyingTo(null);
       setShowEmoji(false);
+      setSending(false); // Reset sending state - API call happens in background
+      
+      // STEP 3: Send to API in background (non-blocking)
+      (async () => {
+        try {
+          // Check if message already has server_id (already synced) before sending
+          // This prevents duplicate sends if retry service already sent it
+          if (dbInitialized) {
+            try {
+              const database = await getDb();
+              if (database) {
+                const existingMessage = await database.getFirstAsync<{ server_id?: number }>(
+                  `SELECT server_id FROM messages WHERE id = ?`,
+                  [tempLocalId]
+                );
+                
+                if (existingMessage?.server_id) {
+                  if (__DEV__) {
+                    console.log(`[UserChat] Message ${tempLocalId} already has server_id ${existingMessage.server_id}, skipping API call`);
+                  }
+                  // Update UI with server ID
+                  setMessages(prev => prev.map(msg => 
+                    msg.id === tempLocalId 
+                      ? { ...msg, id: existingMessage.server_id!, sync_status: 'synced' }
+                      : msg
+                  ));
+                  return; // Don't send again
+                }
+              }
+            } catch (checkError) {
+              // Continue with send if check fails
+              if (__DEV__) {
+                console.warn('[UserChat] Error checking message status:', checkError);
+              }
+            }
+          }
+          
+          let formData = new FormData();
+          formData.append('receiver_id', String(id));
+          
+          if (replyingTo) {
+            formData.append('reply_to_id', replyingTo.id.toString());
+          }
+          
+          if (attachment) {
+            formData.append('attachments[]', {
+              uri: attachment.uri,
+              name: attachment.name,
+              type: attachment.type,
+            } as any);
+          }
+          
+          if (messageText && !voiceRecording) {
+            formData.append('message', messageText);
+          }
+          
+          if (voiceRecording) {
+            formData.append('message', messageText);
+            formData.append('attachments[]', {
+              uri: voiceRecording.uri,
+              name: 'voice_message.m4a',
+              type: 'audio/m4a',
+            } as any);
+            formData.append('voice_duration', voiceRecording.duration.toString());
+            formData.append('is_voice_message', 'true');
+          }
+          
+          // Send to API
+          const res = await messagesAPI.sendMessage(formData);
+          
+          // STEP 4: Update SQLite with server response (change status to synced, update server_id)
+          if (res.data && res.data.id && dbInitialized) {
+            try {
+              await updateMessageStatus(tempLocalId, res.data.id, 'synced');
+              
+              // Update UI message with server ID
+              setMessages(prev => prev.map(msg => 
+                msg.id === tempLocalId 
+                  ? { ...msg, id: res.data.id, sync_status: 'synced' }
+                  : msg
+              ));
+              
+              // Update latest message ID
+              latestMessageIdRef.current = res.data.id;
+              
+              if (__DEV__) {
+                console.log('[UserChat] Message synced successfully:', tempLocalId, '->', res.data.id);
+              }
+            } catch (updateError) {
+              console.error('[UserChat] Error updating message status:', updateError);
+            }
+          }
+          
+          // Update last_seen_at
+          try {
+            await usersAPI.updateLastSeen();
+          } catch (error) {
+            // Silently fail
+          }
+          
+        } catch (apiError: any) {
+          // STEP 5: Handle API failure gracefully
+          console.error('[UserChat] Error sending message to API:', apiError);
+          
+          // Check if it's a network error (retryable) or permanent error
+          const isNetworkError = 
+            apiError.message === 'Network Error' || 
+            !apiError.response ||
+            apiError.code === 'ECONNABORTED' ||
+            apiError.message?.includes('timeout');
+          
+          if (dbInitialized) {
+            if (!isNetworkError && apiError.response?.status >= 400 && apiError.response?.status < 500) {
+              // Client error (4xx) - mark as failed
+              await updateMessageStatus(tempLocalId, undefined, 'failed');
+              
+              // Update UI to show failed status
+              setMessages(prev => prev.map(msg => 
+                msg.id === tempLocalId 
+                  ? { ...msg, sync_status: 'failed' }
+                  : msg
+              ));
+              
+              if (__DEV__) {
+                console.log('[UserChat] Message marked as failed:', tempLocalId);
+              }
+            } else {
+              // Network/server error - keep as pending for retry
+              // Retry service will handle it
+              if (__DEV__) {
+                console.log('[UserChat] Message kept as pending for retry:', tempLocalId);
+              }
+            }
+          }
+          
+          // Show user-friendly error (non-blocking)
+          if (!isNetworkError) {
+            Alert.alert(
+              'Message Pending',
+              'Your message was saved locally but couldn\'t be sent. It will be retried automatically.',
+              [{ text: 'OK' }]
+            );
+          }
+        }
+      })();
+      
     } catch (e: unknown) {
       const error = e as any;
-      console.error('Error sending message:', error);
-      console.error('Error details:', {
-        message: error.message,
-        status: error.response?.status,
-        statusText: error.response?.statusText,
-        data: error.response?.data,
-        requestData: {
-          input: input,
-          hasAttachment: !!attachment,
-          hasVoiceRecording: !!voiceRecording,
-          voiceDuration: voiceRecording?.duration,
-          replyingTo: replyingTo?.id
-        }
-      });
-      
-      // Handle specific database constraint errors
-      if (error.response?.data?.exception === 'Illuminate\\Database\\QueryException') {
-        // If it's a voice message with database constraint error, still show the message
-        if (voiceRecording) {
-          // Don't show error alert, just log it
-        } else {
-          Alert.alert(
-            'Error Sending Message',
-            'There was a problem saving your message. This might be due to a database constraint issue. Please try again.',
-            [{ text: 'OK' }]
-          );
-        }
-      } else {
-        // Check if it's a timeout error
-        if (error.code === 'ECONNABORTED' || error.message?.includes('timeout')) {
-          Alert.alert(
-            'Connection Timeout',
-            'The message is taking too long to send. Please check your internet connection and try again.',
-            [{ text: 'OK' }]
-          );
-        } else if (error.message === 'Network Error' || !error.response) {
-          Alert.alert(
-            'Network Error',
-            'Unable to connect to the server. Please check your internet connection and try again.',
-            [{ text: 'OK' }]
-          );
-        } else {
-          Alert.alert('Error', 'Failed to send message. Please try again.');
-        }
-      }
-    } finally {
-      clearTimeout(safetyTimeout);
+      console.error('[UserChat] Error in handleSend:', error);
       setSending(false);
+      
+      Alert.alert(
+        'Error',
+        'Failed to save message. Please try again.',
+        [{ text: 'OK' }]
+      );
     }
   };
 
@@ -1616,6 +1880,7 @@ export default function UserChatScreen() {
             timestamp={timestamp}
             textPart={voiceMessageData.textPart}
             readAt={item.read_at}
+            syncStatus={item.sync_status || 'synced'}
           />
         </TouchableOpacity>
       );
@@ -1728,6 +1993,7 @@ export default function UserChatScreen() {
                   {isMine && (
                     <MessageStatus 
                       readAt={item.read_at} 
+                      syncStatus={item.sync_status || 'synced'}
                       isDark={isDark}
                       size={12}
                     />
@@ -1803,6 +2069,7 @@ export default function UserChatScreen() {
                   {isMine && (
                     <MessageStatus 
                       readAt={item.read_at} 
+                      syncStatus={item.sync_status || 'synced'}
                       isDark={isDark}
                       size={12}
                     />
@@ -1892,6 +2159,7 @@ export default function UserChatScreen() {
                   {isMine && (
                     <MessageStatus 
                       readAt={item.read_at} 
+                      syncStatus={item.sync_status || 'synced'}
                       isDark={isDark}
                       size={12}
                     />
@@ -2276,15 +2544,29 @@ export default function UserChatScreen() {
               data={messages}
               renderItem={renderItem}
               extraData={messages.length} // Force re-render when messages array changes
+              initialScrollIndex={initialScrollIndex}
+              initialNumToRender={30} // Render 30 items initially for better performance
+              windowSize={10} // Keep 10 screens worth of items in memory (optimized)
+              maxToRenderPerBatch={15} // Render 15 items per batch
+              removeClippedSubviews={true} // Remove off-screen views for better performance
+              updateCellsBatchingPeriod={50} // Batch updates every 50ms
+              onEndReached={() => {
+                // Load more messages when reaching the top (older messages)
+                if (hasMoreMessages && !loadingMore) {
+                  loadMoreMessages();
+                }
+              }}
+              onEndReachedThreshold={0.1} // Trigger when 10% from top
               keyExtractor={(item, index) => {
                 // Use message ID if available, otherwise use index with a stable fallback
                 if (item && item.id !== undefined && item.id !== null && item.id !== 0) {
                   return `message-${item.id}`;
                 }
                 // For messages without IDs, use index and created_at if available
+                // Include sender_id to make it more unique
                 const fallbackKey = item?.created_at 
-                  ? `message-fallback-${index}-${item.created_at}` 
-                  : `message-fallback-${index}-${Math.random().toString(36).slice(2)}`;
+                  ? `message-fallback-${index}-${item.sender_id || 'unknown'}-${item.created_at}` 
+                  : `message-fallback-${index}-${item.sender_id || 'unknown'}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
                 return fallbackKey;
               }}
               style={{ flex: 1 }}
@@ -2295,15 +2577,52 @@ export default function UserChatScreen() {
               inverted={false} // Make sure it's not inverted
               keyboardShouldPersistTaps="handled"
               keyboardDismissMode={Platform.OS === 'ios' ? 'interactive' : 'on-drag'}
-              // Don't use initialScrollIndex - it causes blank screen
-              // Scroll will happen after content is rendered via onContentSizeChange
+              onScrollToIndexFailed={(info) => {
+                // Handle scrollToIndex failures (e.g., item not rendered yet)
+                // Fallback to scrollToEnd
+                const wait = new Promise(resolve => setTimeout(resolve, 500));
+                wait.then(() => {
+                  if (flatListRef.current && messages.length > 0) {
+                    try {
+                      (flatListRef.current as any).scrollToEnd({ animated: false });
+                      setHasScrolledToBottom(true);
+                    } catch (error) {
+                      console.warn('Fallback scrollToEnd also failed:', error);
+                    }
+                  }
+                });
+              }}
               onScroll={({ nativeEvent }) => {
-                const { contentOffset } = nativeEvent;
+                const { contentOffset, contentSize, layoutMeasurement } = nativeEvent;
                 
-                // Use a threshold instead of exactly 0, as FlatList might not reach exactly 0
+                // Detect user-initiated scrolling
+                const currentOffset = contentOffset.y;
+                const previousOffset = lastScrollOffsetRef.current;
+                
+                // Calculate if user is near bottom (within 100px threshold)
+                const contentHeight = contentSize.height;
+                const viewportHeight = layoutMeasurement.height;
+                const distanceFromBottom = contentHeight - (currentOffset + viewportHeight);
+                const isNearBottom = distanceFromBottom <= 100;
+                
+                // Detect if this is a user-initiated scroll (not programmatic)
+                // If offset changed significantly and we're not near bottom, user scrolled
+                if (previousOffset !== 0 && Math.abs(currentOffset - previousOffset) > 10) {
+                  if (!isNearBottom) {
+                    // User scrolled away from bottom
+                    userScrolledRef.current = true;
+                    shouldAutoScrollRef.current = false;
+                  } else {
+                    // User scrolled back to bottom
+                    userScrolledRef.current = false;
+                    shouldAutoScrollRef.current = true;
+                  }
+                }
+                
+                lastScrollOffsetRef.current = currentOffset;
+                
+                // Load more messages when at top (existing functionality)
                 const isAtTop = contentOffset.y <= 50; // Within 50 pixels of the top
-                
-                // Debounce: only trigger once every 2 seconds
                 const now = Date.now();
                 if (isAtTop && hasMoreMessages && !loadingMore && (now - lastScrollTrigger > 2000)) {
                   setLastScrollTrigger(now);
@@ -2333,15 +2652,66 @@ export default function UserChatScreen() {
                 ) : null
               }
               onContentSizeChange={() => {
-                // Scroll to bottom when content size changes (e.g., images load)
-                if (!loading && messages.length > 0 && !hasScrolledToBottom) {
-                  scrollToBottom(false, 0);
+                // Scroll to bottom when content size changes (e.g., images load, new messages)
+                // Only scroll if user is at bottom or it's initial load
+                if (!loading && messages.length > 0 && shouldAutoScrollRef.current && !userScrolledRef.current) {
+                  // Use scrollToEnd which is more reliable - wait a bit for content to be fully rendered
+                  setTimeout(() => {
+                    if (flatListRef.current && messages.length > 0 && shouldAutoScrollRef.current) {
+                      try {
+                        (flatListRef.current as any).scrollToEnd({ animated: false });
+                        setHasScrolledToBottom(true);
+                        if (isInitialLoadRef.current) {
+                          isInitialLoadRef.current = false;
+                        }
+                      } catch (error) {
+                        // Fallback: try scrollToIndex
+                        try {
+                          const lastIndex = messages.length - 1;
+                          (flatListRef.current as any).scrollToIndex({ 
+                            index: lastIndex, 
+                            animated: false,
+                            viewPosition: 1
+                          });
+                          setHasScrolledToBottom(true);
+                          if (isInitialLoadRef.current) {
+                            isInitialLoadRef.current = false;
+                          }
+                        } catch (scrollError) {
+                          console.warn('Scroll failed:', scrollError);
+                        }
+                      }
+                    }
+                  }, 200);
                 }
               }}
               onLayout={() => {
-                // Scroll to bottom when layout is ready
-                if (!loading && messages.length > 0 && !hasScrolledToBottom) {
-                  scrollToBottom(false, 0);
+                // Scroll to bottom when layout is ready (only on initial load)
+                if (!loading && messages.length > 0 && isInitialLoadRef.current && shouldAutoScrollRef.current) {
+                  // Use multiple attempts with increasing delays to ensure scroll happens
+                  const attemptScroll = (delay: number) => {
+                    setTimeout(() => {
+                      if (flatListRef.current && messages.length > 0 && isInitialLoadRef.current) {
+                        try {
+                          (flatListRef.current as any).scrollToEnd({ animated: false });
+                          setHasScrolledToBottom(true);
+                          isInitialLoadRef.current = false;
+                        } catch (error) {
+                          // Try again with longer delay if this attempt failed
+                          if (delay < 500) {
+                            attemptScroll(delay + 100);
+                          } else {
+                            console.warn('Scroll failed after multiple attempts:', error);
+                          }
+                        }
+                      }
+                    }, delay);
+                  };
+                  
+                  // Start with requestAnimationFrame, then try with delays
+                  requestAnimationFrame(() => {
+                    attemptScroll(100);
+                  });
                 }
               }}
               ListEmptyComponent={() => (

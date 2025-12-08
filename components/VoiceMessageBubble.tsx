@@ -3,7 +3,6 @@ import { MaterialCommunityIcons } from '@expo/vector-icons';
 import { Audio } from 'expo-av';
 import React, { useEffect, useRef, useState } from 'react';
 import {
-    Alert,
     Animated,
     StyleSheet,
     Text,
@@ -20,6 +19,7 @@ interface VoiceMessageBubbleProps {
   senderName?: string;
   textPart?: string; // Optional text part for voice messages with text
   readAt?: string | null; // Read receipt timestamp
+  syncStatus?: 'synced' | 'pending' | 'failed'; // Message sync status
 }
 
 export default function VoiceMessageBubble({ 
@@ -29,12 +29,14 @@ export default function VoiceMessageBubble({
   timestamp,
   senderName,
   textPart,
-  readAt
+  readAt,
+  syncStatus = 'synced'
 }: VoiceMessageBubbleProps) {
   const [sound, setSound] = useState<Audio.Sound | null>(null);
   const [isPlaying, setIsPlaying] = useState(false);
   const [position, setPosition] = useState(0);
   const [isLoading, setIsLoading] = useState(false);
+  const [hasError, setHasError] = useState(false);
   const { currentTheme } = useTheme();
   
   const isDark = currentTheme === 'dark';
@@ -90,6 +92,7 @@ export default function VoiceMessageBubble({
 
       console.log('VoiceMessageBubble - Sound object created successfully');
       setSound(newSound);
+      setHasError(false);
     } catch (error: unknown) {
       const err = error as any;
       console.error('Error loading audio:', error);
@@ -101,10 +104,8 @@ export default function VoiceMessageBubble({
       });
       
       setSound(null);
-      // Don't show alert for missing URI, just log the error
-      if (uri) {
-        Alert.alert('Error', 'Failed to load audio file.');
-      }
+      setHasError(true);
+      // Silently handle error - show error state in UI instead of popup
     } finally {
       setIsLoading(false);
     }
@@ -133,13 +134,8 @@ export default function VoiceMessageBubble({
   };
 
   const togglePlayback = async () => {
-    // If no URI, show a message that audio is not available
-    if (!uri) {
-      Alert.alert(
-        'Audio Not Available', 
-        'Voice message audio is temporarily unavailable due to a database constraint issue. The message was sent successfully, but the audio file could not be saved. This will be fixed in the next update.',
-        [{ text: 'OK' }]
-      );
+    // If no URI or has error, silently return (error state already shown in UI)
+    if (!uri || hasError) {
       return;
     }
 
@@ -225,9 +221,12 @@ export default function VoiceMessageBubble({
       if (err?.message?.includes('Player does not exist')) {
         console.log('VoiceMessageBubble - Player does not exist, reloading audio...');
         setSound(null);
+        setHasError(false);
         await loadAudio();
       } else {
-        Alert.alert('Error', 'Failed to play/pause audio.');
+        // Silently handle error - show error state in UI
+        setHasError(true);
+        setSound(null);
       }
     }
   };
@@ -349,10 +348,10 @@ export default function VoiceMessageBubble({
             styles.playButton,
             { backgroundColor: isMine ? 'rgba(255, 255, 255, 0.2)' : 'rgba(0, 0, 0, 0.1)' }
           ]}
-          disabled={isLoading}
+          disabled={isLoading || hasError || !uri}
         >
           <MaterialCommunityIcons 
-            name={!uri ? 'alert-circle' : (isLoading ? 'loading' : (isPlaying ? 'pause' : 'play'))} 
+            name={!uri || hasError ? 'alert-circle' : (isLoading ? 'loading' : (isPlaying ? 'pause' : 'play'))} 
             size={16} 
             color={isMine ? '#FFFFFF' : (isDark ? '#FFFFFF' : '#1F2937')} 
           />
@@ -360,12 +359,15 @@ export default function VoiceMessageBubble({
 
         {/* Waveform or Message */}
         <View style={styles.waveformWrapper}>
-          {uri ? renderWaveform() : (
+          {uri && !hasError ? renderWaveform() : (
             <Text style={[
               styles.unavailableText,
               { color: isMine ? '#E0E7FF' : (isDark ? '#9CA3AF' : '#6B7280') }
             ]}>
-              Voice message ({formatTime(duration)}) - Audio temporarily unavailable
+              {!uri 
+                ? `Voice message (${formatTime(duration)}) - Audio temporarily unavailable`
+                : `Voice message (${formatTime(duration)}) - Unable to load audio`
+              }
             </Text>
           )}
         </View>
@@ -375,7 +377,7 @@ export default function VoiceMessageBubble({
           styles.durationText,
           { color: isMine ? '#E0E7FF' : (isDark ? '#9CA3AF' : '#6B7280') }
         ]}>
-          {uri ? `${formatTime(position)} / ${formatTime(duration)}` : formatTime(duration)}
+          {uri && !hasError ? `${formatTime(position)} / ${formatTime(duration)}` : formatTime(duration)}
         </Text>
       </View>
 
@@ -391,6 +393,7 @@ export default function VoiceMessageBubble({
         {isMine && (
           <MessageStatus 
             readAt={readAt} 
+            syncStatus={syncStatus}
             isDark={isDark}
             size={12}
           />

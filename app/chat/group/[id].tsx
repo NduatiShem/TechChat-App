@@ -12,6 +12,9 @@ import { useAuth } from '@/context/AuthContext';
 import { useNotifications } from '@/context/NotificationContext';
 import { useTheme } from '@/context/ThemeContext';
 import { groupsAPI, messagesAPI, usersAPI } from '@/services/api';
+import { getDb, getMessages as getDbMessages, hasMessagesForConversation, initDatabase, saveMessages as saveDbMessages, updateMessageStatus } from '@/services/database';
+import { startRetryService } from '@/services/messageRetryService';
+import { syncConversationMessages } from '@/services/syncService';
 import { isVideoAttachment } from '@/utils/textUtils';
 import { MaterialCommunityIcons, MaterialIcons } from '@expo/vector-icons';
 import { useFocusEffect } from '@react-navigation/native';
@@ -23,20 +26,20 @@ import { router, useLocalSearchParams } from 'expo-router';
 import * as Sharing from 'expo-sharing';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
-  ActivityIndicator,
-  Alert,
-  BackHandler,
-  FlatList,
-  Image,
-  Keyboard,
-  KeyboardAvoidingView,
-  Modal,
-  Platform,
-  StatusBar,
-  Text,
-  TextInput,
-  TouchableOpacity,
-  View
+    ActivityIndicator,
+    Alert,
+    BackHandler,
+    FlatList,
+    Image,
+    Keyboard,
+    KeyboardAvoidingView,
+    Modal,
+    Platform,
+    StatusBar,
+    Text,
+    TextInput,
+    TouchableOpacity,
+    View
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
@@ -48,6 +51,7 @@ interface Message {
   created_at: string;
   read_at?: string | null;
   edited_at?: string | null;
+  sync_status?: 'synced' | 'pending' | 'failed';
   attachments?: {
     id: number;
     name: string;
@@ -139,6 +143,29 @@ export default function GroupChatScreen() {
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
   const [keyboardHeight, setKeyboardHeight] = useState(0);
 
+  // Helper function to deduplicate messages by ID
+  const deduplicateMessages = useCallback((messagesArray: Message[]): Message[] => {
+    const seenIds = new Set<number>();
+    const uniqueMessages: Message[] = [];
+    
+    for (const msg of messagesArray) {
+      // Only add if we haven't seen this ID before and ID is valid
+      if (msg && msg.id !== undefined && msg.id !== null && msg.id !== 0) {
+        if (!seenIds.has(msg.id)) {
+          seenIds.add(msg.id);
+          uniqueMessages.push(msg);
+        }
+      } else {
+        // For messages without valid IDs, keep them but they should be rare
+        uniqueMessages.push(msg);
+      }
+    }
+    
+    return uniqueMessages.sort((a: Message, b: Message) => 
+      new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
+    );
+  }, []);
+
   const flatListRef = useRef<FlatList>(null);
   const hasScrolledForThisConversation = useRef<string | null>(null); // Track which conversation we've scrolled for
   
@@ -149,11 +176,11 @@ export default function GroupChatScreen() {
   const isPaginatingRef = useRef<boolean>(false); // Track if user is currently paginating (loading older messages)
   const lastFocusTimeRef = useRef<number>(0); // Track when screen last gained focus
   
-  // Background polling state - for checking new messages
+  // Background sync state - for checking new messages (uses sync service + SQLite)
   const pollingIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const latestMessageIdRef = useRef<number | null>(null); // Track latest message ID to detect new messages
-  const isPollingRef = useRef<boolean>(false); // Track if polling is active
-  const POLLING_INTERVAL = 3000; // Poll every 3 seconds
+  const isPollingRef = useRef<boolean>(false); // Track if sync is active
+  const POLLING_INTERVAL = 3000; // Sync every 3 seconds
   const MAX_RETRY_ATTEMPTS = 5; // Maximum retry attempts
   const INITIAL_RETRY_DELAY = 1000; // Start with 1 second delay
   
@@ -163,6 +190,65 @@ export default function GroupChatScreen() {
   const [loadingMore, setLoadingMore] = useState(false);
   const [lastScrollTrigger, setLastScrollTrigger] = useState(0);
   const [hasScrolledToBottom, setHasScrolledToBottom] = useState(false);
+  const [dbInitialized, setDbInitialized] = useState(false);
+  const [loadedMessagesCount, setLoadedMessagesCount] = useState(0);
+  const MESSAGES_PER_PAGE = 50; // Load 50 messages at a time
+
+  // Initialize database on mount
+  useEffect(() => {
+    let mounted = true;
+    const initDb = async () => {
+      try {
+        await initDatabase();
+        if (mounted) {
+          setDbInitialized(true);
+        }
+      } catch (error) {
+        console.error('[GroupChat] Failed to initialize database:', error);
+        if (mounted) {
+          setDbInitialized(true); // Still allow app to work
+        }
+      }
+    };
+    initDb();
+    return () => {
+      mounted = false;
+    };
+  }, []);
+
+  // Load messages from local database first (instant display)
+  const loadMessagesFromDb = useCallback(async (limit: number = MESSAGES_PER_PAGE, offset: number = 0): Promise<Message[]> => {
+    try {
+      if (!dbInitialized) return [];
+      
+      const dbMessages = await getDbMessages(Number(id), 'group', limit, offset);
+      
+      // Transform database format to UI format
+      return dbMessages.map(msg => ({
+        id: msg.server_id || msg.id,
+        message: msg.message || '',
+        sender_id: msg.sender_id,
+        group_id: msg.group_id || Number(id),
+        created_at: msg.created_at,
+        read_at: msg.read_at,
+        edited_at: msg.edited_at,
+        sync_status: msg.sync_status, // Include sync_status for tick display
+        attachments: msg.attachments?.map(att => ({
+          id: att.server_id || att.id,
+          name: att.name,
+          mime: att.mime,
+          url: att.url,
+          size: att.size,
+          type: att.type,
+        })),
+        reply_to: msg.reply_to,
+        sender: msg.sender, // Include sender info if available
+      }));
+    } catch (error) {
+      console.error('[GroupChat] Error loading messages from database:', error);
+      return [];
+    }
+  }, [id, dbInitialized]);
 
   // Fetch messages
   const fetchMessages = useCallback(async (showLoading = true) => {
@@ -171,6 +257,59 @@ export default function GroupChatScreen() {
         setLoading(true);
       }
       setHasScrolledToBottom(false); // Reset scroll flag when fetching new messages
+      
+      // Check if this is first-time opening this conversation (no messages in DB)
+      if (dbInitialized) {
+        const hasMessages = await hasMessagesForConversation(Number(id), 'group');
+        
+        if (!hasMessages) {
+          // First-time: Fetch from API first, then save to SQLite
+          if (__DEV__) {
+            console.log('[GroupChat] First-time opening conversation, fetching from API...');
+          }
+          try {
+            const syncResult = await syncConversationMessages(Number(id), 'group', user?.id || 0);
+            if (syncResult.success && syncResult.newMessagesCount > 0) {
+              // Load from database after sync
+              const syncedMessages = await loadMessagesFromDb(MESSAGES_PER_PAGE, 0);
+              if (syncedMessages.length > 0) {
+                const sorted = syncedMessages.sort((a, b) => 
+                  new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
+                );
+                setMessages(sorted);
+                setLoadedMessagesCount(sorted.length);
+                if (sorted.length > 0) {
+                  const latestMsg = sorted[sorted.length - 1];
+                  latestMessageIdRef.current = latestMsg.id;
+                }
+              }
+            }
+          } catch (syncError) {
+            console.error('[GroupChat] Error in first-time sync:', syncError);
+          }
+        } else {
+          // Returning: Load from local database for instant display
+          const localMessages = await loadMessagesFromDb(MESSAGES_PER_PAGE, 0);
+          if (localMessages.length > 0) {
+            const sortedMessages = localMessages.sort((a, b) => 
+              new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
+            );
+            setMessages(sortedMessages);
+            setLoadedMessagesCount(sortedMessages.length);
+            if (showLoading) {
+              setLoading(false);
+            }
+            
+            // Update latest message ID
+            if (sortedMessages.length > 0) {
+              const latestMsg = sortedMessages[sortedMessages.length - 1];
+              latestMessageIdRef.current = latestMsg.id;
+            }
+          }
+        }
+      }
+      
+      // Then sync from API in background (for updates)
       const response = await messagesAPI.getByGroup(Number(id), 1, 10);
       // Handle Laravel pagination format
       const messagesData = response.data.messages?.data || response.data.messages || [];
@@ -211,10 +350,51 @@ export default function GroupChatScreen() {
       const sortedMessages = processedMessages.sort((a: Message, b: Message) => 
         new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
       );
-      setMessages(sortedMessages);
-      messagesLengthRef.current = sortedMessages.length; // Update ref
+      // Save messages to database
+      if (dbInitialized) {
+        try {
+          const messagesToSave = sortedMessages.map((msg: any) => ({
+            server_id: msg.id,
+            conversation_id: Number(id),
+            conversation_type: 'group' as const,
+            sender_id: msg.sender_id,
+            group_id: Number(id),
+            message: msg.message,
+            created_at: msg.created_at,
+            read_at: msg.read_at,
+            edited_at: msg.edited_at,
+            reply_to_id: msg.reply_to_id,
+            sync_status: 'synced' as const,
+            attachments: msg.attachments,
+          }));
+          await saveDbMessages(messagesToSave);
+        } catch (dbError) {
+          console.error('[GroupChat] Error saving messages to database:', dbError);
+        }
+      }
       
-      // Update latest message ID for polling detection
+      // Only update UI if we didn't already load from DB (to avoid flicker)
+      if (!dbInitialized || messages.length === 0) {
+        // Ensure all messages have sync_status (default to 'synced' for API messages)
+        const messagesWithStatus = sortedMessages.map(msg => ({
+          ...msg,
+          sync_status: msg.sync_status || 'synced' as const,
+        }));
+        setMessages(messagesWithStatus);
+        messagesLengthRef.current = messagesWithStatus.length;
+      } else {
+        // Reload from DB to get merged data (includes sync_status)
+        const mergedMessages = await loadMessagesFromDb(MESSAGES_PER_PAGE, 0);
+        if (mergedMessages.length > 0) {
+          const sorted = mergedMessages.sort((a, b) => 
+            new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
+          );
+          setMessages(sorted);
+          messagesLengthRef.current = sorted.length;
+        }
+      } // Update ref
+      
+      // Update latest message ID for sync detection
       if (sortedMessages.length > 0) {
         const latestMsg = sortedMessages[sortedMessages.length - 1]; // Last message is newest (after sorting)
         latestMessageIdRef.current = latestMsg.id;
@@ -335,95 +515,80 @@ export default function GroupChatScreen() {
     }
   }, [messages.length]);
   
-  // Background polling for new messages - silent, non-intrusive
-  const pollForNewMessages = useCallback(async () => {
-    // Don't poll if:
-    // 1. Already polling (prevent concurrent polls)
+  // Background sync for new messages - uses sync service and SQLite (no duplication)
+  const syncForNewMessages = useCallback(async () => {
+    // Don't sync if:
+    // 1. Already syncing (prevent concurrent syncs)
     // 2. User is loading more messages (pagination)
     // 3. User is sending a message
     // 4. No latest message ID tracked yet
+    // 5. Database not initialized
     if (
       isPollingRef.current ||
       loadingMore ||
       isPaginatingRef.current ||
       sending ||
-      !latestMessageIdRef.current
+      !latestMessageIdRef.current ||
+      !dbInitialized
     ) {
       return;
     }
 
     isPollingRef.current = true;
     try {
-      // Fetch latest messages (page 1) silently
-      const response = await messagesAPI.getByGroup(Number(id), 1, 10);
-      const messagesData = response.data.messages?.data || response.data.messages || [];
+      // Sync with server - this saves to SQLite
+      const syncResult = await syncConversationMessages(Number(id), 'group', user?.id || 0);
       
-      if (messagesData.length === 0) {
+      if (!syncResult.success || syncResult.newMessagesCount === 0) {
+        isPollingRef.current = false;
+        return;
+      }
+
+      // Load all messages from SQLite (after sync)
+      const syncedMessages = await loadMessagesFromDb(100, 0); // Load enough to get new ones
+      
+      if (syncedMessages.length === 0) {
         isPollingRef.current = false;
         return;
       }
 
       // Sort messages to find the newest
-      const sortedNewMessages = messagesData.sort((a: Message, b: Message) => 
+      const sortedMessages = syncedMessages.sort((a: Message, b: Message) => 
         new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
       );
       
-      const newestMessage = sortedNewMessages[sortedNewMessages.length - 1];
+      const newestMessage = sortedMessages[sortedMessages.length - 1];
       
       // Check if we have new messages (newer than our latest)
       if (newestMessage.id > latestMessageIdRef.current) {
         // Find all new messages (those with ID > latestMessageIdRef.current)
-        const newMessages = sortedNewMessages.filter((msg: Message) => 
+        const newMessages = sortedMessages.filter((msg: Message) => 
           msg.id > latestMessageIdRef.current!
         );
         
         if (newMessages.length > 0) {
-          // Process new messages to ensure reply_to data is structured
-          const processedNewMessages = newMessages.map((msg: any) => {
-            if (msg.reply_to) {
-              return msg;
-            }
-            
-            if (msg.reply_to_id) {
-              // Try to find replied message in existing messages or new messages
-              const allMessages = [...messages, ...newMessages];
-              const repliedMessage = allMessages.find((m: any) => m.id === msg.reply_to_id);
-              if (repliedMessage) {
-                msg.reply_to = {
-                  id: repliedMessage.id,
-                  message: repliedMessage.message,
-                  sender: repliedMessage.sender || {
-                    id: repliedMessage.sender_id,
-                    name: repliedMessage.sender?.name || 'Unknown User'
-                  },
-                  attachments: repliedMessage.attachments || []
-                };
-              }
-            }
-            return msg;
-          });
-          
-          // Add new messages to existing messages (append at end, they're already sorted)
+          // Update UI with all messages from SQLite (ensures consistency)
           setMessages(prev => {
-            // Check for duplicates before adding
+            // Merge with existing messages, ensuring no duplicates
             const existingIds = new Set(prev.map(m => m.id));
-            const uniqueNewMessages = processedNewMessages.filter(msg => !existingIds.has(msg.id));
-            
-            if (uniqueNewMessages.length === 0) {
-              return prev; // No new unique messages
-            }
-            
-            // Combine and sort all messages
-            const allMessages = [...prev, ...uniqueNewMessages].sort((a: Message, b: Message) => 
+            const allUniqueMessages = [
+              ...prev.filter(msg => !newMessages.some(nm => nm.id === msg.id)), // Keep existing that aren't in new
+              ...newMessages // Add new messages
+            ].sort((a: Message, b: Message) => 
               new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
             );
             
-            // Update latest message ID
-            const latestMsg = allMessages[allMessages.length - 1];
-            latestMessageIdRef.current = latestMsg.id;
-            messagesLengthRef.current = allMessages.length;
+            // Deduplicate to be safe
+            const deduplicated = deduplicateMessages(allUniqueMessages);
             
-            return allMessages;
+            // Update latest message ID
+            if (deduplicated.length > 0) {
+              const latestMsg = deduplicated[deduplicated.length - 1];
+              latestMessageIdRef.current = latestMsg.id;
+              messagesLengthRef.current = deduplicated.length;
+            }
+            
+            return deduplicated;
           });
           
           // Auto-scroll to bottom only if user is already at bottom (not scrolling up)
@@ -432,27 +597,32 @@ export default function GroupChatScreen() {
               scrollToBottom(false, 0);
             }, 100);
           }
+          
+          if (__DEV__) {
+            console.log(`[GroupChat] Synced ${newMessages.length} new messages from SQLite`);
+          }
         }
       }
     } catch (error: any) {
       // Silently handle errors - don't interrupt user
       // Only log in dev mode
       if (__DEV__) {
-        console.log('[GroupChat] Polling error (silent):', error.message);
+        console.log('[GroupChat] Sync error (silent):', error.message);
       }
     } finally {
       isPollingRef.current = false;
     }
-  }, [id, loadingMore, sending, messages, hasScrolledToBottom, scrollToBottom]);
+  }, [id, loadingMore, sending, dbInitialized, user?.id, loadMessagesFromDb, hasScrolledToBottom, scrollToBottom, deduplicateMessages]);
 
-  // Start/stop polling based on screen focus and user activity
+  // Start/stop periodic sync based on screen focus and user activity
   useEffect(() => {
-    // Don't start polling if:
+    // Don't start syncing if:
     // - User is loading more messages
     // - User is sending a message
     // - No messages loaded yet
-    if (loadingMore || sending || messages.length === 0 || !latestMessageIdRef.current) {
-      // Clear polling if it exists
+    // - Database not initialized
+    if (loadingMore || sending || messages.length === 0 || !latestMessageIdRef.current || !dbInitialized) {
+      // Clear sync interval if it exists
       if (pollingIntervalRef.current) {
         clearInterval(pollingIntervalRef.current);
         pollingIntervalRef.current = null;
@@ -460,9 +630,9 @@ export default function GroupChatScreen() {
       return;
     }
 
-    // Start polling
+    // Start periodic sync (replaces polling - uses sync service + SQLite)
     pollingIntervalRef.current = setInterval(() => {
-      pollForNewMessages();
+      syncForNewMessages();
     }, POLLING_INTERVAL);
 
     // Cleanup on unmount or when dependencies change
@@ -472,7 +642,18 @@ export default function GroupChatScreen() {
         pollingIntervalRef.current = null;
       }
     };
-  }, [id, loadingMore, sending, messages.length, pollForNewMessages]);
+  }, [id, loadingMore, sending, messages.length, dbInitialized, syncForNewMessages]);
+  
+  // Start retry service on mount
+  useEffect(() => {
+    if (dbInitialized) {
+      startRetryService(30000); // Retry every 30 seconds
+    }
+    
+    return () => {
+      // Cleanup handled by stopRetryService if needed
+    };
+  }, [dbInitialized]);
   
   // Initial fetch on mount
   useEffect(() => {
@@ -482,9 +663,9 @@ export default function GroupChatScreen() {
     isPaginatingRef.current = false; // Reset pagination flag
     lastFocusTimeRef.current = 0; // Reset focus time
     latestMessageIdRef.current = null; // Reset latest message ID
-    isPollingRef.current = false; // Reset polling flag
+    isPollingRef.current = false; // Reset sync flag
     
-    // Clear polling interval
+    // Clear sync interval
     if (pollingIntervalRef.current) {
       clearInterval(pollingIntervalRef.current);
       pollingIntervalRef.current = null;
@@ -500,7 +681,7 @@ export default function GroupChatScreen() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]); // Only depend on id, fetchMessages is stable
   
-  // Cleanup retry timeout and polling on unmount
+  // Cleanup retry timeout and sync interval on unmount
   useEffect(() => {
     return () => {
       if (retryTimeoutRef.current) {
@@ -798,245 +979,323 @@ export default function GroupChatScreen() {
     
     setSending(true);
     
-    // Safety timeout: ensure sending state is reset even if something goes wrong
-    const safetyTimeout = setTimeout(() => {
-      console.warn('Message send timeout - resetting sending state');
-      setSending(false);
-    }, 35000); // 35 seconds (slightly longer than API timeout)
+    // Prepare message text
+    let messageText = input.trim();
+    if (attachment && !messageText) {
+      if (attachment.type?.startsWith('image/') || attachment.isImage) {
+        messageText = '[IMAGE]';
+      } else {
+        messageText = '[FILE]';
+      }
+    }
+    
+    if (voiceRecording) {
+      const voiceMessage = `[VOICE_MESSAGE:${voiceRecording.duration}]`;
+      messageText = messageText ? `${messageText} ${voiceMessage}` : voiceMessage;
+    }
+    
+    // Generate temporary local ID for the message
+    const tempLocalId = Date.now() + Math.random();
+    const now = new Date().toISOString();
+    
+    // Create message object for local storage
+    const localMessage = {
+      id: tempLocalId, // Temporary local ID
+      conversation_id: Number(id),
+      conversation_type: 'group' as const,
+      sender_id: Number(user?.id || 0),
+      group_id: Number(id),
+      message: messageText || null,
+      created_at: now,
+      read_at: null,
+      edited_at: null,
+      reply_to_id: replyingTo?.id || null,
+      sync_status: 'pending' as const,
+      attachments: attachment ? [{
+        name: attachment.name || 'attachment',
+        mime: attachment.type || 'application/octet-stream',
+        url: attachment.uri, // Local URI for now
+        local_path: attachment.uri,
+      }] : voiceRecording ? [{
+        name: 'voice_message.m4a',
+        mime: 'audio/m4a',
+        url: voiceRecording.uri,
+        local_path: voiceRecording.uri,
+      }] : undefined,
+    };
+    
+    // Create message for UI display
+    const uiMessage: any = {
+      id: tempLocalId,
+      conversation_id: Number(id),
+      sender_id: Number(user?.id || 0),
+      group_id: Number(id),
+      message: messageText || null,
+      created_at: now,
+      read_at: null,
+      edited_at: null,
+      reply_to_id: replyingTo?.id || null,
+      reply_to: replyingTo || undefined,
+      sender: {
+        id: Number(user?.id || 0),
+        name: user?.name || 'You',
+        avatar_url: user?.avatar_url,
+      },
+      sync_status: 'pending',
+      attachments: localMessage.attachments,
+    };
     
     try {
-      let formData = new FormData();
-      
-      // Handle file/image attachment
-      let messageText = input.trim();
-      
-      // If attachment exists and no text, add marker similar to voice messages
-      if (attachment && !messageText) {
-        if (attachment.type?.startsWith('image/') || attachment.isImage) {
-          messageText = '[IMAGE]';
-        } else {
-          messageText = '[FILE]';
-        }
-      }
-      
-      formData.append('group_id', id as string);
-      
-      // Add reply_to_id if replying to a message
-      if (replyingTo) {
-        formData.append('reply_to_id', replyingTo.id.toString());
-      }
-      
-      // Handle file/image attachment
-      if (attachment) {
-        formData.append('attachments[]', {
-          uri: attachment.uri,
-          name: attachment.name,
-          type: attachment.type,
-        } as any);
-      }
-      
-      // Add text message if present (or marker for attachment)
-      if (messageText && !voiceRecording) {
-        formData.append('message', messageText);
-      }
-      
-      // Handle voice recording - attach file + keep marker text
-      if (voiceRecording) {
-        const voiceMessage = `[VOICE_MESSAGE:${voiceRecording.duration}]`;
-        const combinedMessage = messageText ? `${messageText} ${voiceMessage}` : voiceMessage;
-        formData.append('message', combinedMessage);
-
-        // Important: send as attachments[] so Laravel sees an array
-        formData.append('attachments[]', {
-          uri: voiceRecording.uri,
-          name: 'voice_message.m4a',
-          type: 'audio/m4a',
-        } as any);
-
-        // Optional metadata
-        formData.append('voice_duration', voiceRecording.duration.toString());
-        formData.append('is_voice_message', 'true');
-      }
-      
-      // Add timeout wrapper for message sending to prevent hanging
-      const sendMessageWithTimeout = async () => {
+      // STEP 1: Save to SQLite first with pending status (instant local storage)
+      if (dbInitialized) {
         try {
-          return await messagesAPI.sendMessage(formData);
-        } catch (error: any) {
-          // If it's a timeout, throw a more descriptive error
-          if (error.code === 'ECONNABORTED' || error.message?.includes('timeout')) {
-            throw new Error('Request timeout - message send took too long');
+          await saveDbMessages([{
+            id: tempLocalId,
+            conversation_id: Number(id),
+            conversation_type: 'group',
+            sender_id: Number(user?.id || 0),
+            group_id: Number(id),
+            message: messageText || null,
+            created_at: now,
+            read_at: null,
+            edited_at: null,
+            reply_to_id: replyingTo?.id || null,
+            sync_status: 'pending',
+            attachments: localMessage.attachments,
+          }]);
+          
+          if (__DEV__) {
+            console.log('[GroupChat] Saved message to SQLite with pending status:', tempLocalId);
           }
-          throw error;
+        } catch (dbError) {
+          console.error('[GroupChat] Error saving to SQLite:', dbError);
+          // Continue anyway - we'll still try to send to API
         }
-      };
-      
-      const res = await sendMessageWithTimeout();
-      
-      // Update last_seen_at when user sends a message (activity indicator)
-      try {
-        await usersAPI.updateLastSeen();
-      } catch {
-        // Silently fail - don't block message sending if last_seen update fails
-        // Failed to update last_seen_at
       }
       
-      // Prepare message text to preserve what was sent
-      let messageTextToPreserve = input.trim();
-      if (voiceRecording) {
-        messageTextToPreserve = input.trim() ? `${input.trim()} [VOICE_MESSAGE:${voiceRecording.duration}]` : `[VOICE_MESSAGE:${voiceRecording.duration}]`;
-      } else if (attachment && !input.trim()) {
-        // Add marker for attachment without text
-        messageTextToPreserve = attachment.type?.startsWith('image/') || attachment.isImage ? '[IMAGE]' : '[FILE]';
-      }
-      
-      // Ensure the message has sender_id set correctly from backend response
-      // Also preserve reply_to data if it exists in response or from replyingTo state
-      const newMessage = {
-        ...res.data,
-        message: res.data.message || messageTextToPreserve, // Preserve message text
-        sender_id: res.data.sender_id || Number(user?.id), // Ensure sender_id is set
-        group_id: res.data.group_id || Number(id), // Ensure group_id is set
-        sender: res.data.sender || {
-          id: Number(user?.id),
-          name: user?.name,
-          avatar_url: user?.avatar_url
-        },
-        // Preserve reply_to from backend response, or construct from replyingTo state
-        reply_to: res.data.reply_to || (replyingTo ? {
-          id: replyingTo.id,
-          message: replyingTo.message,
-          sender: replyingTo.sender || {
-            id: replyingTo.sender_id,
-            name: replyingTo.sender?.name || 'Unknown User'
-          },
-          attachments: replyingTo.attachments || []
-        } : undefined)
-      };
-      
-      // Ensure the message has a valid ID - if not, use a temporary unique ID
-      if (!newMessage.id || newMessage.id === 0) {
-        console.warn('Message response missing ID, using temporary ID');
-        newMessage.id = Date.now() + Math.random(); // Temporary unique ID
-      }
-      
+      // STEP 2: Show message immediately in UI (optimistic update)
       setMessages(prev => {
-        // Check if message already exists to prevent duplicates
-        // Only check if newMessage has a valid ID
-        if (newMessage.id && newMessage.id !== 0) {
-          const messageExists = prev.some(msg => msg.id === newMessage.id);
-          if (messageExists) {
-            console.log('Message already exists in state, skipping:', newMessage.id);
-            return prev;
-          }
-        }
-        
-        console.log('Adding new message to state (group):', {
-          messageId: newMessage.id,
-          messageText: newMessage.message?.substring(0, 50),
-          currentMessagesCount: prev.length,
-          newMessagesCount: prev.length + 1
-        });
-        
-        // Add new message and sort by created_at to ensure correct order
-        const updatedMessages = [...prev, newMessage].sort((a, b) => {
+        const updatedMessages = [...prev, uiMessage].sort((a, b) => {
           const dateA = new Date(a.created_at).getTime();
           const dateB = new Date(b.created_at).getTime();
-          return dateA - dateB; // Ascending order (oldest first)
+          return dateA - dateB;
         });
         
-        // Update latest message ID when user sends a message
-        if (updatedMessages.length > 0) {
-          const latestMsg = updatedMessages[updatedMessages.length - 1];
+        const uniqueMessages = deduplicateMessages(updatedMessages);
+        
+        if (uniqueMessages.length > 0) {
+          const latestMsg = uniqueMessages[uniqueMessages.length - 1];
           latestMessageIdRef.current = latestMsg.id;
         }
         
-        // Scroll to bottom after message is added to state
-        // Use requestAnimationFrame and setTimeout to ensure state update is reflected
+        // Scroll to bottom
         requestAnimationFrame(() => {
           setTimeout(() => {
             if (flatListRef.current) {
               try {
                 flatListRef.current.scrollToEnd({ animated: true });
               } catch {
-                // If scrollToEnd fails, try scrolling to the last item by index
-                // Scroll failed, trying alternative method
-                try {
-                  // Wait for layout to complete, then scroll to last index
-                  setTimeout(() => {
-                    if (flatListRef.current) {
-                      const lastIndex = updatedMessages.length - 1;
-                      flatListRef.current.scrollToIndex({ 
-                        index: lastIndex, 
-                        animated: true,
-                        viewPosition: 1 // 1 means bottom (0 = top, 1 = bottom)
-                      });
-                    }
-                  }, 100);
-                } catch {
-                  // Alternative scroll method also failed
-                }
+                // Scroll failed, will retry
               }
             }
-          }, (attachment || voiceRecording) ? 300 : 100);
+          }, attachment || voiceRecording ? 300 : 100);
         });
         
-        // Also scroll after content size changes (for images/files)
-        requestAnimationFrame(() => {
-          setTimeout(() => {
-            if (flatListRef.current) {
-              try {
-                flatListRef.current.scrollToEnd({ animated: true });
-              } catch {
-                // Second scroll attempt failed
-              }
-            }
-          }, (attachment || voiceRecording) ? 400 : 200);
-        });
-        
-        return updatedMessages;
+        return uniqueMessages;
       });
+      
+      // Clear input immediately for better UX
       setInput('');
       setAttachment(null);
       setVoiceRecording(null);
-      setReplyingTo(null); // Clear reply state
+      setReplyingTo(null);
       setShowEmoji(false);
+      setSending(false); // Reset sending state - API call happens in background
+      
+      // STEP 3: Send to API in background (non-blocking)
+      (async () => {
+        try {
+          // Check if message already has server_id (already synced) before sending
+          // This prevents duplicate sends if retry service already sent it
+          if (dbInitialized) {
+            try {
+              const database = await getDb();
+              if (database) {
+                const existingMessage = await database.getFirstAsync<{ server_id?: number }>(
+                  `SELECT server_id FROM messages WHERE id = ?`,
+                  [tempLocalId]
+                );
+                
+                if (existingMessage?.server_id) {
+                  if (__DEV__) {
+                    console.log(`[GroupChat] Message ${tempLocalId} already has server_id ${existingMessage.server_id}, skipping API call`);
+                  }
+                  // Update UI with server ID, but first check for duplicates
+                  setMessages(prev => {
+                    const serverId = existingMessage.server_id!;
+                    // Check if there's already a message with this server ID (from sync)
+                    const existingServerMessage = prev.find(msg => msg.id === serverId);
+                    
+                    let updatedMessages;
+                    if (existingServerMessage) {
+                      // Remove the temp message and keep the server one (which is more complete)
+                      updatedMessages = prev.filter(msg => msg.id !== tempLocalId);
+                    } else {
+                      // Update temp message to server ID
+                      updatedMessages = prev.map(msg => 
+                        msg.id === tempLocalId 
+                          ? { ...msg, id: serverId, sync_status: 'synced' }
+                          : msg
+                      );
+                    }
+                    // Ensure no duplicates remain
+                    return deduplicateMessages(updatedMessages);
+                  });
+                  return; // Don't send again
+                }
+              }
+            } catch (checkError) {
+              // Continue with send if check fails
+              if (__DEV__) {
+                console.warn('[GroupChat] Error checking message status:', checkError);
+              }
+            }
+          }
+          
+          let formData = new FormData();
+          formData.append('group_id', id as string);
+          
+          if (replyingTo) {
+            formData.append('reply_to_id', replyingTo.id.toString());
+          }
+          
+          if (attachment) {
+            formData.append('attachments[]', {
+              uri: attachment.uri,
+              name: attachment.name,
+              type: attachment.type,
+            } as any);
+          }
+          
+          if (messageText && !voiceRecording) {
+            formData.append('message', messageText);
+          }
+          
+          if (voiceRecording) {
+            formData.append('message', messageText);
+            formData.append('attachments[]', {
+              uri: voiceRecording.uri,
+              name: 'voice_message.m4a',
+              type: 'audio/m4a',
+            } as any);
+            formData.append('voice_duration', voiceRecording.duration.toString());
+            formData.append('is_voice_message', 'true');
+          }
+          
+          // Send to API
+          const res = await messagesAPI.sendMessage(formData);
+          
+          // STEP 4: Update SQLite with server response (change status to synced, update server_id)
+          if (res.data && res.data.id && dbInitialized) {
+            try {
+              await updateMessageStatus(tempLocalId, res.data.id, 'synced');
+              
+              // Update UI message with server ID, but first check for duplicates
+              setMessages(prev => {
+                const serverId = res.data.id;
+                // Check if there's already a message with this server ID (from sync)
+                const existingServerMessage = prev.find(msg => msg.id === serverId);
+                
+                let updatedMessages;
+                if (existingServerMessage) {
+                  // Remove the temp message and keep the server one (which is more complete)
+                  updatedMessages = prev.filter(msg => msg.id !== tempLocalId);
+                } else {
+                  // Update temp message to server ID
+                  updatedMessages = prev.map(msg => 
+                    msg.id === tempLocalId 
+                      ? { ...msg, id: serverId, sync_status: 'synced' }
+                      : msg
+                  );
+                }
+                // Ensure no duplicates remain
+                return deduplicateMessages(updatedMessages);
+              });
+              
+              // Update latest message ID
+              latestMessageIdRef.current = res.data.id;
+              
+              if (__DEV__) {
+                console.log('[GroupChat] Message synced successfully:', tempLocalId, '->', res.data.id);
+              }
+            } catch (updateError) {
+              console.error('[GroupChat] Error updating message status:', updateError);
+            }
+          }
+          
+          // Update last_seen_at
+          try {
+            await usersAPI.updateLastSeen();
+          } catch (error) {
+            // Silently fail
+          }
+          
+        } catch (apiError: any) {
+          // STEP 5: Handle API failure gracefully
+          console.error('[GroupChat] Error sending message to API:', apiError);
+          
+          // Check if it's a network error (retryable) or permanent error
+          const isNetworkError = 
+            apiError.message === 'Network Error' || 
+            !apiError.response ||
+            apiError.code === 'ECONNABORTED' ||
+            apiError.message?.includes('timeout');
+          
+          if (dbInitialized) {
+            if (!isNetworkError && apiError.response?.status >= 400 && apiError.response?.status < 500) {
+              // Client error (4xx) - mark as failed
+              await updateMessageStatus(tempLocalId, undefined, 'failed');
+              
+              // Update UI to show failed status
+              setMessages(prev => prev.map(msg => 
+                msg.id === tempLocalId 
+                  ? { ...msg, sync_status: 'failed' }
+                  : msg
+              ));
+              
+              if (__DEV__) {
+                console.log('[GroupChat] Message marked as failed:', tempLocalId);
+              }
+            } else {
+              // Network/server error - keep as pending for retry
+              // Retry service will handle it
+              if (__DEV__) {
+                console.log('[GroupChat] Message kept as pending for retry:', tempLocalId);
+              }
+            }
+          }
+          
+          // Show user-friendly error (non-blocking)
+          if (!isNetworkError) {
+            Alert.alert(
+              'Message Pending',
+              'Your message was saved locally but couldn\'t be sent. It will be retried automatically.',
+              [{ text: 'OK' }]
+            );
+          }
+        }
+      })();
+      
     } catch (e: unknown) {
       const error = e as any;
-      // Error sending message
-      // Handle specific database constraint errors
-      if (error.response?.data?.exception === 'Illuminate\\Database\\QueryException') {
-        // If it's a voice message with database constraint error, still show the message
-        if (voiceRecording) {
-          // Don't show error alert, just log it
-        } else {
-          Alert.alert(
-            'Error Sending Message',
-            'There was a problem saving your message. This might be due to a database constraint issue. Please try again.',
-            [{ text: 'OK' }]
-          );
-        }
-      } else {
-        // Check if it's a timeout error
-        if (error.code === 'ECONNABORTED' || error.message?.includes('timeout')) {
-          Alert.alert(
-            'Connection Timeout',
-            'The message is taking too long to send. Please check your internet connection and try again.',
-            [{ text: 'OK' }]
-          );
-        } else if (error.message === 'Network Error' || !error.response) {
-          Alert.alert(
-            'Network Error',
-            'Unable to connect to the server. Please check your internet connection and try again.',
-            [{ text: 'OK' }]
-          );
-        } else {
-          Alert.alert('Error', 'Failed to send message. Please try again.');
-        }
-      }
-    } finally {
-      clearTimeout(safetyTimeout);
+      console.error('[GroupChat] Error in handleSend:', error);
       setSending(false);
+      
+      Alert.alert(
+        'Error',
+        'Failed to save message. Please try again.',
+        [{ text: 'OK' }]
+      );
     }
   };
 
@@ -1547,6 +1806,8 @@ export default function GroupChatScreen() {
             timestamp={timestamp}
             senderName={!isMine && item.sender ? item.sender.name : undefined}
             textPart={voiceMessageData.textPart}
+            readAt={item.read_at}
+            syncStatus={item.sync_status || 'synced'}
           />
         </TouchableOpacity>
       );
@@ -2223,19 +2484,39 @@ export default function GroupChatScreen() {
               style={{ flex: 1 }}
             >
               <FlatList
-                ref={flatListRef}
-                data={messages}
-                renderItem={renderItem}
+              ref={flatListRef}
+              data={messages}
+              renderItem={renderItem}
+              initialNumToRender={30}
+              windowSize={10}
+              maxToRenderPerBatch={15}
+              removeClippedSubviews={true}
+              updateCellsBatchingPeriod={50}
+              onEndReached={() => {
+                if (hasMoreMessages && !loadingMore) {
+                  loadMoreMessages();
+                }
+              }}
+              onEndReachedThreshold={0.1}
                 extraData={messages.length} // Force re-render when messages array changes
                 keyExtractor={(item, index) => {
-                  // Use message ID if available, otherwise use index with a stable fallback
+                  // Create a unique key that handles temporary IDs and prevents duplicates
                   if (item && item.id !== undefined && item.id !== null && item.id !== 0) {
+                    // For pending messages (temp IDs), include sync_status to ensure uniqueness
+                    // This prevents duplicate keys when a temp message gets updated to server ID
+                    if (item.sync_status === 'pending') {
+                      // Use a combination that includes created_at for pending messages
+                      // This ensures temp messages have unique keys even if they share the same ID pattern
+                      const createdAt = item.created_at || index.toString();
+                      return `message-pending-${item.id}-${createdAt}`;
+                    }
+                    // For synced messages, use ID alone (should be unique from server)
                     return `message-${item.id}`;
                   }
                   // For messages without IDs, use index and created_at if available
                   const fallbackKey = item?.created_at 
                     ? `message-fallback-${index}-${item.created_at}` 
-                    : `message-fallback-${index}-${Math.random().toString(36).slice(2)}`;
+                    : `message-fallback-${index}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
                   return fallbackKey;
                 }}
                 contentContainerStyle={{ 

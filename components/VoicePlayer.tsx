@@ -3,7 +3,6 @@ import { MaterialCommunityIcons } from '@expo/vector-icons';
 import { Audio } from 'expo-av';
 import React, { useEffect, useRef, useState } from 'react';
 import {
-    Alert,
     StyleSheet,
     Text,
     TouchableOpacity,
@@ -26,6 +25,7 @@ export default function VoicePlayer({
   const [duration, setDuration] = useState(initialDuration || 0);
   const [position, setPosition] = useState(0);
   const [isLoading, setIsLoading] = useState(false);
+  const [hasError, setHasError] = useState(false);
   const { currentTheme } = useTheme();
   
   const isDark = currentTheme === 'dark';
@@ -59,6 +59,7 @@ export default function VoicePlayer({
       );
 
       setSound(newSound);
+      setHasError(false);
       
       // Get duration if not provided
       if (!initialDuration) {
@@ -69,7 +70,9 @@ export default function VoicePlayer({
       }
     } catch (error) {
       console.error('Error loading audio:', error);
-      Alert.alert('Error', 'Failed to load audio file.');
+      setHasError(true);
+      setSound(null);
+      // Silently handle error - show error state in UI instead of popup
     } finally {
       setIsLoading(false);
     }
@@ -91,7 +94,7 @@ export default function VoicePlayer({
   };
 
   const togglePlayback = async () => {
-    if (!sound) return;
+    if (!sound || hasError) return;
 
     try {
       if (isPlaying) {
@@ -113,7 +116,13 @@ export default function VoicePlayer({
       }
     } catch (error) {
       console.error('Error toggling playback:', error);
-      Alert.alert('Error', 'Failed to play/pause audio.');
+      // Silently handle error - show error state in UI
+      setHasError(true);
+      setIsPlaying(false);
+      if (positionInterval.current) {
+        clearInterval(positionInterval.current);
+        positionInterval.current = null;
+      }
     }
   };
 
@@ -181,45 +190,62 @@ export default function VoicePlayer({
       <TouchableOpacity 
         onPress={togglePlayback} 
         style={styles.playButton}
-        disabled={!sound}
+        disabled={!sound || hasError}
       >
         <MaterialCommunityIcons 
-          name={isPlaying ? 'pause' : 'play'} 
+          name={hasError ? 'alert-circle' : (isPlaying ? 'pause' : 'play')} 
           size={sizeStyles.icon} 
-          color={isDark ? '#FFFFFF' : '#1F2937'} 
+          color={hasError 
+            ? (isDark ? '#EF4444' : '#DC2626')
+            : (isDark ? '#FFFFFF' : '#1F2937')
+          } 
         />
       </TouchableOpacity>
 
       <View style={styles.content}>
-        <View style={styles.progressContainer}>
-          <View style={[
-            styles.progressBar, 
+        {hasError ? (
+          <Text style={[
+            styles.errorText,
             { 
-              height: sizeStyles.progressHeight,
-              backgroundColor: isDark ? '#4B5563' : '#D1D5DB' 
+              fontSize: sizeStyles.text,
+              color: isDark ? '#EF4444' : '#DC2626' 
             }
           ]}>
-            <View 
-              style={[
-                styles.progressFill, 
+            Unable to load audio
+          </Text>
+        ) : (
+          <>
+            <View style={styles.progressContainer}>
+              <View style={[
+                styles.progressBar, 
                 { 
-                  width: `${getProgressPercentage()}%`,
-                  backgroundColor: isDark ? '#39B54A' : '#39B54A' 
+                  height: sizeStyles.progressHeight,
+                  backgroundColor: isDark ? '#4B5563' : '#D1D5DB' 
                 }
-              ]} 
-            />
-          </View>
-        </View>
+              ]}>
+                <View 
+                  style={[
+                    styles.progressFill, 
+                    { 
+                      width: `${getProgressPercentage()}%`,
+                      backgroundColor: isDark ? '#39B54A' : '#39B54A' 
+                    }
+                  ]} 
+                />
+              </View>
+            </View>
 
-        <Text style={[
-          styles.durationText, 
-          { 
-            fontSize: sizeStyles.text,
-            color: isDark ? '#9CA3AF' : '#6B7280' 
-          }
-        ]}>
-          {formatTime(position)} / {formatTime(duration)}
-        </Text>
+            <Text style={[
+              styles.durationText, 
+              { 
+                fontSize: sizeStyles.text,
+                color: isDark ? '#9CA3AF' : '#6B7280' 
+              }
+            ]}>
+              {formatTime(position)} / {formatTime(duration)}
+            </Text>
+          </>
+        )}
       </View>
 
       <MaterialCommunityIcons 
@@ -257,5 +283,9 @@ const styles = StyleSheet.create({
   },
   durationText: {
     fontWeight: '500',
+  },
+  errorText: {
+    fontWeight: '500',
+    fontStyle: 'italic',
   },
 }); 
