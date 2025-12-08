@@ -1,17 +1,119 @@
+import type { DatabaseMessage } from '@/types/database';
 import { conversationsAPI, messagesAPI } from './api';
 import {
+    deleteMessage,
+    getDb,
     saveConversations,
     saveMessages,
     updateSyncState
 } from './database';
 
+// Sync lock mechanism to prevent concurrent syncs
+let conversationsSyncLock = false;
+let conversationsSyncPromise: Promise<{ success: boolean; count: number; error?: string }> | null = null;
+let lastConversationsSyncTime = 0;
+const CONVERSATIONS_SYNC_DEBOUNCE_MS = 2000; // Wait 2 seconds between syncs
+
+// Message sync locks per conversation
+const messageSyncLocks = new Map<string, boolean>();
+const messageSyncPromises = new Map<string, Promise<any>>();
+const lastMessageSyncTimes = new Map<string, number>();
+const MESSAGE_SYNC_DEBOUNCE_MS = 1000; // Wait 1 second between message syncs for same conversation
+
+/**
+ * Remove messages that exist locally but were deleted on the server
+ * This detects hard-deleted messages (not soft-deleted) that are missing from API response
+ */
+async function removeDeletedMessages(
+  conversationId: number,
+  conversationType: 'individual' | 'group',
+  serverIdsFromAPI: number[]
+): Promise<number> {
+  try {
+    const database = await getDb();
+    if (!database) {
+      return 0;
+    }
+    
+    // Get all local messages with server_id for this conversation
+    const localMessages = await database.getAllAsync<DatabaseMessage>(
+      `SELECT id, server_id FROM messages 
+       WHERE conversation_id = ? AND conversation_type = ? AND server_id IS NOT NULL`,
+      [conversationId, conversationType]
+    );
+    
+    if (localMessages.length === 0) {
+      return 0;
+    }
+    
+    // Create set of server IDs from API for quick lookup
+    const apiServerIds = new Set(serverIdsFromAPI);
+    
+    // Find messages that exist locally but not in API (deleted on server)
+    const messagesToDelete = localMessages.filter(msg => 
+      msg.server_id && !apiServerIds.has(msg.server_id)
+    );
+    
+    if (messagesToDelete.length === 0) {
+      return 0;
+    }
+    
+    let deletedCount = 0;
+    for (const msg of messagesToDelete) {
+      try {
+        await deleteMessage(msg.server_id!, msg.id);
+        deletedCount++;
+      } catch (error) {
+        // Log but continue deleting other messages
+        if (__DEV__) {
+          console.warn(`[Sync] Error deleting message ${msg.server_id}:`, error);
+        }
+      }
+    }
+    
+    if (__DEV__ && deletedCount > 0) {
+      console.log(`[Sync] Removed ${deletedCount} deleted messages for ${conversationType} ${conversationId}`);
+    }
+    
+    return deletedCount;
+  } catch (error) {
+    console.error('[Sync] Error removing deleted messages:', error);
+    return 0;
+  }
+}
+
 export async function syncConversationMessages(
   conversationId: number,
   conversationType: 'individual' | 'group',
   currentUserId: number
-): Promise<{ success: boolean; newMessagesCount: number; error?: string }> {
-  try {
-    await updateSyncState(conversationId, conversationType, 'syncing');
+): Promise<{ success: boolean; newMessagesCount: number; deletedCount?: number; error?: string }> {
+  const syncKey = `${conversationType}_${conversationId}`;
+  
+  // Check if sync is already running for this conversation
+  if (messageSyncLocks.get(syncKey) && messageSyncPromises.has(syncKey)) {
+    if (__DEV__) {
+      console.log(`[Sync] Message sync already in progress for ${syncKey}, waiting...`);
+    }
+    return messageSyncPromises.get(syncKey)!;
+  }
+
+  // Debounce: If sync was called recently for this conversation, wait a bit
+  const now = Date.now();
+  const lastSyncTime = lastMessageSyncTimes.get(syncKey) || 0;
+  const timeSinceLastSync = now - lastSyncTime;
+  if (timeSinceLastSync < MESSAGE_SYNC_DEBOUNCE_MS && lastSyncTime > 0) {
+    if (__DEV__) {
+      console.log(`[Sync] Debouncing message sync for ${syncKey} (${timeSinceLastSync}ms since last sync)`);
+    }
+    // Wait for the debounce period
+    await new Promise(resolve => setTimeout(resolve, MESSAGE_SYNC_DEBOUNCE_MS - timeSinceLastSync));
+  }
+
+  // Set lock and create promise
+  messageSyncLocks.set(syncKey, true);
+  const syncPromise = (async () => {
+    try {
+      await updateSyncState(conversationId, conversationType, 'syncing');
 
     let response;
     if (conversationType === 'individual') {
@@ -23,8 +125,13 @@ export async function syncConversationMessages(
     const messagesData = response.data.messages?.data || response.data.messages || [];
 
     if (messagesData.length === 0) {
+      // If API returns 0 messages, don't delete local messages because:
+      // 1. Conversation might be empty (no messages ever sent)
+      // 2. We're only checking first 50 messages (pagination)
+      // 3. API might be temporarily unavailable
+      // Deletion detection only works when we have messages to compare against
       await updateSyncState(conversationId, conversationType, 'synced');
-      return { success: true, newMessagesCount: 0 };
+      return { success: true, newMessagesCount: 0, deletedCount: 0 };
     }
 
     const messagesToSave = messagesData.map((msg: any) => ({
@@ -50,28 +157,65 @@ export async function syncConversationMessages(
       })) ?? [],
     }));
 
-    await saveMessages(messagesToSave);
-    await updateSyncState(conversationId, conversationType, 'synced');
+      await saveMessages(messagesToSave);
+      
+      // Remove messages that exist locally but were deleted on the server
+      const serverIds = messagesToSave.map(msg => msg.server_id!).filter(Boolean);
+      const deletedCount = await removeDeletedMessages(conversationId, conversationType, serverIds);
+      
+      await updateSyncState(conversationId, conversationType, 'synced');
 
-    if (__DEV__) {
-      console.log(`[Sync] Synced ${messagesToSave.length} messages for ${conversationType} ${conversationId}`);
+      lastMessageSyncTimes.set(syncKey, Date.now());
+
+      if (__DEV__) {
+        console.log(`[Sync] Synced ${messagesToSave.length} messages, removed ${deletedCount} deleted messages for ${conversationType} ${conversationId}`);
+      }
+
+      return { success: true, newMessagesCount: messagesToSave.length, deletedCount };
+    } catch (error: any) {
+      const errorMessage = error.message || 'Unknown error';
+      console.error(`[Sync] Error syncing messages for ${conversationType} ${conversationId}:`, errorMessage);
+      
+      await updateSyncState(conversationId, conversationType, 'failed', errorMessage);
+      
+      return { success: false, newMessagesCount: 0, error: errorMessage };
+    } finally {
+      // Release lock
+      messageSyncLocks.set(syncKey, false);
+      messageSyncPromises.delete(syncKey);
     }
+  })();
 
-    return { success: true, newMessagesCount: messagesToSave.length };
-  } catch (error: any) {
-    const errorMessage = error.message || 'Unknown error';
-    console.error(`[Sync] Error syncing messages for ${conversationType} ${conversationId}:`, errorMessage);
-    
-    await updateSyncState(conversationId, conversationType, 'failed', errorMessage);
-    
-    return { success: false, newMessagesCount: 0, error: errorMessage };
-  }
+  messageSyncPromises.set(syncKey, syncPromise);
+  return syncPromise;
 }
 
 export async function syncConversations(): Promise<{ success: boolean; count: number; error?: string }> {
-  try {
-    const response = await conversationsAPI.getAll();
-    let conversationsData = response.data;
+  // Check if sync is already running
+  if (conversationsSyncLock && conversationsSyncPromise) {
+    if (__DEV__) {
+      console.log('[Sync] Conversations sync already in progress, waiting...');
+    }
+    return conversationsSyncPromise;
+  }
+
+  // Debounce: If sync was called recently, wait a bit
+  const now = Date.now();
+  const timeSinceLastSync = now - lastConversationsSyncTime;
+  if (timeSinceLastSync < CONVERSATIONS_SYNC_DEBOUNCE_MS && lastConversationsSyncTime > 0) {
+    if (__DEV__) {
+      console.log(`[Sync] Debouncing conversations sync (${timeSinceLastSync}ms since last sync)`);
+    }
+    // Wait for the debounce period
+    await new Promise(resolve => setTimeout(resolve, CONVERSATIONS_SYNC_DEBOUNCE_MS - timeSinceLastSync));
+  }
+
+  // Set lock and create promise
+  conversationsSyncLock = true;
+  conversationsSyncPromise = (async () => {
+    try {
+      const response = await conversationsAPI.getAll();
+      let conversationsData = response.data;
 
     if (typeof conversationsData === 'string') {
       try {
@@ -112,18 +256,27 @@ export async function syncConversations(): Promise<{ success: boolean; count: nu
       updated_at: conv.updated_at || conv.last_message_date || new Date().toISOString(),
     }));
 
-    await saveConversations(conversationsToSave);
+      await saveConversations(conversationsToSave);
 
-    if (__DEV__) {
-      console.log(`[Sync] Synced ${conversationsToSave.length} conversations`);
+      lastConversationsSyncTime = Date.now();
+
+      if (__DEV__) {
+        console.log(`[Sync] Synced ${conversationsToSave.length} conversations`);
+      }
+
+      return { success: true, count: conversationsToSave.length };
+    } catch (error: any) {
+      const errorMessage = error.message || 'Unknown error';
+      console.error('[Sync] Error syncing conversations:', errorMessage);
+      return { success: false, count: 0, error: errorMessage };
+    } finally {
+      // Release lock
+      conversationsSyncLock = false;
+      conversationsSyncPromise = null;
     }
+  })();
 
-    return { success: true, count: conversationsToSave.length };
-  } catch (error: any) {
-    const errorMessage = error.message || 'Unknown error';
-    console.error('[Sync] Error syncing conversations:', errorMessage);
-    return { success: false, count: 0, error: errorMessage };
-  }
+  return conversationsSyncPromise;
 }
 
 export async function syncOlderMessages(
@@ -131,7 +284,7 @@ export async function syncOlderMessages(
   conversationType: 'individual' | 'group',
   page: number = 1,
   perPage: number = 50
-): Promise<{ success: boolean; messagesCount: number; hasMore: boolean; error?: string }> {
+): Promise<{ success: boolean; messagesCount: number; deletedCount?: number; hasMore: boolean; error?: string }> {
   try {
     let response;
     if (conversationType === 'individual') {
@@ -145,7 +298,7 @@ export async function syncOlderMessages(
     const hasMore = pagination.current_page < pagination.last_page || messagesData.length >= perPage;
 
     if (messagesData.length === 0) {
-      return { success: true, messagesCount: 0, hasMore: false };
+      return { success: true, messagesCount: 0, deletedCount: 0, hasMore: false };
     }
 
     const messagesToSave = messagesData.map((msg: any) => ({
@@ -172,16 +325,22 @@ export async function syncOlderMessages(
     }));
 
     await saveMessages(messagesToSave);
+    
+    // Remove messages that exist locally but were deleted on the server
+    // Note: For pagination, we only check deletions for the current page's messages
+    // Full deletion check should be done in syncConversationMessages (page 1)
+    const serverIds = messagesToSave.map(msg => msg.server_id!).filter(Boolean);
+    const deletedCount = await removeDeletedMessages(conversationId, conversationType, serverIds);
 
     if (__DEV__) {
-      console.log(`[Sync] Synced ${messagesToSave.length} older messages for ${conversationType} ${conversationId}`);
+      console.log(`[Sync] Synced ${messagesToSave.length} older messages, removed ${deletedCount} deleted messages for ${conversationType} ${conversationId}`);
     }
 
-    return { success: true, messagesCount: messagesToSave.length, hasMore };
+    return { success: true, messagesCount: messagesToSave.length, deletedCount, hasMore };
   } catch (error: any) {
     const errorMessage = error.message || 'Unknown error';
     console.error(`[Sync] Error syncing older messages for ${conversationType} ${conversationId}:`, errorMessage);
-    return { success: false, messagesCount: 0, hasMore: false, error: errorMessage };
+    return { success: false, messagesCount: 0, deletedCount: 0, hasMore: false, error: errorMessage };
   }
 }
 

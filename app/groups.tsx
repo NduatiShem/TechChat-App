@@ -4,6 +4,7 @@ import { useAuth } from '@/context/AuthContext';
 import { useNotifications } from '@/context/NotificationContext';
 import { useTheme } from '@/context/ThemeContext';
 import { groupsAPI } from '@/services/api';
+import { getGroups as getDbGroups, initDatabase, saveConversations as saveDbGroups } from '@/services/database';
 import { MaterialCommunityIcons } from '@expo/vector-icons';
 import { useFocusEffect } from '@react-navigation/native';
 import { router } from 'expo-router';
@@ -20,7 +21,7 @@ import {
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import NetInfo from '@react-native-community/netinfo';
-import AsyncStorage from '@react-native-async-storage/async-storage';
+// Removed AsyncStorage import - groups now stored in SQLite only
 
 interface Group {
   id: number;
@@ -46,7 +47,7 @@ export const options = {
   title: "Groups",
 };
 
-const GROUPS_CACHE_KEY = '@techchat_groups';
+// Removed GROUPS_CACHE_KEY - groups now stored in SQLite only
 
 export default function GroupsScreen() {
   const [groups, setGroups] = useState<Group[]>([]);
@@ -60,34 +61,58 @@ export default function GroupsScreen() {
   const { updateGroupUnreadCount } = useNotifications();
 
   const isDark = currentTheme === 'dark';
+  const [dbInitialized, setDbInitialized] = useState(false);
 
-  // Cache groups to AsyncStorage
-  const cacheGroups = async (groupsToCache: Group[]) => {
-    try {
-      await AsyncStorage.setItem(GROUPS_CACHE_KEY, JSON.stringify(groupsToCache));
-    } catch (error) {
-      console.error('Failed to cache groups:', error);
-    }
-  };
-
-  // Load cached groups from AsyncStorage
-  const loadCachedGroups = async (): Promise<Group[]> => {
-    try {
-      const cachedData = await AsyncStorage.getItem(GROUPS_CACHE_KEY);
-      if (cachedData) {
-        const parsed = JSON.parse(cachedData);
-        if (Array.isArray(parsed)) {
-          return parsed;
+  // Initialize database on mount
+  useEffect(() => {
+    let mounted = true;
+    const initDb = async () => {
+      try {
+        await initDatabase();
+        if (mounted) {
+          setDbInitialized(true);
+        }
+      } catch (error) {
+        console.error('[Groups] Failed to initialize database:', error);
+        if (mounted) {
+          setDbInitialized(true);
         }
       }
+    };
+    initDb();
+    return () => {
+      mounted = false;
+    };
+  }, []);
+
+  // Load groups from SQLite (local-first)
+  const loadCachedGroups = async (): Promise<Group[]> => {
+    try {
+      if (!dbInitialized) return [];
+      
+      const dbGroups = await getDbGroups();
+      
+      // Transform database format to UI format
+      return dbGroups.map(group => ({
+        id: group.group_id || group.conversation_id,
+        name: group.name,
+        description: undefined,
+        owner_id: 0, // Not stored in conversations table
+        last_message: group.last_message || undefined,
+        last_message_date: group.last_message_date || undefined,
+        created_at: group.created_at,
+        updated_at: group.updated_at,
+        unread_count: group.unread_count,
+        avatar_url: group.avatar_url || undefined,
+      }));
     } catch (error) {
-      console.error('Failed to load cached groups:', error);
+      console.error('[Groups] Error loading from database:', error);
+      return [];
     }
-    return [];
   };
 
   const loadGroups = async (forceRefresh = false) => {
-    // If offline, load from cache only
+    // If offline, load from SQLite only
     if (!isOnline && !forceRefresh) {
       const cachedGroups = await loadCachedGroups();
       if (cachedGroups.length > 0) {
@@ -111,20 +136,38 @@ export default function GroupsScreen() {
         safeGroupsData.forEach((group) => {
           const unreadCount = group.unread_count || 0;
           totalGroupUnread += unreadCount;
-          // Don't call updateUnreadCount for groups - that's only for individual conversations
-          // Groups have their own counter (groupUnreadCount)
         });
-        // Update total group unread count (separate from individual conversations)
         updateGroupUnreadCount(totalGroupUnread);
       }
       
       setGroups(safeGroupsData);
       setFilteredGroups(safeGroupsData);
       
-      // Cache groups for offline access
-      await cacheGroups(safeGroupsData);
+      // Save groups to SQLite for offline access
+      if (dbInitialized) {
+        try {
+          const groupsToSave = safeGroupsData.map((group: any) => ({
+            conversation_id: group.id,
+            conversation_type: 'group' as const,
+            group_id: group.id,
+            name: group.name || 'Unknown Group',
+            email: undefined,
+            avatar_url: group.avatar_url,
+            last_message: group.last_message,
+            last_message_date: group.last_message_date || group.updated_at,
+            last_message_sender_id: undefined,
+            last_message_read_at: undefined,
+            unread_count: group.unread_count ?? 0,
+            created_at: group.created_at || new Date().toISOString(),
+            updated_at: group.updated_at || group.last_message_date || new Date().toISOString(),
+          }));
+          await saveDbGroups(groupsToSave);
+        } catch (dbError) {
+          console.error('[Groups] Error saving to database:', dbError);
+        }
+      }
     } catch {
-      // Failed to load groups - try to load from cache
+      // Failed to load groups - try to load from SQLite
       const cachedGroups = await loadCachedGroups();
       if (cachedGroups.length > 0) {
         setGroups(cachedGroups);
@@ -183,9 +226,9 @@ export default function GroupsScreen() {
   }, [user, isOnline]);
 
   useEffect(() => {
-    // Only load groups if user is authenticated
-    if (user) {
-      // First try to load from cache for instant display
+    // Only load groups if user is authenticated and database is initialized
+    if (user && dbInitialized) {
+      // First try to load from SQLite for instant display
       loadCachedGroups().then(cached => {
         if (cached.length > 0) {
           setGroups(cached);
@@ -194,7 +237,7 @@ export default function GroupsScreen() {
         }
       });
       
-      // Then load from API (will update cache if successful)
+      // Then load from API (will update SQLite if successful)
       loadGroups();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps

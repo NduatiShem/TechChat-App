@@ -194,32 +194,36 @@ async function retrySingleMessage(message: DatabaseMessage): Promise<void> {
     
     // Handle different response structures
     let messageId: number | undefined;
+    let serverCreatedAt: string | undefined;
     
     // Try different possible response structures
     if (res.data) {
       // Standard structure: res.data.id
       if (res.data.id) {
         messageId = res.data.id;
+        serverCreatedAt = res.data.created_at;
       }
       // Alternative: res.data.data.id (nested)
       else if (res.data.data && res.data.data.id) {
         messageId = res.data.data.id;
+        serverCreatedAt = res.data.data.created_at;
       }
       // Alternative: res.data.message?.id
       else if (res.data.message && res.data.message.id) {
         messageId = res.data.message.id;
+        serverCreatedAt = res.data.message.created_at;
       }
     }
     
     if (messageId) {
-      // Success - update message status
-      await updateMessageStatus(message.id, messageId, 'synced');
+      // Success - update message status WITH SERVER TIMESTAMP to prevent duplicates
+      await updateMessageStatus(message.id, messageId, 'synced', serverCreatedAt);
       
       // Remove from retry set immediately
       messagesBeingRetried.delete(message.id);
       
       if (__DEV__) {
-        console.log(`[MessageRetry] Successfully sent message ${message.id}, server_id: ${messageId}`);
+        console.log(`[MessageRetry] Successfully sent message ${message.id}, server_id: ${messageId}, timestamp: ${serverCreatedAt}`);
       }
     } else {
       // Log the actual response structure for debugging

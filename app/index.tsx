@@ -54,7 +54,7 @@ interface Conversation {
   };
 }
 
-const CONVERSATIONS_CACHE_KEY = '@techchat_conversations';
+// Removed CONVERSATIONS_CACHE_KEY - using SQLite only
 
 export default function ConversationsScreen() {
   const [conversations, setConversations] = useState<Conversation[]>([]);
@@ -95,15 +95,31 @@ export default function ConversationsScreen() {
     };
   }, []);
 
-  // Load conversations from SQLite (local-first)
+  // Deduplicate conversations helper
+  const deduplicateConversations = useCallback((convs: Conversation[]): Conversation[] => {
+    const seen = new Map<number, Conversation>();
+    for (const conv of convs) {
+      if (conv && conv.id !== undefined && conv.id !== null) {
+        // Keep the most recent version if duplicate
+        const existing = seen.get(conv.id);
+        if (!existing || new Date(conv.updated_at || conv.created_at || '') > new Date(existing.updated_at || existing.created_at || '')) {
+          seen.set(conv.id, conv);
+        }
+      }
+    }
+    return Array.from(seen.values());
+  }, []);
+
+  // Load conversations from SQLite (local-first) - only individual conversations for messages tab
   const loadCachedConversations = async (): Promise<Conversation[]> => {
     try {
       if (!dbInitialized) return [];
       
-      const dbConvs = await getDbConversations();
+      // Only load individual conversations (exclude groups)
+      const dbConvs = await getDbConversations('individual');
       
       // Transform database format to UI format
-      return dbConvs.map(conv => ({
+      const conversations = dbConvs.map(conv => ({
         id: conv.conversation_id,
         conversation_id: conv.conversation_id,
         user_id: conv.user_id,
@@ -120,20 +136,11 @@ export default function ConversationsScreen() {
         created_at: conv.created_at,
         updated_at: conv.updated_at,
       }));
+      
+      // Deduplicate before returning
+      return deduplicateConversations(conversations);
     } catch (error) {
       console.error('[Conversations] Error loading from database:', error);
-      // Fallback to AsyncStorage
-      try {
-        const cachedData = await AsyncStorage.getItem(CONVERSATIONS_CACHE_KEY);
-        if (cachedData) {
-          const parsed = JSON.parse(cachedData);
-          if (Array.isArray(parsed)) {
-            return parsed;
-          }
-        }
-      } catch (fallbackError) {
-        console.error('[Conversations] Fallback to AsyncStorage failed:', fallbackError);
-      }
       return [];
     }
   };
@@ -143,8 +150,9 @@ export default function ConversationsScreen() {
     if (!isOnline && !forceRefresh) {
       const cachedConversations = await loadCachedConversations();
       if (cachedConversations.length > 0) {
-        setConversations(cachedConversations);
-        setFilteredConversations(cachedConversations);
+        const deduplicated = deduplicateConversations(cachedConversations);
+        setConversations(deduplicated);
+        setFilteredConversations(deduplicated);
         setIsLoading(false);
         return;
       }
@@ -210,12 +218,12 @@ export default function ConversationsScreen() {
         return;
       }
       
-      // Remove duplicates based on id
-      // Backend already filters active users, so we don't need to filter here
+      // Remove duplicates and filter out groups (messages tab is for individual conversations only)
       const uniqueConversations = conversationsArray.filter((conversation, index, self) => 
         conversation && 
         conversation.id !== undefined && 
         conversation.id !== null &&
+        !conversation.is_group && // Exclude groups from messages tab
         index === self.findIndex(c => c.id === conversation.id)
       );
       
@@ -228,8 +236,10 @@ export default function ConversationsScreen() {
         updateUnreadCount(Number(conversationId), unreadCount);
       });
       
-      setConversations(uniqueConversations);
-      setFilteredConversations(uniqueConversations);
+      // Deduplicate before setting state
+      const deduplicated = deduplicateConversations(uniqueConversations);
+      setConversations(deduplicated);
+      setFilteredConversations(deduplicated);
       
       // Save to SQLite database
       try {
@@ -252,12 +262,7 @@ export default function ConversationsScreen() {
         await saveDbConversations(conversationsToSave);
       } catch (dbError) {
         console.error('[Conversations] Error saving to database:', dbError);
-        // Fallback to AsyncStorage
-        try {
-          await AsyncStorage.setItem(CONVERSATIONS_CACHE_KEY, JSON.stringify(uniqueConversations));
-        } catch (asyncError) {
-          console.error('[Conversations] Error saving to AsyncStorage:', asyncError);
-        }
+        // No fallback - SQLite is the only storage
       }
     } catch (error: any) {
       console.error('Failed to load conversations:', error);
@@ -265,8 +270,9 @@ export default function ConversationsScreen() {
       if (!isOnline || error?.message?.includes('Network') || error?.code === 'NETWORK_ERROR') {
         const cachedConversations = await loadCachedConversations();
         if (cachedConversations.length > 0) {
-          setConversations(cachedConversations);
-          setFilteredConversations(cachedConversations);
+          const deduplicated = deduplicateConversations(cachedConversations);
+          setConversations(deduplicated);
+          setFilteredConversations(deduplicated);
           setIsLoading(false);
           return;
         }
@@ -277,8 +283,9 @@ export default function ConversationsScreen() {
         // Try loading from cache one more time
         const cachedConversations = await loadCachedConversations();
         if (cachedConversations.length > 0) {
-          setConversations(cachedConversations);
-          setFilteredConversations(cachedConversations);
+          const deduplicated = deduplicateConversations(cachedConversations);
+          setConversations(deduplicated);
+          setFilteredConversations(deduplicated);
         } else {
           setConversations([]);
           setFilteredConversations([]);
@@ -362,8 +369,9 @@ export default function ConversationsScreen() {
               // Load from database after sync
               const synced = await loadCachedConversations();
               if (synced.length > 0) {
-                setConversations(synced);
-                setFilteredConversations(synced);
+                const deduplicated = deduplicateConversations(synced);
+                setConversations(deduplicated);
+                setFilteredConversations(deduplicated);
               }
               setIsLoading(false);
             } else {
@@ -377,8 +385,9 @@ export default function ConversationsScreen() {
             }
             loadCachedConversations().then(cached => {
               if (cached.length > 0) {
-                setConversations(cached);
-                setFilteredConversations(cached);
+                const deduplicated = deduplicateConversations(cached);
+                setConversations(deduplicated);
+                setFilteredConversations(deduplicated);
                 setIsLoading(false);
               } else {
                 // If no cached data, fetch from API
@@ -392,8 +401,9 @@ export default function ConversationsScreen() {
                 // Reload from database to get synced data
                 loadCachedConversations().then(synced => {
                   if (synced.length > 0) {
-                    setConversations(synced);
-                    setFilteredConversations(synced);
+                    const deduplicated = deduplicateConversations(synced);
+                    setConversations(deduplicated);
+                    setFilteredConversations(deduplicated);
                   }
                 });
               }
@@ -427,8 +437,9 @@ export default function ConversationsScreen() {
         // Load from local DB first for instant display
         loadCachedConversations().then(cached => {
           if (cached.length > 0) {
-            setConversations(cached);
-            setFilteredConversations(cached);
+            const deduplicated = deduplicateConversations(cached);
+            setConversations(deduplicated);
+            setFilteredConversations(deduplicated);
           }
         });
         
@@ -437,8 +448,9 @@ export default function ConversationsScreen() {
           if (result.success) {
             loadCachedConversations().then(synced => {
               if (synced.length > 0) {
-                setConversations(synced);
-                setFilteredConversations(synced);
+                const deduplicated = deduplicateConversations(synced);
+                setConversations(deduplicated);
+                setFilteredConversations(deduplicated);
               }
             });
           }
@@ -629,7 +641,9 @@ export default function ConversationsScreen() {
         renderItem={renderConversation}
         keyExtractor={(item, index) => {
           if (item && item.id !== undefined && item.id !== null) {
-            return `conversation-${item.id}`;
+            // Include conversation type in key to ensure uniqueness
+            const type = item.is_group ? 'group' : 'individual';
+            return `conversation-${type}-${item.id}`;
           }
           console.warn('Conversation missing id:', item, 'at index', index);
           return `conversation-fallback-${index}`;

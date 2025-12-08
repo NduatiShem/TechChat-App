@@ -12,7 +12,7 @@ import { useAuth } from '@/context/AuthContext';
 import { useNotifications } from '@/context/NotificationContext';
 import { useTheme } from '@/context/ThemeContext';
 import { groupsAPI, messagesAPI, usersAPI } from '@/services/api';
-import { getDb, getMessages as getDbMessages, hasMessagesForConversation, initDatabase, saveMessages as saveDbMessages, updateMessageStatus } from '@/services/database';
+import { deleteMessage as deleteDbMessage, fixDuplicateMessagesWithWrongTimestamps, getDb, getMessages as getDbMessages, hasMessagesForConversation, initDatabase, saveMessages as saveDbMessages, updateMessageByServerId, updateMessageStatus } from '@/services/database';
 import { startRetryService } from '@/services/messageRetryService';
 import { syncConversationMessages } from '@/services/syncService';
 import { isVideoAttachment } from '@/utils/textUtils';
@@ -143,28 +143,203 @@ export default function GroupChatScreen() {
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
   const [keyboardHeight, setKeyboardHeight] = useState(0);
 
-  // Helper function to deduplicate messages by ID
+  // Robust deduplication function using composite key (ID + created_at + message content)
   const deduplicateMessages = useCallback((messagesArray: Message[]): Message[] => {
-    const seenIds = new Set<number>();
-    const uniqueMessages: Message[] = [];
+    // Use a Map with composite key: "id_createdAt_messageContent" for more robust deduplication
+    const seenMessages = new Map<string, Message>();
+    const seenById = new Map<number | string, Message>();
     
     for (const msg of messagesArray) {
-      // Only add if we haven't seen this ID before and ID is valid
-      if (msg && msg.id !== undefined && msg.id !== null && msg.id !== 0) {
-        if (!seenIds.has(msg.id)) {
-          seenIds.add(msg.id);
-          uniqueMessages.push(msg);
+      if (!msg) continue;
+      
+      // Primary deduplication: Check by ID first
+      if (msg.id !== undefined && msg.id !== null && msg.id !== 0) {
+        const existingById = seenById.get(msg.id);
+        
+        if (existingById) {
+          // Same ID exists - prefer the one with synced status or more complete data
+          const existingIsBetter = 
+            (existingById.sync_status === 'synced' && msg.sync_status !== 'synced') ||
+            (existingById.attachments && !msg.attachments) ||
+            (existingById.reply_to && !msg.reply_to);
+          
+          if (!existingIsBetter) {
+            // Replace with newer/better version
+            seenById.set(msg.id, msg);
+            // Also update in seenMessages if it exists there
+            const messageKey = `${msg.id}_${msg.created_at}_${msg.message || ''}`;
+            seenMessages.set(messageKey, msg);
+          }
+          continue; // Skip to next message
         }
-      } else {
-        // For messages without valid IDs, keep them but they should be rare
-        uniqueMessages.push(msg);
+        
+        // New ID, add it
+        seenById.set(msg.id, msg);
+      }
+      
+      // Secondary deduplication: Check by content+sender for messages with same content
+      // This handles cases where same message has different IDs (tempLocalId vs server_id)
+      // and different timestamps (local vs server timestamp)
+      const messageContent = msg.message || '';
+      const messageTime = new Date(msg.created_at).getTime();
+      const senderId = msg.sender_id;
+      
+      // Check if we already have this message by content+sender
+      let foundDuplicate = false;
+      for (const [key, existing] of seenMessages.entries()) {
+        const existingTime = new Date(existing.created_at).getTime();
+        const timeDiff = Math.abs(existingTime - messageTime);
+        const contentMatch = (existing.message || '') === messageContent;
+        const senderMatch = existing.sender_id === senderId;
+        
+        // CRITICAL FIX: For messages with same content+sender, check if they're duplicates
+        // regardless of timestamp if:
+        // 1. Both have server_id (synced messages) - match by content+sender only
+        // 2. One has tempLocalId and one has server_id - match if within reasonable time window
+        if (contentMatch && senderMatch) {
+          const msgHasServerId = msg.id && typeof msg.id === 'number' && msg.id < 1000000000000;
+          const existingHasServerId = existing.id && typeof existing.id === 'number' && existing.id < 1000000000000;
+          
+          // Case 1: Both have server_id - match regardless of timestamp (they're the same message)
+          if (msgHasServerId && existingHasServerId) {
+            // Same content, same sender, both synced - they're duplicates
+            // Prefer the one with more recent timestamp or better sync status
+            if (msg.sync_status === 'synced' && existing.sync_status !== 'synced') {
+              seenMessages.delete(key);
+              const newKey = `${msg.id}_${msg.created_at}_${messageContent}`;
+              seenMessages.set(newKey, msg);
+              if (existing.id && seenById.has(existing.id)) {
+                seenById.delete(existing.id);
+                seenById.set(msg.id, msg);
+              }
+            } else if (messageTime > existingTime && msg.sync_status === 'synced') {
+              // Prefer newer timestamp if both are synced
+              seenMessages.delete(key);
+              const newKey = `${msg.id}_${msg.created_at}_${messageContent}`;
+              seenMessages.set(newKey, msg);
+              if (existing.id && seenById.has(existing.id)) {
+                seenById.delete(existing.id);
+                seenById.set(msg.id, msg);
+              }
+            }
+            foundDuplicate = true;
+            break;
+          }
+          
+          // Case 2: One has tempLocalId, one has server_id - match if within 10 minutes
+          // (allows for network delays and clock differences)
+          if ((msgHasServerId && !existingHasServerId) || (!msgHasServerId && existingHasServerId)) {
+            if (timeDiff < 600000) { // 10 minutes window
+              // Prefer the one with server_id (synced) over tempLocalId (pending)
+              if (msg.sync_status === 'synced' && existing.sync_status !== 'synced') {
+                seenMessages.delete(key);
+                const newKey = `${msg.id}_${msg.created_at}_${messageContent}`;
+                seenMessages.set(newKey, msg);
+                if (existing.id && seenById.has(existing.id)) {
+                  seenById.delete(existing.id);
+                  seenById.set(msg.id, msg);
+                }
+              }
+              foundDuplicate = true;
+              break;
+            }
+          }
+          
+          // Case 3: Both have tempLocalId - match if within 5 seconds (same send attempt)
+          if (!msgHasServerId && !existingHasServerId) {
+            if (timeDiff < 5000) {
+              // Prefer the one with better sync status
+              if (msg.sync_status === 'synced' && existing.sync_status !== 'synced') {
+                seenMessages.delete(key);
+                const newKey = `${msg.id}_${msg.created_at}_${messageContent}`;
+                seenMessages.set(newKey, msg);
+                if (existing.id && seenById.has(existing.id)) {
+                  seenById.delete(existing.id);
+                  seenById.set(msg.id, msg);
+                }
+              }
+              foundDuplicate = true;
+              break;
+            }
+          }
+        }
+      }
+      
+      if (!foundDuplicate) {
+        // Create composite key for deduplication
+        const messageKey = msg.id 
+          ? `${msg.id}_${msg.created_at}_${messageContent}` 
+          : `${msg.created_at}_${messageContent}_${senderId}`;
+        seenMessages.set(messageKey, msg);
       }
     }
     
-    return uniqueMessages.sort((a: Message, b: Message) => 
+    // FIX: Combine both seenById and seenMessages, prioritizing seenById
+    // This ensures we don't lose messages that might not have IDs yet
+    const allUniqueMessages = new Map<number | string, Message>();
+    
+    // First, add all messages from seenById (has priority - these have IDs)
+    for (const msg of seenById.values()) {
+      allUniqueMessages.set(msg.id, msg);
+    }
+    
+    // Then, add messages from seenMessages that don't have IDs or weren't in seenById
+    for (const msg of seenMessages.values()) {
+      if (msg.id) {
+        // If it has an ID but wasn't in seenById, add it (shouldn't happen, but safety)
+        if (!allUniqueMessages.has(msg.id)) {
+          allUniqueMessages.set(msg.id, msg);
+        }
+      } else {
+        // Message without ID - use composite key
+        const key = `temp_${msg.created_at}_${msg.message || ''}_${msg.sender_id}`;
+        if (!allUniqueMessages.has(key)) {
+          allUniqueMessages.set(key, msg);
+        }
+      }
+    }
+    
+    // Sort by created_at
+    return Array.from(allUniqueMessages.values()).sort((a: Message, b: Message) => 
       new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
     );
   }, []);
+  
+  // FIXED: Use ref-based approach to prevent infinite loops and race conditions
+  const prevMessagesLengthRef = useRef<number>(0);
+  const isDeduplicatingRef = useRef<boolean>(false);
+  
+  useEffect(() => {
+    // Only deduplicate if:
+    // 1. Messages length changed (might indicate duplicates)
+    // 2. Not already deduplicating (prevent race conditions)
+    // 3. We have messages
+    if (messages.length > 0 && 
+        messages.length !== prevMessagesLengthRef.current && 
+        !isDeduplicatingRef.current) {
+      
+      isDeduplicatingRef.current = true;
+      const deduplicated = deduplicateMessages(messages);
+      
+      if (deduplicated.length !== messages.length) {
+        if (__DEV__) {
+          console.log(`[GroupChat] Deduplication safety net: Removed ${messages.length - deduplicated.length} duplicate messages`);
+        }
+        prevMessagesLengthRef.current = deduplicated.length;
+        setMessages(deduplicated);
+      } else {
+        prevMessagesLengthRef.current = messages.length;
+      }
+      
+      // Reset flag after a short delay to allow state updates
+      setTimeout(() => {
+        isDeduplicatingRef.current = false;
+      }, 100);
+    } else if (messages.length === prevMessagesLengthRef.current) {
+      // Length didn't change, update ref
+      prevMessagesLengthRef.current = messages.length;
+    }
+  }, [messages.length, deduplicateMessages]); // Only depend on length, not full array
 
   const flatListRef = useRef<FlatList>(null);
   const hasScrolledForThisConversation = useRef<string | null>(null); // Track which conversation we've scrolled for
@@ -269,18 +444,46 @@ export default function GroupChatScreen() {
           }
           try {
             const syncResult = await syncConversationMessages(Number(id), 'group', user?.id || 0);
-            if (syncResult.success && syncResult.newMessagesCount > 0) {
-              // Load from database after sync
-              const syncedMessages = await loadMessagesFromDb(MESSAGES_PER_PAGE, 0);
-              if (syncedMessages.length > 0) {
-                const sorted = syncedMessages.sort((a, b) => 
-                  new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
-                );
-                setMessages(sorted);
-                setLoadedMessagesCount(sorted.length);
-                if (sorted.length > 0) {
-                  const latestMsg = sorted[sorted.length - 1];
-                  latestMessageIdRef.current = latestMsg.id;
+            if (syncResult.success) {
+              // Fix existing duplicates with wrong timestamps
+              try {
+                const response = await messagesAPI.getByGroup(Number(id), 1, 50);
+                const messagesData = response.data.messages?.data || response.data.messages || [];
+                
+                if (messagesData.length > 0) {
+                  await fixDuplicateMessagesWithWrongTimestamps(
+                    Number(id),
+                    'group',
+                    messagesData.map((msg: any) => ({
+                      id: msg.id,
+                      created_at: msg.created_at,
+                      message: msg.message,
+                      sender_id: msg.sender_id,
+                    }))
+                  );
+                }
+              } catch (cleanupError) {
+                // Silently fail - cleanup is not critical
+                if (__DEV__) {
+                  console.warn('[GroupChat] Error cleaning up duplicates:', cleanupError);
+                }
+              }
+              
+              if (syncResult.newMessagesCount > 0) {
+                // Load from database after sync
+                const syncedMessages = await loadMessagesFromDb(MESSAGES_PER_PAGE, 0);
+                if (syncedMessages.length > 0) {
+                  const sorted = syncedMessages.sort((a, b) => 
+                    new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
+                  );
+                  // Deduplicate before setting
+                  const uniqueMessages = deduplicateMessages(sorted);
+                  setMessages(uniqueMessages);
+                  setLoadedMessagesCount(uniqueMessages.length);
+                  if (uniqueMessages.length > 0) {
+                    const latestMsg = uniqueMessages[uniqueMessages.length - 1];
+                    latestMessageIdRef.current = latestMsg.id;
+                  }
                 }
               }
             }
@@ -294,15 +497,17 @@ export default function GroupChatScreen() {
             const sortedMessages = localMessages.sort((a, b) => 
               new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
             );
-            setMessages(sortedMessages);
-            setLoadedMessagesCount(sortedMessages.length);
+            // Deduplicate before setting
+            const uniqueMessages = deduplicateMessages(sortedMessages);
+            setMessages(uniqueMessages);
+            setLoadedMessagesCount(uniqueMessages.length);
             if (showLoading) {
               setLoading(false);
             }
             
             // Update latest message ID
-            if (sortedMessages.length > 0) {
-              const latestMsg = sortedMessages[sortedMessages.length - 1];
+            if (uniqueMessages.length > 0) {
+              const latestMsg = uniqueMessages[uniqueMessages.length - 1];
               latestMessageIdRef.current = latestMsg.id;
             }
           }
@@ -310,7 +515,8 @@ export default function GroupChatScreen() {
       }
       
       // Then sync from API in background (for updates)
-      const response = await messagesAPI.getByGroup(Number(id), 1, 10);
+      // Fetch more messages (50) to match syncConversationMessages and ensure all messages are loaded
+      const response = await messagesAPI.getByGroup(Number(id), 1, 50);
       // Handle Laravel pagination format
       const messagesData = response.data.messages?.data || response.data.messages || [];
       const pagination = response.data.messages || {};
@@ -368,6 +574,25 @@ export default function GroupChatScreen() {
             attachments: msg.attachments,
           }));
           await saveDbMessages(messagesToSave);
+          
+          // Fix existing duplicates with wrong timestamps after saving
+          try {
+            await fixDuplicateMessagesWithWrongTimestamps(
+              Number(id),
+              'group',
+              sortedMessages.map((msg: any) => ({
+                id: msg.id,
+                created_at: msg.created_at,
+                message: msg.message,
+                sender_id: msg.sender_id,
+              }))
+            );
+          } catch (cleanupError) {
+            // Silently fail - cleanup is not critical
+            if (__DEV__) {
+              console.warn('[GroupChat] Error cleaning up duplicates after save:', cleanupError);
+            }
+          }
         } catch (dbError) {
           console.error('[GroupChat] Error saving messages to database:', dbError);
         }
@@ -384,21 +609,70 @@ export default function GroupChatScreen() {
         messagesLengthRef.current = messagesWithStatus.length;
       } else {
         // Reload from DB to get merged data (includes sync_status)
+        // FIX: Don't merge with prev state - DB is source of truth after sync
         const mergedMessages = await loadMessagesFromDb(MESSAGES_PER_PAGE, 0);
+        
         if (mergedMessages.length > 0) {
           const sorted = mergedMessages.sort((a, b) => 
             new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
           );
-          setMessages(sorted);
-          messagesLengthRef.current = sorted.length;
+          
+          // FIX: Only get truly pending messages from prev state (not synced ones)
+          setMessages(prev => {
+            // Get ONLY pending messages that don't have server_id yet
+            const trulyPendingMessages = prev.filter(msg => 
+              msg.sync_status === 'pending' && 
+              typeof msg.id === 'number' && 
+              msg.id > 1000000000000 && // tempLocalId is timestamp-based
+              !sorted.some(dbMsg => {
+                // Check if this pending message matches a DB message by content+sender
+                // This handles tempLocalId -> server_id mapping
+                const timeDiff = Math.abs(
+                  new Date(dbMsg.created_at).getTime() - new Date(msg.created_at).getTime()
+                );
+                const messageMatch = (dbMsg.message || '') === (msg.message || '');
+                const senderMatch = dbMsg.sender_id === msg.sender_id;
+                
+                return messageMatch && senderMatch && timeDiff < 10000; // 10 second window
+              })
+            );
+            
+            // Combine DB messages with truly pending messages
+            const allMessages = [...sorted, ...trulyPendingMessages];
+            const sortedAll = allMessages.sort((a, b) => 
+              new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
+            );
+            
+            // CRITICAL: Deduplicate by server_id first, then by content+timestamp
+            const deduplicated = deduplicateMessages(sortedAll);
+            messagesLengthRef.current = deduplicated.length;
+            return deduplicated;
+          });
+        } else {
+          // No DB messages, but preserve pending messages
+          setMessages(prev => {
+            const pendingMessages = prev.filter(msg => 
+              msg.sync_status === 'pending' || 
+              (msg.sync_status !== 'synced' && typeof msg.id === 'number' && msg.id > 1000000000000)
+            );
+            if (pendingMessages.length > 0) {
+              messagesLengthRef.current = pendingMessages.length;
+              return pendingMessages;
+            }
+            return prev;
+          });
         }
       } // Update ref
       
       // Update latest message ID for sync detection
-      if (sortedMessages.length > 0) {
-        const latestMsg = sortedMessages[sortedMessages.length - 1]; // Last message is newest (after sorting)
-        latestMessageIdRef.current = latestMsg.id;
-      }
+      // Get current messages state for this
+      setMessages(current => {
+        if (current.length > 0) {
+          const latestMsg = current[current.length - 1];
+          latestMessageIdRef.current = latestMsg.id;
+        }
+        return current; // Don't modify state, just use it for side effects
+      });
       
       setGroupInfo(response.data.selectedConversation);
       
@@ -1075,6 +1349,15 @@ export default function GroupChatScreen() {
       
       // STEP 2: Show message immediately in UI (optimistic update)
       setMessages(prev => {
+        // Check if message with this tempLocalId already exists (prevent duplicates)
+        const existingIds = new Set(prev.map(m => m.id));
+        if (existingIds.has(tempLocalId)) {
+          if (__DEV__) {
+            console.warn('[GroupChat] Message with tempLocalId already exists, skipping:', tempLocalId);
+          }
+          return prev; // Don't add duplicate
+        }
+        
         const updatedMessages = [...prev, uiMessage].sort((a, b) => {
           const dateA = new Date(a.created_at).getTime();
           const dateB = new Date(b.created_at).getTime();
@@ -1121,8 +1404,8 @@ export default function GroupChatScreen() {
             try {
               const database = await getDb();
               if (database) {
-                const existingMessage = await database.getFirstAsync<{ server_id?: number }>(
-                  `SELECT server_id FROM messages WHERE id = ?`,
+                const existingMessage = await database.getFirstAsync<{ server_id?: number; created_at?: string }>(
+                  `SELECT server_id, created_at FROM messages WHERE id = ?`,
                   [tempLocalId]
                 );
                 
@@ -1130,9 +1413,10 @@ export default function GroupChatScreen() {
                   if (__DEV__) {
                     console.log(`[GroupChat] Message ${tempLocalId} already has server_id ${existingMessage.server_id}, skipping API call`);
                   }
-                  // Update UI with server ID, but first check for duplicates
+                  // Update UI with server ID and server timestamp, but first check for duplicates
                   setMessages(prev => {
                     const serverId = existingMessage.server_id!;
+                    const serverCreatedAt = existingMessage.created_at;
                     // Check if there's already a message with this server ID (from sync)
                     const existingServerMessage = prev.find(msg => msg.id === serverId);
                     
@@ -1141,10 +1425,15 @@ export default function GroupChatScreen() {
                       // Remove the temp message and keep the server one (which is more complete)
                       updatedMessages = prev.filter(msg => msg.id !== tempLocalId);
                     } else {
-                      // Update temp message to server ID
+                      // Update temp message to server ID AND update timestamp to match server
                       updatedMessages = prev.map(msg => 
                         msg.id === tempLocalId 
-                          ? { ...msg, id: serverId, sync_status: 'synced' }
+                          ? { 
+                              ...msg, 
+                              id: serverId, 
+                              sync_status: 'synced',
+                              created_at: serverCreatedAt || msg.created_at // Use server timestamp from DB
+                            }
                           : msg
                       );
                     }
@@ -1195,38 +1484,50 @@ export default function GroupChatScreen() {
           // Send to API
           const res = await messagesAPI.sendMessage(formData);
           
-          // STEP 4: Update SQLite with server response (change status to synced, update server_id)
+          // STEP 4: Update SQLite with server response (change status to synced, update server_id and timestamp)
           if (res.data && res.data.id && dbInitialized) {
             try {
-              await updateMessageStatus(tempLocalId, res.data.id, 'synced');
+              // Update with server timestamp to prevent duplicates with different timestamps
+              const serverCreatedAt = res.data.created_at;
+              await updateMessageStatus(tempLocalId, res.data.id, 'synced', serverCreatedAt);
               
-              // Update UI message with server ID, but first check for duplicates
+              // Update UI message with server ID and server timestamp, checking for duplicates
               setMessages(prev => {
                 const serverId = res.data.id;
-                // Check if there's already a message with this server ID (from sync)
-                const existingServerMessage = prev.find(msg => msg.id === serverId);
+                // Check if message with server ID already exists (from a sync)
+                const existingIds = new Set(prev.map(m => m.id));
+                const serverIdExists = existingIds.has(serverId);
                 
-                let updatedMessages;
-                if (existingServerMessage) {
-                  // Remove the temp message and keep the server one (which is more complete)
-                  updatedMessages = prev.filter(msg => msg.id !== tempLocalId);
+                if (serverIdExists) {
+                  // Server ID already exists, remove the tempLocalId message to avoid duplication
+                  if (__DEV__) {
+                    console.log('[GroupChat] Server ID already exists, removing tempLocalId message:', tempLocalId);
+                  }
+                  const filtered = prev.filter(msg => msg.id !== tempLocalId);
+                  // Ensure deduplication after filtering
+                  return deduplicateMessages(filtered);
                 } else {
-                  // Update temp message to server ID
-                  updatedMessages = prev.map(msg => 
+                  // Update the tempLocalId to server ID AND update timestamp to match server
+                  const updated = prev.map(msg => 
                     msg.id === tempLocalId 
-                      ? { ...msg, id: serverId, sync_status: 'synced' }
+                      ? { 
+                          ...msg, 
+                          id: serverId, 
+                          sync_status: 'synced',
+                          created_at: serverCreatedAt || msg.created_at // Use server timestamp
+                        }
                       : msg
                   );
+                  // Ensure deduplication after update
+                  return deduplicateMessages(updated);
                 }
-                // Ensure no duplicates remain
-                return deduplicateMessages(updatedMessages);
               });
               
               // Update latest message ID
               latestMessageIdRef.current = res.data.id;
               
               if (__DEV__) {
-                console.log('[GroupChat] Message synced successfully:', tempLocalId, '->', res.data.id);
+                console.log('[GroupChat] Message synced successfully:', tempLocalId, '->', res.data.id, 'with timestamp:', serverCreatedAt);
               }
             } catch (updateError) {
               console.error('[GroupChat] Error updating message status:', updateError);
@@ -1493,12 +1794,30 @@ export default function GroupChatScreen() {
     try {
       const response = await messagesAPI.editMessage(editingMessage.id, editText.trim());
       
+      const editedAt = response.data.edited_at || new Date().toISOString();
+      
       // Update message in local state
       setMessages(prev => prev.map(msg => 
         msg.id === editingMessage.id 
-          ? { ...msg, message: editText.trim(), edited_at: response.data.edited_at || new Date().toISOString() }
+          ? { ...msg, message: editText.trim(), edited_at: editedAt }
           : msg
       ));
+      
+      // Update SQLite immediately
+      if (dbInitialized) {
+        try {
+          await updateMessageByServerId(editingMessage.id, {
+            message: editText.trim(),
+            edited_at: editedAt,
+          });
+          if (__DEV__) {
+            console.log('[GroupChat] Updated edited message in SQLite:', editingMessage.id);
+          }
+        } catch (dbError) {
+          console.error('[GroupChat] Error updating SQLite after edit:', dbError);
+          // Continue anyway - sync will fix it later
+        }
+      }
       
       setEditingMessage(null);
       setEditText('');
@@ -1546,6 +1865,20 @@ export default function GroupChatScreen() {
               
               // Remove message from local state
               setMessages(prev => prev.filter(msg => msg.id !== messageId));
+              
+              // Delete from SQLite immediately
+              if (dbInitialized) {
+                try {
+                  await deleteDbMessage(messageId);
+                  if (__DEV__) {
+                    console.log('[GroupChat] Deleted message from SQLite:', messageId);
+                  }
+                } catch (dbError) {
+                  console.error('[GroupChat] Error deleting from SQLite:', dbError);
+                  // Continue anyway - sync will fix it later
+                }
+              }
+              
               setShowMessageOptions(null);
               
               // Optionally refresh messages to get updated last_message
@@ -1559,9 +1892,19 @@ export default function GroupChatScreen() {
                 Alert.alert(
                   'Message Not Found', 
                   'This message may have already been deleted.',
-                  [{ text: 'OK', onPress: () => {
+                  [{ text: 'OK', onPress: async () => {
                     // Remove from local state anyway
                     setMessages(prev => prev.filter(msg => msg.id !== messageId));
+                    
+                    // Also try to delete from SQLite
+                    if (dbInitialized) {
+                      try {
+                        await deleteDbMessage(messageId);
+                      } catch (dbError) {
+                        console.error('[GroupChat] Error deleting from SQLite (404 case):', dbError);
+                      }
+                    }
+                    
                     setShowMessageOptions(null);
                   }}]
                 );
