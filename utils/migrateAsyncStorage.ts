@@ -46,16 +46,59 @@ export async function migrateConversationsFromAsyncStorage(): Promise<number> {
   }
 }
 
-export async function runAsyncStorageMigration(): Promise<{ conversations: number }> {
+export async function migrateGroupsFromAsyncStorage(): Promise<number> {
+  try {
+    const cachedData = await AsyncStorage.getItem(GROUPS_CACHE_KEY);
+    if (!cachedData) {
+      return 0;
+    }
+
+    const groups = JSON.parse(cachedData);
+    if (!Array.isArray(groups) || groups.length === 0) {
+      return 0;
+    }
+
+    const groupsToSave = groups.map((group: any) => ({
+      conversation_id: group.id,
+      conversation_type: 'group' as const,
+      group_id: group.id,
+      name: group.name || 'Unknown Group',
+      email: undefined,
+      avatar_url: group.avatar_url,
+      last_message: group.last_message,
+      last_message_date: group.last_message_date || group.updated_at,
+      last_message_sender_id: undefined,
+      last_message_read_at: undefined,
+      unread_count: group.unread_count ?? 0,
+      created_at: group.created_at || new Date().toISOString(),
+      updated_at: group.updated_at || group.last_message_date || new Date().toISOString(),
+    }));
+
+    await saveConversations(groupsToSave);
+
+    if (__DEV__) {
+      console.log(`[Migration] Migrated ${groupsToSave.length} groups from AsyncStorage`);
+    }
+
+    return groupsToSave.length;
+  } catch (error) {
+    console.error('[Migration] Error migrating groups:', error);
+    return 0;
+  }
+}
+
+export async function runAsyncStorageMigration(): Promise<{ conversations: number; groups: number }> {
   try {
     const conversationsCount = await migrateConversationsFromAsyncStorage();
+    const groupsCount = await migrateGroupsFromAsyncStorage();
 
     return {
       conversations: conversationsCount,
+      groups: groupsCount,
     };
   } catch (error) {
     console.error('[Migration] Error running AsyncStorage migration:', error);
-    return { conversations: 0 };
+    return { conversations: 0, groups: 0 };
   }
 }
 

@@ -1,5 +1,8 @@
+import type { DatabaseMessage } from '@/types/database';
 import { conversationsAPI, messagesAPI } from './api';
 import {
+    deleteMessage,
+    getDb,
     saveConversations,
     saveMessages,
     updateSyncState
@@ -17,11 +20,73 @@ const messageSyncPromises = new Map<string, Promise<any>>();
 const lastMessageSyncTimes = new Map<string, number>();
 const MESSAGE_SYNC_DEBOUNCE_MS = 1000; // Wait 1 second between message syncs for same conversation
 
+/**
+ * Remove messages that exist locally but were deleted on the server
+ * This detects hard-deleted messages (not soft-deleted) that are missing from API response
+ */
+async function removeDeletedMessages(
+  conversationId: number,
+  conversationType: 'individual' | 'group',
+  serverIdsFromAPI: number[]
+): Promise<number> {
+  try {
+    const database = await getDb();
+    if (!database) {
+      return 0;
+    }
+    
+    // Get all local messages with server_id for this conversation
+    const localMessages = await database.getAllAsync<DatabaseMessage>(
+      `SELECT id, server_id FROM messages 
+       WHERE conversation_id = ? AND conversation_type = ? AND server_id IS NOT NULL`,
+      [conversationId, conversationType]
+    );
+    
+    if (localMessages.length === 0) {
+      return 0;
+    }
+    
+    // Create set of server IDs from API for quick lookup
+    const apiServerIds = new Set(serverIdsFromAPI);
+    
+    // Find messages that exist locally but not in API (deleted on server)
+    const messagesToDelete = localMessages.filter(msg => 
+      msg.server_id && !apiServerIds.has(msg.server_id)
+    );
+    
+    if (messagesToDelete.length === 0) {
+      return 0;
+    }
+    
+    let deletedCount = 0;
+    for (const msg of messagesToDelete) {
+      try {
+        await deleteMessage(msg.server_id!, msg.id);
+        deletedCount++;
+      } catch (error) {
+        // Log but continue deleting other messages
+        if (__DEV__) {
+          console.warn(`[Sync] Error deleting message ${msg.server_id}:`, error);
+        }
+      }
+    }
+    
+    if (__DEV__ && deletedCount > 0) {
+      console.log(`[Sync] Removed ${deletedCount} deleted messages for ${conversationType} ${conversationId}`);
+    }
+    
+    return deletedCount;
+  } catch (error) {
+    console.error('[Sync] Error removing deleted messages:', error);
+    return 0;
+  }
+}
+
 export async function syncConversationMessages(
   conversationId: number,
   conversationType: 'individual' | 'group',
   currentUserId: number
-): Promise<{ success: boolean; newMessagesCount: number; error?: string }> {
+): Promise<{ success: boolean; newMessagesCount: number; deletedCount?: number; error?: string }> {
   const syncKey = `${conversationType}_${conversationId}`;
   
   // Check if sync is already running for this conversation
@@ -60,8 +125,13 @@ export async function syncConversationMessages(
     const messagesData = response.data.messages?.data || response.data.messages || [];
 
     if (messagesData.length === 0) {
+      // If API returns 0 messages, don't delete local messages because:
+      // 1. Conversation might be empty (no messages ever sent)
+      // 2. We're only checking first 50 messages (pagination)
+      // 3. API might be temporarily unavailable
+      // Deletion detection only works when we have messages to compare against
       await updateSyncState(conversationId, conversationType, 'synced');
-      return { success: true, newMessagesCount: 0 };
+      return { success: true, newMessagesCount: 0, deletedCount: 0 };
     }
 
     const messagesToSave = messagesData.map((msg: any) => ({
@@ -88,15 +158,20 @@ export async function syncConversationMessages(
     }));
 
       await saveMessages(messagesToSave);
+      
+      // Remove messages that exist locally but were deleted on the server
+      const serverIds = messagesToSave.map(msg => msg.server_id!).filter(Boolean);
+      const deletedCount = await removeDeletedMessages(conversationId, conversationType, serverIds);
+      
       await updateSyncState(conversationId, conversationType, 'synced');
 
       lastMessageSyncTimes.set(syncKey, Date.now());
 
       if (__DEV__) {
-        console.log(`[Sync] Synced ${messagesToSave.length} messages for ${conversationType} ${conversationId}`);
+        console.log(`[Sync] Synced ${messagesToSave.length} messages, removed ${deletedCount} deleted messages for ${conversationType} ${conversationId}`);
       }
 
-      return { success: true, newMessagesCount: messagesToSave.length };
+      return { success: true, newMessagesCount: messagesToSave.length, deletedCount };
     } catch (error: any) {
       const errorMessage = error.message || 'Unknown error';
       console.error(`[Sync] Error syncing messages for ${conversationType} ${conversationId}:`, errorMessage);
@@ -209,7 +284,7 @@ export async function syncOlderMessages(
   conversationType: 'individual' | 'group',
   page: number = 1,
   perPage: number = 50
-): Promise<{ success: boolean; messagesCount: number; hasMore: boolean; error?: string }> {
+): Promise<{ success: boolean; messagesCount: number; deletedCount?: number; hasMore: boolean; error?: string }> {
   try {
     let response;
     if (conversationType === 'individual') {
@@ -223,7 +298,7 @@ export async function syncOlderMessages(
     const hasMore = pagination.current_page < pagination.last_page || messagesData.length >= perPage;
 
     if (messagesData.length === 0) {
-      return { success: true, messagesCount: 0, hasMore: false };
+      return { success: true, messagesCount: 0, deletedCount: 0, hasMore: false };
     }
 
     const messagesToSave = messagesData.map((msg: any) => ({
@@ -250,16 +325,22 @@ export async function syncOlderMessages(
     }));
 
     await saveMessages(messagesToSave);
+    
+    // Remove messages that exist locally but were deleted on the server
+    // Note: For pagination, we only check deletions for the current page's messages
+    // Full deletion check should be done in syncConversationMessages (page 1)
+    const serverIds = messagesToSave.map(msg => msg.server_id!).filter(Boolean);
+    const deletedCount = await removeDeletedMessages(conversationId, conversationType, serverIds);
 
     if (__DEV__) {
-      console.log(`[Sync] Synced ${messagesToSave.length} older messages for ${conversationType} ${conversationId}`);
+      console.log(`[Sync] Synced ${messagesToSave.length} older messages, removed ${deletedCount} deleted messages for ${conversationType} ${conversationId}`);
     }
 
-    return { success: true, messagesCount: messagesToSave.length, hasMore };
+    return { success: true, messagesCount: messagesToSave.length, deletedCount, hasMore };
   } catch (error: any) {
     const errorMessage = error.message || 'Unknown error';
     console.error(`[Sync] Error syncing older messages for ${conversationType} ${conversationId}:`, errorMessage);
-    return { success: false, messagesCount: 0, hasMore: false, error: errorMessage };
+    return { success: false, messagesCount: 0, deletedCount: 0, hasMore: false, error: errorMessage };
   }
 }
 

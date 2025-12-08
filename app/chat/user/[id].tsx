@@ -12,7 +12,7 @@ import { useAuth } from '@/context/AuthContext';
 import { useNotifications } from '@/context/NotificationContext';
 import { useTheme } from '@/context/ThemeContext';
 import { messagesAPI, usersAPI } from '@/services/api';
-import { deleteMessage as deleteDbMessage, getDb, getMessages as getDbMessages, hasMessagesForConversation, initDatabase, saveMessages as saveDbMessages, updateMessageByServerId, updateMessageStatus } from '@/services/database';
+import { deleteMessage as deleteDbMessage, fixDuplicateMessagesWithWrongTimestamps, getDb, getMessages as getDbMessages, hasMessagesForConversation, initDatabase, saveMessages as saveDbMessages, updateMessageByServerId, updateMessageStatus } from '@/services/database';
 import { startRetryService } from '@/services/messageRetryService';
 import { syncConversationMessages, syncOlderMessages } from '@/services/syncService';
 import { isVideoAttachment } from '@/utils/textUtils';
@@ -149,13 +149,14 @@ export default function UserChatScreen() {
         seenById.set(msg.id, msg);
       }
       
-      // Secondary deduplication: Check by content+timestamp for tempLocalId -> server_id mapping
+      // Secondary deduplication: Check by content+sender for messages with same content
       // This handles cases where same message has different IDs (tempLocalId vs server_id)
+      // and different timestamps (local vs server timestamp)
       const messageContent = msg.message || '';
       const messageTime = new Date(msg.created_at).getTime();
       const senderId = msg.sender_id;
       
-      // Check if we already have this message by content+timestamp+sender
+      // Check if we already have this message by content+sender
       let foundDuplicate = false;
       for (const [key, existing] of seenMessages.entries()) {
         const existingTime = new Date(existing.created_at).getTime();
@@ -163,22 +164,76 @@ export default function UserChatScreen() {
         const contentMatch = (existing.message || '') === messageContent;
         const senderMatch = existing.sender_id === senderId;
         
-        // If same content, sender, and within 5 seconds, it's likely the same message
-        if (contentMatch && senderMatch && timeDiff < 5000) {
-          // Prefer the one with server_id (synced) over tempLocalId (pending)
-          if (msg.sync_status === 'synced' && existing.sync_status !== 'synced') {
-            // Replace existing with synced version
-            seenMessages.delete(key);
-            const newKey = `${msg.id}_${msg.created_at}_${messageContent}`;
-            seenMessages.set(newKey, msg);
-            // Also update seenById if existing had an ID
-            if (existing.id && seenById.has(existing.id)) {
-              seenById.delete(existing.id);
-              seenById.set(msg.id, msg);
+        // CRITICAL FIX: For messages with same content+sender, check if they're duplicates
+        // regardless of timestamp if:
+        // 1. Both have server_id (synced messages) - match by content+sender only
+        // 2. One has tempLocalId and one has server_id - match if within reasonable time window
+        if (contentMatch && senderMatch) {
+          const msgHasServerId = msg.id && typeof msg.id === 'number' && msg.id < 1000000000000;
+          const existingHasServerId = existing.id && typeof existing.id === 'number' && existing.id < 1000000000000;
+          
+          // Case 1: Both have server_id - match regardless of timestamp (they're the same message)
+          if (msgHasServerId && existingHasServerId) {
+            // Same content, same sender, both synced - they're duplicates
+            // Prefer the one with more recent timestamp or better sync status
+            if (msg.sync_status === 'synced' && existing.sync_status !== 'synced') {
+              seenMessages.delete(key);
+              const newKey = `${msg.id}_${msg.created_at}_${messageContent}`;
+              seenMessages.set(newKey, msg);
+              if (existing.id && seenById.has(existing.id)) {
+                seenById.delete(existing.id);
+                seenById.set(msg.id, msg);
+              }
+            } else if (messageTime > existingTime && msg.sync_status === 'synced') {
+              // Prefer newer timestamp if both are synced
+              seenMessages.delete(key);
+              const newKey = `${msg.id}_${msg.created_at}_${messageContent}`;
+              seenMessages.set(newKey, msg);
+              if (existing.id && seenById.has(existing.id)) {
+                seenById.delete(existing.id);
+                seenById.set(msg.id, msg);
+              }
+            }
+            foundDuplicate = true;
+            break;
+          }
+          
+          // Case 2: One has tempLocalId, one has server_id - match if within 10 minutes
+          // (allows for network delays and clock differences)
+          if ((msgHasServerId && !existingHasServerId) || (!msgHasServerId && existingHasServerId)) {
+            if (timeDiff < 600000) { // 10 minutes window
+              // Prefer the one with server_id (synced) over tempLocalId (pending)
+              if (msg.sync_status === 'synced' && existing.sync_status !== 'synced') {
+                seenMessages.delete(key);
+                const newKey = `${msg.id}_${msg.created_at}_${messageContent}`;
+                seenMessages.set(newKey, msg);
+                if (existing.id && seenById.has(existing.id)) {
+                  seenById.delete(existing.id);
+                  seenById.set(msg.id, msg);
+                }
+              }
+              foundDuplicate = true;
+              break;
             }
           }
-          foundDuplicate = true;
-          break;
+          
+          // Case 3: Both have tempLocalId - match if within 5 seconds (same send attempt)
+          if (!msgHasServerId && !existingHasServerId) {
+            if (timeDiff < 5000) {
+              // Prefer the one with better sync status
+              if (msg.sync_status === 'synced' && existing.sync_status !== 'synced') {
+                seenMessages.delete(key);
+                const newKey = `${msg.id}_${msg.created_at}_${messageContent}`;
+                seenMessages.set(newKey, msg);
+                if (existing.id && seenById.has(existing.id)) {
+                  seenById.delete(existing.id);
+                  seenById.set(msg.id, msg);
+                }
+              }
+              foundDuplicate = true;
+              break;
+            }
+          }
         }
       }
       
@@ -191,27 +246,72 @@ export default function UserChatScreen() {
       }
     }
     
-    // Use seenById as primary source (more reliable), fallback to seenMessages
-    const uniqueMessages = Array.from(seenById.values());
+    // FIX: Combine both seenById and seenMessages, prioritizing seenById
+    // This ensures we don't lose messages that might not have IDs yet
+    const allUniqueMessages = new Map<number | string, Message>();
+    
+    // First, add all messages from seenById (has priority - these have IDs)
+    for (const msg of seenById.values()) {
+      allUniqueMessages.set(msg.id, msg);
+    }
+    
+    // Then, add messages from seenMessages that don't have IDs or weren't in seenById
+    for (const msg of seenMessages.values()) {
+      if (msg.id) {
+        // If it has an ID but wasn't in seenById, add it (shouldn't happen, but safety)
+        if (!allUniqueMessages.has(msg.id)) {
+          allUniqueMessages.set(msg.id, msg);
+        }
+      } else {
+        // Message without ID - use composite key
+        const key = `temp_${msg.created_at}_${msg.message || ''}_${msg.sender_id}`;
+        if (!allUniqueMessages.has(key)) {
+          allUniqueMessages.set(key, msg);
+        }
+      }
+    }
     
     // Sort by created_at
-    return uniqueMessages.sort((a: Message, b: Message) => 
+    return Array.from(allUniqueMessages.values()).sort((a: Message, b: Message) => 
       new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
     );
   }, []);
   
-  // Safety net: Automatically deduplicate messages whenever they change
+  // FIXED: Use ref-based approach to prevent infinite loops and race conditions
+  const prevMessagesLengthRef = useRef<number>(0);
+  const isDeduplicatingRef = useRef<boolean>(false);
+  
   useEffect(() => {
-    if (messages.length > 0) {
+    // Only deduplicate if:
+    // 1. Messages length changed (might indicate duplicates)
+    // 2. Not already deduplicating (prevent race conditions)
+    // 3. We have messages
+    if (messages.length > 0 && 
+        messages.length !== prevMessagesLengthRef.current && 
+        !isDeduplicatingRef.current) {
+      
+      isDeduplicatingRef.current = true;
       const deduplicated = deduplicateMessages(messages);
+      
       if (deduplicated.length !== messages.length) {
         if (__DEV__) {
           console.log(`[UserChat] Deduplication safety net: Removed ${messages.length - deduplicated.length} duplicate messages`);
         }
+        prevMessagesLengthRef.current = deduplicated.length;
         setMessages(deduplicated);
+      } else {
+        prevMessagesLengthRef.current = messages.length;
       }
+      
+      // Reset flag after a short delay to allow state updates
+      setTimeout(() => {
+        isDeduplicatingRef.current = false;
+      }, 100);
+    } else if (messages.length === prevMessagesLengthRef.current) {
+      // Length didn't change, update ref
+      prevMessagesLengthRef.current = messages.length;
     }
-  }, [messages, deduplicateMessages]);
+  }, [messages.length, deduplicateMessages]); // Only depend on length, not full array
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(true);
   const [sending, setSending] = useState(false);
@@ -342,20 +442,46 @@ export default function UserChatScreen() {
         }
         try {
           const syncResult = await syncConversationMessages(Number(id), 'individual', user?.id || 0);
-          if (syncResult.success && syncResult.newMessagesCount > 0) {
-            // Load from database after sync
-            const syncedMessages = await loadMessagesFromDb(MESSAGES_PER_PAGE, 0);
-            if (syncedMessages.length > 0) {
-              const sorted = syncedMessages.sort((a, b) => 
-                new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
-              );
-              // Deduplicate before setting
-              const uniqueMessages = deduplicateMessages(sorted);
-              setMessages(uniqueMessages);
-              setLoadedMessagesCount(uniqueMessages.length);
-              if (uniqueMessages.length > 0) {
-                const latestMsg = uniqueMessages[uniqueMessages.length - 1];
-                latestMessageIdRef.current = latestMsg.id;
+          if (syncResult.success) {
+            // Fix existing duplicates with wrong timestamps
+            try {
+              const response = await messagesAPI.getByUser(Number(id), 1, 50);
+              const messagesData = response.data.messages?.data || response.data.messages || [];
+              
+              if (messagesData.length > 0) {
+                await fixDuplicateMessagesWithWrongTimestamps(
+                  Number(id),
+                  'individual',
+                  messagesData.map((msg: any) => ({
+                    id: msg.id,
+                    created_at: msg.created_at,
+                    message: msg.message,
+                    sender_id: msg.sender_id,
+                  }))
+                );
+              }
+            } catch (cleanupError) {
+              // Silently fail - cleanup is not critical
+              if (__DEV__) {
+                console.warn('[UserChat] Error cleaning up duplicates:', cleanupError);
+              }
+            }
+            
+            if (syncResult.newMessagesCount > 0) {
+              // Load from database after sync
+              const syncedMessages = await loadMessagesFromDb(MESSAGES_PER_PAGE, 0);
+              if (syncedMessages.length > 0) {
+                const sorted = syncedMessages.sort((a, b) => 
+                  new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
+                );
+                // Deduplicate before setting
+                const uniqueMessages = deduplicateMessages(sorted);
+                setMessages(uniqueMessages);
+                setLoadedMessagesCount(uniqueMessages.length);
+                if (uniqueMessages.length > 0) {
+                  const latestMsg = uniqueMessages[uniqueMessages.length - 1];
+                  latestMessageIdRef.current = latestMsg.id;
+                }
               }
             }
           }
@@ -496,6 +622,25 @@ export default function UserChatScreen() {
           }));
           await saveDbMessages(messagesToSave);
           
+          // Fix existing duplicates with wrong timestamps after saving
+          try {
+            await fixDuplicateMessagesWithWrongTimestamps(
+              Number(id),
+              'individual',
+              uniqueMessages.map((msg: any) => ({
+                id: msg.id,
+                created_at: msg.created_at,
+                message: msg.message,
+                sender_id: msg.sender_id,
+              }))
+            );
+          } catch (cleanupError) {
+            // Silently fail - cleanup is not critical
+            if (__DEV__) {
+              console.warn('[UserChat] Error cleaning up duplicates after save:', cleanupError);
+            }
+          }
+          
           if (__DEV__) {
             console.log(`[UserChat] Saved ${messagesToSave.length} messages to database from API sync`);
           }
@@ -515,75 +660,59 @@ export default function UserChatScreen() {
         messagesLengthRef.current = messagesWithStatus.length;
       } else {
         // Reload from DB to get merged data (includes sync_status)
-        // CRITICAL FIX: Preserve pending messages to prevent them from disappearing
+        // FIX: Don't merge with prev state - DB is source of truth after sync
         const mergedMessages = await loadMessagesFromDb(MESSAGES_PER_PAGE, 0);
         
-        // Merge with pending messages from current state
-        setMessages(prev => {
-          // Get pending messages from current state
-          // tempLocalId is Date.now() + Math.random(), so it's a very large positive number
-          // Check by sync_status instead of ID value
-          const pendingMessages = prev.filter(msg => 
-            msg.sync_status === 'pending' || 
-            (msg.sync_status !== 'synced' && typeof msg.id === 'number' && msg.id > 1000000000000) // tempLocalId is timestamp-based
+        if (mergedMessages.length > 0) {
+          const sorted = mergedMessages.sort((a, b) => 
+            new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
           );
           
-          if (mergedMessages.length > 0) {
-            const sorted = mergedMessages.sort((a, b) => 
-              new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
+          // FIX: Only get truly pending messages from prev state (not synced ones)
+          setMessages(prev => {
+            // Get ONLY pending messages that don't have server_id yet
+            const trulyPendingMessages = prev.filter(msg => 
+              msg.sync_status === 'pending' && 
+              typeof msg.id === 'number' && 
+              msg.id > 1000000000000 && // tempLocalId is timestamp-based
+              !sorted.some(dbMsg => {
+                // Check if this pending message matches a DB message by content+sender
+                // This handles tempLocalId -> server_id mapping
+                const timeDiff = Math.abs(
+                  new Date(dbMsg.created_at).getTime() - new Date(msg.created_at).getTime()
+                );
+                const messageMatch = (dbMsg.message || '') === (msg.message || '');
+                const senderMatch = dbMsg.sender_id === msg.sender_id;
+                
+                return messageMatch && senderMatch && timeDiff < 10000; // 10 second window
+              })
             );
             
-            // Create a map of DB message IDs for quick lookup
-            const dbMessageIds = new Set(sorted.map(msg => msg.id));
-            
-            // Add pending messages that aren't already in DB results
-            // Check by content+timestamp first (since tempLocalId won't match server_id)
-            const pendingToAdd = pendingMessages.filter(pending => {
-              // Check if pending message exists in DB by content and timestamp (within 5 seconds)
-              // This handles the case where tempLocalId != server_id
-              const existsByContent = sorted.some(dbMsg => {
-                const timeDiff = Math.abs(
-                  new Date(dbMsg.created_at).getTime() - new Date(pending.created_at).getTime()
-                );
-                const messageMatch = (dbMsg.message || '') === (pending.message || '');
-                const senderMatch = dbMsg.sender_id === pending.sender_id;
-                
-                // Also check if DB message has server_id that matches pending's expected server_id
-                // (if pending was already synced but UI hasn't updated)
-                if (dbMsg.id === pending.id) {
-                  return true; // Same ID, definitely duplicate
-                }
-                
-                return (
-                  messageMatch &&
-                  senderMatch &&
-                  timeDiff < 5000 // Within 5 seconds (more lenient for network delays)
-                );
-              });
-              
-              return !existsByContent; // Only add if not found in DB
-            });
-            
-            // Merge DB messages with pending messages
-            const allMessages = [...sorted, ...pendingToAdd];
+            // Combine DB messages with truly pending messages
+            const allMessages = [...sorted, ...trulyPendingMessages];
             const sortedAll = allMessages.sort((a, b) => 
               new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
             );
             
-            // Deduplicate final result
-            const finalMessages = deduplicateMessages(sortedAll);
-            messagesLengthRef.current = finalMessages.length;
-            return finalMessages;
-          } else {
-            // No DB messages, but preserve pending messages
+            // CRITICAL: Deduplicate by server_id first, then by content+timestamp
+            const deduplicated = deduplicateMessages(sortedAll);
+            messagesLengthRef.current = deduplicated.length;
+            return deduplicated;
+          });
+        } else {
+          // No DB messages, but preserve pending messages
+          setMessages(prev => {
+            const pendingMessages = prev.filter(msg => 
+              msg.sync_status === 'pending' || 
+              (msg.sync_status !== 'synced' && typeof msg.id === 'number' && msg.id > 1000000000000)
+            );
             if (pendingMessages.length > 0) {
               messagesLengthRef.current = pendingMessages.length;
               return pendingMessages;
             }
-            // No messages at all, keep current state
             return prev;
-          }
-        });
+          });
+        }
       }
       
       // Set initialScrollIndex to last message for automatic scroll on mount
@@ -1473,8 +1602,8 @@ export default function UserChatScreen() {
             try {
               const database = await getDb();
               if (database) {
-                const existingMessage = await database.getFirstAsync<{ server_id?: number }>(
-                  `SELECT server_id FROM messages WHERE id = ?`,
+                const existingMessage = await database.getFirstAsync<{ server_id?: number; created_at?: string }>(
+                  `SELECT server_id, created_at FROM messages WHERE id = ?`,
                   [tempLocalId]
                 );
                 
@@ -1482,10 +1611,15 @@ export default function UserChatScreen() {
                   if (__DEV__) {
                     console.log(`[UserChat] Message ${tempLocalId} already has server_id ${existingMessage.server_id}, skipping API call`);
                   }
-                  // Update UI with server ID
+                  // Update UI with server ID and server timestamp
                   setMessages(prev => prev.map(msg => 
                     msg.id === tempLocalId 
-                      ? { ...msg, id: existingMessage.server_id!, sync_status: 'synced' }
+                      ? { 
+                          ...msg, 
+                          id: existingMessage.server_id!, 
+                          sync_status: 'synced',
+                          created_at: existingMessage.created_at || msg.created_at // Use server timestamp from DB
+                        }
                       : msg
                   ));
                   return; // Don't send again
@@ -1532,12 +1666,14 @@ export default function UserChatScreen() {
           // Send to API
           const res = await messagesAPI.sendMessage(formData);
           
-          // STEP 4: Update SQLite with server response (change status to synced, update server_id)
+          // STEP 4: Update SQLite with server response (change status to synced, update server_id and timestamp)
           if (res.data && res.data.id && dbInitialized) {
             try {
-              await updateMessageStatus(tempLocalId, res.data.id, 'synced');
+              // Update with server timestamp to prevent duplicates with different timestamps
+              const serverCreatedAt = res.data.created_at;
+              await updateMessageStatus(tempLocalId, res.data.id, 'synced', serverCreatedAt);
               
-              // Update UI message with server ID, checking for duplicates
+              // Update UI message with server ID and server timestamp, checking for duplicates
               setMessages(prev => {
                 // Check if message with server ID already exists (from a sync)
                 const existingIds = new Set(prev.map(m => m.id));
@@ -1552,10 +1688,15 @@ export default function UserChatScreen() {
                   // Ensure deduplication after filtering
                   return deduplicateMessages(filtered);
                 } else {
-                  // Update the tempLocalId to server ID
+                  // Update the tempLocalId to server ID AND update timestamp to match server
                   const updated = prev.map(msg => 
                     msg.id === tempLocalId 
-                      ? { ...msg, id: res.data.id, sync_status: 'synced' }
+                      ? { 
+                          ...msg, 
+                          id: res.data.id, 
+                          sync_status: 'synced',
+                          created_at: serverCreatedAt || msg.created_at // Use server timestamp
+                        }
                       : msg
                   );
                   // Ensure deduplication after update
@@ -1567,7 +1708,7 @@ export default function UserChatScreen() {
               latestMessageIdRef.current = res.data.id;
               
               if (__DEV__) {
-                console.log('[UserChat] Message synced successfully:', tempLocalId, '->', res.data.id);
+                console.log('[UserChat] Message synced successfully:', tempLocalId, '->', res.data.id, 'with timestamp:', serverCreatedAt);
               }
             } catch (updateError) {
               console.error('[UserChat] Error updating message status:', updateError);
