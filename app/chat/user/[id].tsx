@@ -433,7 +433,11 @@ export default function UserChatScreen() {
     if (showLoading) {
       setLoading(true);
     }
-    setHasScrolledToBottom(false); // Reset scroll flag when fetching new messages
+    // Only reset scroll flag if this is initial load or user hasn't scrolled away
+    // This prevents unwanted scrolls when refreshing content while user is viewing older messages
+    if (isInitialLoadRef.current || (!userScrolledRef.current && shouldAutoScrollRef.current)) {
+      setHasScrolledToBottom(false);
+    }
     
     // Check if this is first-time opening this conversation (no messages in DB)
     if (dbInitialized) {
@@ -735,8 +739,11 @@ export default function UserChatScreen() {
         setLoading(false);
       }
       
-      // Reset scroll flag to allow initial scroll
-      setHasScrolledToBottom(false);
+      // Only reset scroll flag if this is initial load or user is at bottom
+      // This prevents unwanted scrolls when refreshing while user is viewing older messages
+      if (isInitialLoadRef.current || (!userScrolledRef.current && shouldAutoScrollRef.current)) {
+        setHasScrolledToBottom(false);
+      }
       
       // Mark messages as read when user opens conversation
       // Use the new route: PUT /api/messages/mark-read/{userId}
@@ -2919,13 +2926,17 @@ export default function UserChatScreen() {
               onEndReachedThreshold={0.1} // Trigger when 10% from top
               keyExtractor={(item, index) => {
                 // Use message ID if available, otherwise use index with a stable fallback
+                // Always include index as a fallback to ensure uniqueness even with duplicate IDs
                 if (item && item.id !== undefined && item.id !== null && item.id !== 0) {
-                  return `message-${item.id}`;
+                  // Include index and created_at to ensure uniqueness even if duplicate IDs exist
+                  // This prevents React key warnings when deduplication hasn't run yet
+                  const createdAt = item.created_at ? `-${item.created_at}` : '';
+                  return `message-${item.id}${createdAt}-${index}`;
                 }
                 // For messages without IDs, use index and created_at if available
                 // Include sender_id to make it more unique
-                const fallbackKey = item?.created_at 
-                  ? `message-fallback-${index}-${item.sender_id || 'unknown'}-${item.created_at}` 
+                const fallbackKey = item?.created_at
+                  ? `message-fallback-${index}-${item.sender_id || 'unknown'}-${item.created_at}`
                   : `message-fallback-${index}-${item.sender_id || 'unknown'}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
                 return fallbackKey;
               }}

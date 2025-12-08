@@ -351,6 +351,12 @@ export default function GroupChatScreen() {
   const isPaginatingRef = useRef<boolean>(false); // Track if user is currently paginating (loading older messages)
   const lastFocusTimeRef = useRef<number>(0); // Track when screen last gained focus
   
+  // Scroll management refs
+  const userScrolledRef = useRef<boolean>(false); // Track if user manually scrolled
+  const isInitialLoadRef = useRef<boolean>(true); // Track if this is the initial load
+  const lastScrollOffsetRef = useRef<number>(0); // Track last scroll offset to detect user scrolling
+  const shouldAutoScrollRef = useRef<boolean>(true); // Flag to determine if auto-scroll should happen
+  
   // Background sync state - for checking new messages (uses sync service + SQLite)
   const pollingIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const latestMessageIdRef = useRef<number | null>(null); // Track latest message ID to detect new messages
@@ -869,11 +875,16 @@ export default function GroupChatScreen() {
             return deduplicated;
           });
           
-          // Auto-scroll to bottom only if user is already at bottom (not scrolling up)
-          if (flatListRef.current && hasScrolledToBottom) {
-            setTimeout(() => {
-              scrollToBottom(false, 0);
-            }, 100);
+          // Auto-scroll to bottom when receiving new messages
+          // Only scroll if user is near bottom (hasn't manually scrolled up)
+          // Prevent during initial load - onLayout handles initial scroll
+          if (shouldAutoScrollRef.current && !userScrolledRef.current && hasAttemptedInitialScrollRef.current) {
+            // Small delay to let state update complete
+            requestAnimationFrame(() => {
+              setTimeout(() => {
+                scrollToBottom(false, 0, false); // animated = false, delay = 0, force = false
+              }, 100);
+            });
           }
           
           if (__DEV__) {
@@ -974,13 +985,20 @@ export default function GroupChatScreen() {
   }, []);
 
   // Improved scroll to bottom function that uses content size to scroll to absolute bottom
-  const scrollToBottom = useCallback((animated = false, delay = 100) => {
-    // Prevent scroll during initial load (onLayout handles initial scroll)
-    if (!hasAttemptedInitialScrollRef.current) {
+  const scrollToBottom = useCallback((animated = false, delay = 0, force = false) => {
+    // Prevent scroll during initial load unless forced (onLayout handles initial scroll)
+    if (!force && !hasAttemptedInitialScrollRef.current) {
       return;
     }
     
-    if (!flatListRef.current || messages.length === 0) return;
+    // Check if we should auto-scroll (unless forced)
+    if (!force && !shouldAutoScrollRef.current) {
+      return;
+    }
+    
+    if (!flatListRef.current || messages.length === 0) {
+      return;
+    }
     
     // Clear any pending scroll to prevent multiple rapid scrolls
     if (scrollTimeoutRef.current) {
@@ -989,7 +1007,9 @@ export default function GroupChatScreen() {
     }
     
     const performScroll = () => {
-      if (!flatListRef.current || messages.length === 0) return;
+      if (!flatListRef.current || messages.length === 0) {
+        return;
+      }
       
       try {
         // If we have content size and viewport size, use scrollToOffset for precise positioning
@@ -1005,8 +1025,12 @@ export default function GroupChatScreen() {
           setHasScrolledToBottom(true);
         } else {
           // Fallback to scrollToEnd if sizes aren't available yet
-          flatListRef.current.scrollToEnd({ animated });
+          (flatListRef.current as any).scrollToEnd({ animated });
           setHasScrolledToBottom(true);
+        }
+        
+        if (!force) {
+          shouldAutoScrollRef.current = false; // Reset after successful scroll
         }
       } catch (error) {
         console.warn('Scroll failed:', error);
@@ -1026,16 +1050,15 @@ export default function GroupChatScreen() {
     if (hasScrolledForThisConversation.current !== id) {
       hasScrolledForThisConversation.current = id as string;
       setHasScrolledToBottom(false);
+      isInitialLoadRef.current = true;
+      userScrolledRef.current = false;
+      shouldAutoScrollRef.current = true;
+      lastScrollOffsetRef.current = 0;
       hasAttemptedInitialScrollRef.current = false;
       contentSizeRef.current = null;
       viewportSizeRef.current = null;
     }
-    
-    // Scroll when messages are loaded and not loading (single attempt with debounce)
-    if (!loading && messages.length > 0 && !hasScrolledToBottom) {
-      scrollToBottom(false, 300);
-    }
-  }, [loading, messages.length, id, scrollToBottom, hasScrolledToBottom]);
+  }, [id]);
 
   // Mark messages as read and refresh messages when group chat is opened
   useFocusEffect(
@@ -1085,7 +1108,9 @@ export default function GroupChatScreen() {
       
       fetchMessages(!hasExistingMessages);
       
+      // Enable auto-scroll when conversation is focused
       // Scroll will be handled by onContentSizeChange and onLayout
+      shouldAutoScrollRef.current = true;
 
       const markGroupMessagesAsRead = async () => {
         if (!ENABLE_MARK_AS_READ || !id || !user) return;
@@ -1371,6 +1396,8 @@ export default function GroupChatScreen() {
         }
         
         // Scroll to bottom
+        shouldAutoScrollRef.current = true;
+        userScrolledRef.current = false;
         requestAnimationFrame(() => {
           setTimeout(() => {
             if (flatListRef.current) {
@@ -2840,6 +2867,7 @@ export default function GroupChatScreen() {
                 extraData={messages.length} // Force re-render when messages array changes
                 keyExtractor={(item, index) => {
                   // Create a unique key that handles temporary IDs and prevents duplicates
+                  // Always include index as a fallback to ensure uniqueness even with duplicate IDs
                   if (item && item.id !== undefined && item.id !== null && item.id !== 0) {
                     // For pending messages (temp IDs), include sync_status to ensure uniqueness
                     // This prevents duplicate keys when a temp message gets updated to server ID
@@ -2847,10 +2875,12 @@ export default function GroupChatScreen() {
                       // Use a combination that includes created_at for pending messages
                       // This ensures temp messages have unique keys even if they share the same ID pattern
                       const createdAt = item.created_at || index.toString();
-                      return `message-pending-${item.id}-${createdAt}`;
+                      return `message-pending-${item.id}-${createdAt}-${index}`;
                     }
-                    // For synced messages, use ID alone (should be unique from server)
-                    return `message-${item.id}`;
+                    // For synced messages, include index to ensure uniqueness even if duplicate IDs exist
+                    // This prevents React key warnings when deduplication hasn't run yet
+                    const createdAt = item.created_at ? `-${item.created_at}` : '';
+                    return `message-${item.id}${createdAt}-${index}`;
                   }
                   // For messages without IDs, use index and created_at if available
                   const fallbackKey = item?.created_at 
@@ -2872,9 +2902,34 @@ export default function GroupChatScreen() {
                 contentSizeRef.current = { width: contentSize.width, height: contentSize.height };
                 viewportSizeRef.current = { width: layoutMeasurement.width, height: layoutMeasurement.height };
                 
-                const isAtTop = contentOffset.y <= 50;
+                // Detect user scrolling to manage auto-scroll
+                const currentOffset = contentOffset.y;
+                const contentHeight = contentSize.height;
+                const viewportHeight = layoutMeasurement.height;
+                const previousOffset = lastScrollOffsetRef.current;
                 
-                // Debounce: only trigger once every 2 seconds
+                // Check if user is near bottom (within 100 pixels)
+                const distanceFromBottom = contentHeight - (currentOffset + viewportHeight);
+                const isNearBottom = distanceFromBottom < 100;
+                
+                // Detect if this is a user-initiated scroll (not programmatic)
+                // If offset changed significantly and we're not near bottom, user scrolled
+                if (previousOffset !== 0 && Math.abs(currentOffset - previousOffset) > 10) {
+                  if (!isNearBottom) {
+                    // User scrolled away from bottom
+                    userScrolledRef.current = true;
+                    shouldAutoScrollRef.current = false;
+                  } else {
+                    // User scrolled back to bottom
+                    userScrolledRef.current = false;
+                    shouldAutoScrollRef.current = true;
+                  }
+                }
+                
+                lastScrollOffsetRef.current = currentOffset;
+                
+                // Load more messages when at top (existing functionality)
+                const isAtTop = contentOffset.y <= 50;
                 const now = Date.now();
                 if (isAtTop && hasMoreMessages && !loadingMore && (now - lastScrollTrigger > 2000)) {
                   setLastScrollTrigger(now);
@@ -2910,8 +2965,8 @@ export default function GroupChatScreen() {
                 // Scroll to bottom when content size changes (e.g., images load)
                 // Only scroll if initial scroll has already happened (onLayout handles initial scroll)
                 // This prevents duplicate scrolls on initial load
-                // Also check hasScrolledToBottom to prevent scrolling during initial load period
-                if (!loading && messages.length > 0 && hasScrolledToBottom && hasAttemptedInitialScrollRef.current) {
+                // Also check isInitialLoadRef to prevent scrolling during initial load period
+                if (!loading && messages.length > 0 && !isInitialLoadRef.current && shouldAutoScrollRef.current && !userScrolledRef.current && hasAttemptedInitialScrollRef.current) {
                   // Clear any pending scroll
                   if (scrollTimeoutRef.current) {
                     clearTimeout(scrollTimeoutRef.current);
@@ -2919,14 +2974,14 @@ export default function GroupChatScreen() {
                   
                   // Wait for viewport size to be available, then scroll to absolute bottom
                   scrollTimeoutRef.current = setTimeout(() => {
-                    if (flatListRef.current && messages.length > 0 && !hasScrolledToBottom) {
+                    if (flatListRef.current && messages.length > 0 && shouldAutoScrollRef.current && !userScrolledRef.current) {
                       try {
                         // Use scrollToOffset for precise positioning if we have viewport size
                         if (viewportSizeRef.current && contentSizeRef.current) {
                           const targetOffset = Math.max(0, contentSizeRef.current.height - viewportSizeRef.current.height);
-                          (flatListRef.current as any).scrollToOffset({ 
-                            offset: targetOffset, 
-                            animated: false 
+                          (flatListRef.current as any).scrollToOffset({
+                            offset: targetOffset,
+                            animated: false
                           });
                         } else {
                           // Fallback to scrollToEnd
@@ -2947,7 +3002,7 @@ export default function GroupChatScreen() {
                 viewportSizeRef.current = { width, height };
                 
                 // Scroll to bottom when layout is ready (only on initial load, once)
-                if (!loading && messages.length > 0 && !hasScrolledToBottom && !hasAttemptedInitialScrollRef.current) {
+                if (!loading && messages.length > 0 && isInitialLoadRef.current && shouldAutoScrollRef.current && !hasAttemptedInitialScrollRef.current) {
                   // Set flag immediately to block onContentSizeChange from scrolling during initial load
                   hasAttemptedInitialScrollRef.current = true;
                   
@@ -2958,7 +3013,7 @@ export default function GroupChatScreen() {
                   
                   // Wait for content to be measured, then scroll to absolute bottom
                   scrollTimeoutRef.current = setTimeout(() => {
-                    if (flatListRef.current && messages.length > 0 && !hasScrolledToBottom) {
+                    if (flatListRef.current && messages.length > 0 && isInitialLoadRef.current) {
                       try {
                         // Use scrollToOffset for precise positioning if we have both sizes
                         if (viewportSizeRef.current && contentSizeRef.current) {
@@ -2984,6 +3039,7 @@ export default function GroupChatScreen() {
                           }
                         }
                         setHasScrolledToBottom(true);
+                        isInitialLoadRef.current = false;
                         // Note: hasAttemptedInitialScrollRef was set earlier to block competing scrolls
                       } catch (error) {
                         console.warn('Initial scroll failed:', error);
