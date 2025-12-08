@@ -97,3 +97,4 @@ async function migrateToVersion1(db: SQLite.SQLiteDatabase): Promise<void> {
   await db.execAsync(`PRAGMA user_version = ${DB_VERSION}`);
 }
 
+
