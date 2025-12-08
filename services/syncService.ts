@@ -5,13 +5,50 @@ import {
     updateSyncState
 } from './database';
 
+// Sync lock mechanism to prevent concurrent syncs
+let conversationsSyncLock = false;
+let conversationsSyncPromise: Promise<{ success: boolean; count: number; error?: string }> | null = null;
+let lastConversationsSyncTime = 0;
+const CONVERSATIONS_SYNC_DEBOUNCE_MS = 2000; // Wait 2 seconds between syncs
+
+// Message sync locks per conversation
+const messageSyncLocks = new Map<string, boolean>();
+const messageSyncPromises = new Map<string, Promise<any>>();
+const lastMessageSyncTimes = new Map<string, number>();
+const MESSAGE_SYNC_DEBOUNCE_MS = 1000; // Wait 1 second between message syncs for same conversation
+
 export async function syncConversationMessages(
   conversationId: number,
   conversationType: 'individual' | 'group',
   currentUserId: number
 ): Promise<{ success: boolean; newMessagesCount: number; error?: string }> {
-  try {
-    await updateSyncState(conversationId, conversationType, 'syncing');
+  const syncKey = `${conversationType}_${conversationId}`;
+  
+  // Check if sync is already running for this conversation
+  if (messageSyncLocks.get(syncKey) && messageSyncPromises.has(syncKey)) {
+    if (__DEV__) {
+      console.log(`[Sync] Message sync already in progress for ${syncKey}, waiting...`);
+    }
+    return messageSyncPromises.get(syncKey)!;
+  }
+
+  // Debounce: If sync was called recently for this conversation, wait a bit
+  const now = Date.now();
+  const lastSyncTime = lastMessageSyncTimes.get(syncKey) || 0;
+  const timeSinceLastSync = now - lastSyncTime;
+  if (timeSinceLastSync < MESSAGE_SYNC_DEBOUNCE_MS && lastSyncTime > 0) {
+    if (__DEV__) {
+      console.log(`[Sync] Debouncing message sync for ${syncKey} (${timeSinceLastSync}ms since last sync)`);
+    }
+    // Wait for the debounce period
+    await new Promise(resolve => setTimeout(resolve, MESSAGE_SYNC_DEBOUNCE_MS - timeSinceLastSync));
+  }
+
+  // Set lock and create promise
+  messageSyncLocks.set(syncKey, true);
+  const syncPromise = (async () => {
+    try {
+      await updateSyncState(conversationId, conversationType, 'syncing');
 
     let response;
     if (conversationType === 'individual') {
@@ -50,28 +87,60 @@ export async function syncConversationMessages(
       })) ?? [],
     }));
 
-    await saveMessages(messagesToSave);
-    await updateSyncState(conversationId, conversationType, 'synced');
+      await saveMessages(messagesToSave);
+      await updateSyncState(conversationId, conversationType, 'synced');
 
-    if (__DEV__) {
-      console.log(`[Sync] Synced ${messagesToSave.length} messages for ${conversationType} ${conversationId}`);
+      lastMessageSyncTimes.set(syncKey, Date.now());
+
+      if (__DEV__) {
+        console.log(`[Sync] Synced ${messagesToSave.length} messages for ${conversationType} ${conversationId}`);
+      }
+
+      return { success: true, newMessagesCount: messagesToSave.length };
+    } catch (error: any) {
+      const errorMessage = error.message || 'Unknown error';
+      console.error(`[Sync] Error syncing messages for ${conversationType} ${conversationId}:`, errorMessage);
+      
+      await updateSyncState(conversationId, conversationType, 'failed', errorMessage);
+      
+      return { success: false, newMessagesCount: 0, error: errorMessage };
+    } finally {
+      // Release lock
+      messageSyncLocks.set(syncKey, false);
+      messageSyncPromises.delete(syncKey);
     }
+  })();
 
-    return { success: true, newMessagesCount: messagesToSave.length };
-  } catch (error: any) {
-    const errorMessage = error.message || 'Unknown error';
-    console.error(`[Sync] Error syncing messages for ${conversationType} ${conversationId}:`, errorMessage);
-    
-    await updateSyncState(conversationId, conversationType, 'failed', errorMessage);
-    
-    return { success: false, newMessagesCount: 0, error: errorMessage };
-  }
+  messageSyncPromises.set(syncKey, syncPromise);
+  return syncPromise;
 }
 
 export async function syncConversations(): Promise<{ success: boolean; count: number; error?: string }> {
-  try {
-    const response = await conversationsAPI.getAll();
-    let conversationsData = response.data;
+  // Check if sync is already running
+  if (conversationsSyncLock && conversationsSyncPromise) {
+    if (__DEV__) {
+      console.log('[Sync] Conversations sync already in progress, waiting...');
+    }
+    return conversationsSyncPromise;
+  }
+
+  // Debounce: If sync was called recently, wait a bit
+  const now = Date.now();
+  const timeSinceLastSync = now - lastConversationsSyncTime;
+  if (timeSinceLastSync < CONVERSATIONS_SYNC_DEBOUNCE_MS && lastConversationsSyncTime > 0) {
+    if (__DEV__) {
+      console.log(`[Sync] Debouncing conversations sync (${timeSinceLastSync}ms since last sync)`);
+    }
+    // Wait for the debounce period
+    await new Promise(resolve => setTimeout(resolve, CONVERSATIONS_SYNC_DEBOUNCE_MS - timeSinceLastSync));
+  }
+
+  // Set lock and create promise
+  conversationsSyncLock = true;
+  conversationsSyncPromise = (async () => {
+    try {
+      const response = await conversationsAPI.getAll();
+      let conversationsData = response.data;
 
     if (typeof conversationsData === 'string') {
       try {
@@ -112,18 +181,27 @@ export async function syncConversations(): Promise<{ success: boolean; count: nu
       updated_at: conv.updated_at || conv.last_message_date || new Date().toISOString(),
     }));
 
-    await saveConversations(conversationsToSave);
+      await saveConversations(conversationsToSave);
 
-    if (__DEV__) {
-      console.log(`[Sync] Synced ${conversationsToSave.length} conversations`);
+      lastConversationsSyncTime = Date.now();
+
+      if (__DEV__) {
+        console.log(`[Sync] Synced ${conversationsToSave.length} conversations`);
+      }
+
+      return { success: true, count: conversationsToSave.length };
+    } catch (error: any) {
+      const errorMessage = error.message || 'Unknown error';
+      console.error('[Sync] Error syncing conversations:', errorMessage);
+      return { success: false, count: 0, error: errorMessage };
+    } finally {
+      // Release lock
+      conversationsSyncLock = false;
+      conversationsSyncPromise = null;
     }
+  })();
 
-    return { success: true, count: conversationsToSave.length };
-  } catch (error: any) {
-    const errorMessage = error.message || 'Unknown error';
-    console.error('[Sync] Error syncing conversations:', errorMessage);
-    return { success: false, count: 0, error: errorMessage };
-  }
+  return conversationsSyncPromise;
 }
 
 export async function syncOlderMessages(

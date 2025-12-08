@@ -4,6 +4,114 @@ import * as SQLite from 'expo-sqlite';
 
 let db: SQLite.SQLiteDatabase | null = null;
 
+// Database operation queue to serialize write operations and prevent locks
+type QueueOperation<T> = () => Promise<T>;
+interface QueueItem<T> {
+  operation: QueueOperation<T>;
+  resolve: (value: T) => void;
+  reject: (error: any) => void;
+}
+
+class DatabaseWriteQueue {
+  private queue: QueueItem<any>[] = [];
+  private processing = false;
+
+  async enqueue<T>(operation: QueueOperation<T>): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      this.queue.push({ operation, resolve, reject });
+      this.process();
+    });
+  }
+
+  private async process(): Promise<void> {
+    if (this.processing || this.queue.length === 0) {
+      return;
+    }
+
+    this.processing = true;
+
+    while (this.queue.length > 0) {
+      const item = this.queue.shift();
+      if (!item) break;
+
+      try {
+        const result = await item.operation();
+        item.resolve(result);
+      } catch (error) {
+        item.reject(error);
+      }
+    }
+
+    this.processing = false;
+  }
+
+  getQueueLength(): number {
+    return this.queue.length;
+  }
+
+  isProcessing(): boolean {
+    return this.processing;
+  }
+}
+
+// Global write queue instance
+const writeQueue = new DatabaseWriteQueue();
+
+// Helper function to check if error is a database locked error
+function isDatabaseLockedError(error: any): boolean {
+  if (!error) return false;
+  const errorMessage = error?.message || String(error) || '';
+  const errorCode = error?.code || '';
+  
+  return (
+    errorMessage.toLowerCase().includes('database is locked') ||
+    errorMessage.toLowerCase().includes('database locked') ||
+    errorMessage.toLowerCase().includes('locked') ||
+    errorCode === 'SQLITE_BUSY' ||
+    errorCode === 'SQLITE_LOCKED' ||
+    errorCode === 5 || // SQLITE_BUSY
+    errorCode === 6    // SQLITE_LOCKED
+  );
+}
+
+// Retry helper with exponential backoff
+async function retryWithBackoff<T>(
+  operation: () => Promise<T>,
+  maxRetries: number = 5,
+  initialDelay: number = 50
+): Promise<T> {
+  let lastError: any;
+  
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      return await operation();
+    } catch (error) {
+      lastError = error;
+      
+      // Only retry if it's a database locked error
+      if (!isDatabaseLockedError(error)) {
+        throw error;
+      }
+      
+      // If it's the last attempt, throw the error
+      if (attempt === maxRetries - 1) {
+        break;
+      }
+      
+      // Calculate delay with exponential backoff (max 500ms)
+      const delay = Math.min(initialDelay * Math.pow(2, attempt), 500);
+      
+      if (__DEV__) {
+        console.warn(`[Database] Database locked, retrying in ${delay}ms (attempt ${attempt + 1}/${maxRetries})`);
+      }
+      
+      await new Promise(resolve => setTimeout(resolve, delay));
+    }
+  }
+  
+  throw lastError;
+}
+
 export async function initDatabase(): Promise<SQLite.SQLiteDatabase | null> {
   if (db) {
     return db;
@@ -147,7 +255,7 @@ export async function saveMessages(
       return;
     }
     
-    // Helper function to save a single message
+    // Helper function to save a single message with retry logic
     const saveSingleMessage = async (msg: typeof messages[0]) => {
       // Skip invalid messages
       if (!msg.conversation_id || !msg.sender_id || !msg.created_at) {
@@ -157,30 +265,33 @@ export async function saveMessages(
         return;
       }
 
-      let existingMessage: DatabaseMessage | null = null;
-      
-      try {
-        if (msg.server_id) {
-          existingMessage = await database.getFirstAsync<DatabaseMessage>(
-            `SELECT * FROM messages WHERE server_id = ?`,
-            [msg.server_id]
-          );
-        } else if (msg.id) {
-          existingMessage = await database.getFirstAsync<DatabaseMessage>(
-            `SELECT * FROM messages WHERE id = ?`,
-            [msg.id]
-          );
+      return await retryWithBackoff(async () => {
+        let existingMessage: DatabaseMessage | null = null;
+        
+        try {
+          if (msg.server_id) {
+            existingMessage = await database.getFirstAsync<DatabaseMessage>(
+              `SELECT * FROM messages WHERE server_id = ?`,
+              [msg.server_id]
+            );
+          } else if (msg.id) {
+            existingMessage = await database.getFirstAsync<DatabaseMessage>(
+              `SELECT * FROM messages WHERE id = ?`,
+              [msg.id]
+            );
+          }
+        } catch (queryError) {
+          // If query fails due to lock, retry will handle it
+          if (!isDatabaseLockedError(queryError)) {
+            if (__DEV__) {
+              console.warn('[Database] Error querying existing message:', queryError);
+            }
+          }
+          existingMessage = null;
         }
-      } catch (queryError) {
-        if (__DEV__) {
-          console.warn('[Database] Error querying existing message:', queryError);
-        }
-        existingMessage = null;
-      }
 
-      let messageId: number;
+        let messageId: number;
 
-      try {
         if (existingMessage) {
           await database.runAsync(
             `UPDATE messages SET
@@ -191,10 +302,10 @@ export async function saveMessages(
               updated_at = datetime('now')
             WHERE id = ?`,
             [
-              msg.message ?? existingMessage.message,
-              msg.read_at ?? existingMessage.read_at,
-              msg.edited_at ?? existingMessage.edited_at,
-              msg.sync_status ?? existingMessage.sync_status,
+              (msg.message ?? existingMessage.message) || null,
+              (msg.read_at ?? existingMessage.read_at) || null,
+              (msg.edited_at ?? existingMessage.edited_at) || null,
+              (msg.sync_status ?? existingMessage.sync_status) || 'synced',
               existingMessage.id,
             ]
           );
@@ -222,71 +333,72 @@ export async function saveMessages(
           );
           messageId = result.lastInsertRowId;
         }
-      } catch (insertError) {
-        if (__DEV__) {
-          console.error('[Database] Error inserting/updating message:', insertError);
-        }
-        throw insertError;
-      }
 
-      // Handle attachments
-      if (msg.attachments && msg.attachments.length > 0 && messageId) {
-        for (const attachment of msg.attachments) {
-          try {
-            // Skip invalid attachments
-            if (!attachment.name || !attachment.mime || !attachment.url) {
-              if (__DEV__) {
-                console.warn('[Database] Skipping invalid attachment:', attachment);
+        // Handle attachments
+        if (msg.attachments && msg.attachments.length > 0 && messageId) {
+          for (const attachment of msg.attachments) {
+            try {
+              // Skip invalid attachments
+              if (!attachment.name || !attachment.mime || !attachment.url) {
+                if (__DEV__) {
+                  console.warn('[Database] Skipping invalid attachment:', attachment);
+                }
+                continue;
               }
-              continue;
-            }
 
-            const existingAttachment = await database.getFirstAsync<DatabaseAttachment>(
-              `SELECT * FROM attachments WHERE server_id = ? OR (message_id = ? AND url = ?)`,
-              [attachment.server_id ?? -1, messageId, attachment.url]
-            );
-
-            if (!existingAttachment) {
-              await database.runAsync(
-                `INSERT INTO attachments (
-                  server_id, message_id, name, mime, url, local_path, size, type, sync_status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                [
-                  attachment.server_id ?? null,
-                  messageId,
-                  attachment.name,
-                  attachment.mime,
-                  attachment.url,
-                  attachment.local_path ?? null,
-                  attachment.size ?? null,
-                  attachment.type ?? null,
-                  'synced',
-                ]
+              const existingAttachment = await database.getFirstAsync<DatabaseAttachment>(
+                `SELECT * FROM attachments WHERE server_id = ? OR (message_id = ? AND url = ?)`,
+                [attachment.server_id ?? -1, messageId, attachment.url]
               );
+
+              if (!existingAttachment) {
+                await database.runAsync(
+                  `INSERT INTO attachments (
+                    server_id, message_id, name, mime, url, local_path, size, type, sync_status
+                  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                  [
+                    attachment.server_id ?? null,
+                    messageId,
+                    attachment.name,
+                    attachment.mime,
+                    attachment.url,
+                    attachment.local_path ?? null,
+                    attachment.size ?? null,
+                    attachment.type ?? null,
+                    'synced',
+                  ]
+                );
+              }
+            } catch (attachmentError) {
+              // Only log non-locked errors, locked errors will be retried
+              if (!isDatabaseLockedError(attachmentError)) {
+                if (__DEV__) {
+                  console.warn('[Database] Error saving attachment:', attachmentError);
+                }
+              } else {
+                throw attachmentError; // Retry the whole message save
+              }
             }
-          } catch (attachmentError) {
-            if (__DEV__) {
-              console.warn('[Database] Error saving attachment:', attachmentError);
-            }
-            // Continue to next attachment
           }
         }
-      }
+      });
     };
 
-    // Try using transaction first
+    // Try using transaction first with retry
     try {
-      await database.withTransactionAsync(async () => {
-        for (const msg of messages) {
-          await saveSingleMessage(msg);
-        }
+      await retryWithBackoff(async () => {
+        await database.withTransactionAsync(async () => {
+          for (const msg of messages) {
+            await saveSingleMessage(msg);
+          }
+        });
       });
       
       if (__DEV__) {
         console.log(`[Database] Saved ${messages.length} messages (transaction)`);
       }
     } catch (transactionError) {
-      // If transaction fails, fallback to saving individually
+      // If transaction fails, fallback to saving individually with retry
       if (__DEV__) {
         console.warn('[Database] Transaction failed, falling back to individual saves:', transactionError);
       }
@@ -297,8 +409,11 @@ export async function saveMessages(
           await saveSingleMessage(msg);
           successCount++;
         } catch (individualError) {
-          if (__DEV__) {
-            console.warn('[Database] Failed to save individual message:', individualError);
+          // Only log if it's not a locked error (locked errors are already logged in retry)
+          if (!isDatabaseLockedError(individualError)) {
+            if (__DEV__) {
+              console.warn('[Database] Failed to save individual message:', individualError);
+            }
           }
         }
       }
@@ -320,12 +435,20 @@ export async function markMessageAsRead(messageId: number): Promise<void> {
   try {
     const database = await getDb();
     if (!database) return;
-    await database.runAsync(
-      `UPDATE messages SET read_at = datetime('now'), updated_at = datetime('now') WHERE id = ?`,
-      [messageId]
-    );
+    
+    // Enqueue write operation to prevent concurrent writes
+    await writeQueue.enqueue(async () => {
+      await retryWithBackoff(async () => {
+        await database.runAsync(
+          `UPDATE messages SET read_at = datetime('now'), updated_at = datetime('now') WHERE id = ?`,
+          [messageId]
+        );
+      });
+    });
   } catch (error) {
-    console.error('[Database] Error marking message as read:', error);
+    if (!isDatabaseLockedError(error)) {
+      console.error('[Database] Error marking message as read:', error);
+    }
   }
 }
 
@@ -431,67 +554,166 @@ export async function saveConversations(
       return;
     }
     
-    await database.withTransactionAsync(async () => {
-      for (const conv of conversations) {
-        const existing = await database.getFirstAsync<DatabaseConversation>(
-          `SELECT * FROM conversations 
-           WHERE conversation_id = ? AND conversation_type = ?`,
-          [conv.conversation_id, conv.conversation_type]
-        );
+    // Enqueue write operation to prevent concurrent writes
+    await writeQueue.enqueue(async () => {
+      // Wrap transaction in try-catch to handle rollback errors with retry
+      try {
+        await retryWithBackoff(async () => {
+          await database.withTransactionAsync(async () => {
+            for (const conv of conversations) {
+              try {
+                const existing = await database.getFirstAsync<DatabaseConversation>(
+                  `SELECT * FROM conversations 
+                   WHERE conversation_id = ? AND conversation_type = ?`,
+                  [conv.conversation_id, conv.conversation_type]
+                );
 
-        if (existing) {
-          await database.runAsync(
-            `UPDATE conversations SET
-              name = ?,
-              email = ?,
-              avatar_url = ?,
-              last_message = ?,
-              last_message_date = ?,
-              last_message_sender_id = ?,
-              last_message_read_at = ?,
-              unread_count = ?,
-              updated_at = ?,
-              sync_status = 'synced'
-            WHERE id = ?`,
-            [
-              conv.name,
-              conv.email ?? null,
-              conv.avatar_url ?? null,
-              conv.last_message ?? null,
-              conv.last_message_date ?? null,
-              conv.last_message_sender_id ?? null,
-              conv.last_message_read_at ?? null,
-              conv.unread_count ?? 0,
-              conv.updated_at ?? new Date().toISOString(),
-              existing.id,
-            ]
-          );
-        } else {
-          await database.runAsync(
-            `INSERT INTO conversations (
-              conversation_id, conversation_type, user_id, group_id, name, email, avatar_url,
-              last_message, last_message_date, last_message_sender_id, last_message_read_at,
-              unread_count, created_at, updated_at, sync_status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            [
-              conv.conversation_id,
-              conv.conversation_type,
-              conv.user_id ?? null,
-              conv.group_id ?? null,
-              conv.name,
-              conv.email ?? null,
-              conv.avatar_url ?? null,
-              conv.last_message ?? null,
-              conv.last_message_date ?? null,
-              conv.last_message_sender_id ?? null,
-              conv.last_message_read_at ?? null,
-              conv.unread_count ?? 0,
-              conv.created_at ?? new Date().toISOString(),
-              conv.updated_at ?? new Date().toISOString(),
-              'synced',
-            ]
-          );
+                if (existing) {
+                  await database.runAsync(
+                    `UPDATE conversations SET
+                      name = ?,
+                      email = ?,
+                      avatar_url = ?,
+                      last_message = ?,
+                      last_message_date = ?,
+                      last_message_sender_id = ?,
+                      last_message_read_at = ?,
+                      unread_count = ?,
+                      updated_at = ?,
+                      sync_status = 'synced'
+                    WHERE id = ?`,
+                    [
+                      conv.name,
+                      conv.email ?? null,
+                      conv.avatar_url ?? null,
+                      conv.last_message ?? null,
+                      conv.last_message_date ?? null,
+                      conv.last_message_sender_id ?? null,
+                      conv.last_message_read_at ?? null,
+                      conv.unread_count ?? 0,
+                      conv.updated_at ?? new Date().toISOString(),
+                      existing.id,
+                    ]
+                  );
+                } else {
+                  await database.runAsync(
+                    `INSERT INTO conversations (
+                      conversation_id, conversation_type, user_id, group_id, name, email, avatar_url,
+                      last_message, last_message_date, last_message_sender_id, last_message_read_at,
+                      unread_count, created_at, updated_at, sync_status
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                    [
+                      conv.conversation_id,
+                      conv.conversation_type,
+                      conv.user_id ?? null,
+                      conv.group_id ?? null,
+                      conv.name,
+                      conv.email ?? null,
+                      conv.avatar_url ?? null,
+                      conv.last_message ?? null,
+                      conv.last_message_date ?? null,
+                      conv.last_message_sender_id ?? null,
+                      conv.last_message_read_at ?? null,
+                      conv.unread_count ?? 0,
+                      conv.created_at ?? new Date().toISOString(),
+                      conv.updated_at ?? new Date().toISOString(),
+                      'synced',
+                    ]
+                  );
+                }
+              } catch (convError) {
+                // Log error for individual conversation but continue with others
+                if (!isDatabaseLockedError(convError)) {
+                  console.error(`[Database] Error saving conversation ${conv.conversation_id}:`, convError);
+                }
+                // Don't throw - let other conversations save
+              }
+            }
+          });
+        });
+      } catch (transactionError: any) {
+        // Handle transaction errors, including rollback issues
+        if (transactionError?.message?.includes('rollback') || 
+            transactionError?.message?.includes('transaction') ||
+            isDatabaseLockedError(transactionError)) {
+          if (__DEV__) {
+            console.warn('[Database] Transaction error, falling back to individual saves:', transactionError);
+          }
+          
+          // Fallback: Save conversations individually with retry
+          for (const conv of conversations) {
+          try {
+            await retryWithBackoff(async () => {
+              const existing = await database.getFirstAsync<DatabaseConversation>(
+                `SELECT * FROM conversations 
+                 WHERE conversation_id = ? AND conversation_type = ?`,
+                [conv.conversation_id, conv.conversation_type]
+              );
+
+              if (existing) {
+                await database.runAsync(
+                  `UPDATE conversations SET
+                    name = ?,
+                    email = ?,
+                    avatar_url = ?,
+                    last_message = ?,
+                    last_message_date = ?,
+                    last_message_sender_id = ?,
+                    last_message_read_at = ?,
+                    unread_count = ?,
+                    updated_at = ?,
+                    sync_status = 'synced'
+                  WHERE id = ?`,
+                  [
+                    conv.name,
+                    conv.email ?? null,
+                    conv.avatar_url ?? null,
+                    conv.last_message ?? null,
+                    conv.last_message_date ?? null,
+                    conv.last_message_sender_id ?? null,
+                    conv.last_message_read_at ?? null,
+                    conv.unread_count ?? 0,
+                    conv.updated_at ?? new Date().toISOString(),
+                    existing.id,
+                  ]
+                );
+              } else {
+                await database.runAsync(
+                  `INSERT INTO conversations (
+                    conversation_id, conversation_type, user_id, group_id, name, email, avatar_url,
+                    last_message, last_message_date, last_message_sender_id, last_message_read_at,
+                    unread_count, created_at, updated_at, sync_status
+                  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                  [
+                    conv.conversation_id,
+                    conv.conversation_type,
+                    conv.user_id ?? null,
+                    conv.group_id ?? null,
+                    conv.name,
+                    conv.email ?? null,
+                    conv.avatar_url ?? null,
+                    conv.last_message ?? null,
+                    conv.last_message_date ?? null,
+                    conv.last_message_sender_id ?? null,
+                    conv.last_message_read_at ?? null,
+                    conv.unread_count ?? 0,
+                    conv.created_at ?? new Date().toISOString(),
+                    conv.updated_at ?? new Date().toISOString(),
+                    'synced',
+                  ]
+                );
+              }
+            });
+          } catch (individualError) {
+            if (!isDatabaseLockedError(individualError)) {
+              console.error(`[Database] Error saving individual conversation ${conv.conversation_id}:`, individualError);
+            }
+          }
         }
+      } else {
+        // Re-throw if it's not a transaction/rollback/locked error
+        throw transactionError;
+      }
       }
     });
 
@@ -532,31 +754,35 @@ export async function updateSyncState(
     const database = await getDb();
     if (!database) return;
     
-    const existing = await database.getFirstAsync<SyncState>(
-      `SELECT * FROM sync_state 
-       WHERE conversation_id = ? AND conversation_type = ?`,
-      [conversationId, conversationType]
-    );
+    await retryWithBackoff(async () => {
+      const existing = await database.getFirstAsync<SyncState>(
+        `SELECT * FROM sync_state 
+         WHERE conversation_id = ? AND conversation_type = ?`,
+        [conversationId, conversationType]
+      );
 
-    if (existing) {
-      await database.runAsync(
-        `UPDATE sync_state SET
-          last_sync_timestamp = datetime('now'),
-          sync_status = ?,
-          last_error = ?
-        WHERE conversation_id = ? AND conversation_type = ?`,
-        [syncStatus, lastError ?? null, conversationId, conversationType]
-      );
-    } else {
-      await database.runAsync(
-        `INSERT INTO sync_state (
-          conversation_id, conversation_type, last_sync_timestamp, sync_status, last_error
-        ) VALUES (?, ?, datetime('now'), ?, ?)`,
-        [conversationId, conversationType, syncStatus, lastError ?? null]
-      );
-    }
+      if (existing) {
+        await database.runAsync(
+          `UPDATE sync_state SET
+            last_sync_timestamp = datetime('now'),
+            sync_status = ?,
+            last_error = ?
+          WHERE conversation_id = ? AND conversation_type = ?`,
+          [syncStatus, lastError ?? null, conversationId, conversationType]
+        );
+      } else {
+        await database.runAsync(
+          `INSERT INTO sync_state (
+            conversation_id, conversation_type, last_sync_timestamp, sync_status, last_error
+          ) VALUES (?, ?, datetime('now'), ?, ?)`,
+          [conversationId, conversationType, syncStatus, lastError ?? null]
+        );
+      }
+    });
   } catch (error) {
-    console.error('[Database] Error updating sync state:', error);
+    if (!isDatabaseLockedError(error)) {
+      console.error('[Database] Error updating sync state:', error);
+    }
   }
 }
 
@@ -588,20 +814,24 @@ export async function updateMessageStatus(
     const database = await getDb();
     if (!database) return;
     
-    await database.runAsync(
-      `UPDATE messages SET
-        server_id = ?,
-        sync_status = ?,
-        updated_at = datetime('now')
-      WHERE id = ?`,
-      [serverId ?? null, syncStatus, localMessageId]
-    );
+    await retryWithBackoff(async () => {
+      await database.runAsync(
+        `UPDATE messages SET
+          server_id = ?,
+          sync_status = ?,
+          updated_at = datetime('now')
+        WHERE id = ?`,
+        [serverId ?? null, syncStatus, localMessageId]
+      );
+    });
     
     if (__DEV__) {
       console.log(`[Database] Updated message ${localMessageId} status to ${syncStatus}${serverId ? ` with server_id ${serverId}` : ''}`);
     }
   } catch (error) {
-    console.error('[Database] Error updating message status:', error);
+    if (!isDatabaseLockedError(error)) {
+      console.error('[Database] Error updating message status:', error);
+    }
   }
 }
 
@@ -618,41 +848,108 @@ export async function updateMessageByServerId(
     const database = await getDb();
     if (!database) return;
     
-    const updateFields: string[] = [];
-    const updateValues: any[] = [];
-    
-    if (updates.sync_status !== undefined) {
-      updateFields.push('sync_status = ?');
-      updateValues.push(updates.sync_status);
-    }
-    if (updates.read_at !== undefined) {
-      updateFields.push('read_at = ?');
-      updateValues.push(updates.read_at);
-    }
-    if (updates.edited_at !== undefined) {
-      updateFields.push('edited_at = ?');
-      updateValues.push(updates.edited_at);
-    }
-    if (updates.message !== undefined) {
-      updateFields.push('message = ?');
-      updateValues.push(updates.message);
-    }
-    
-    if (updateFields.length === 0) return;
-    
-    updateFields.push('updated_at = datetime(\'now\')');
-    updateValues.push(serverId);
-    
-    await database.runAsync(
-      `UPDATE messages SET ${updateFields.join(', ')} WHERE server_id = ?`,
-      updateValues
-    );
+    // Enqueue write operation to prevent concurrent writes
+    await writeQueue.enqueue(async () => {
+      const updateFields: string[] = [];
+      const updateValues: any[] = [];
+      
+      if (updates.sync_status !== undefined) {
+        updateFields.push('sync_status = ?');
+        updateValues.push(updates.sync_status);
+      }
+      if (updates.read_at !== undefined) {
+        updateFields.push('read_at = ?');
+        updateValues.push(updates.read_at);
+      }
+      if (updates.edited_at !== undefined) {
+        updateFields.push('edited_at = ?');
+        updateValues.push(updates.edited_at);
+      }
+      if (updates.message !== undefined) {
+        updateFields.push('message = ?');
+        updateValues.push(updates.message);
+      }
+      
+      if (updateFields.length === 0) return;
+      
+      updateFields.push('updated_at = datetime(\'now\')');
+      updateValues.push(serverId);
+      
+      await retryWithBackoff(async () => {
+        await database.runAsync(
+          `UPDATE messages SET ${updateFields.join(', ')} WHERE server_id = ?`,
+          updateValues
+        );
+      });
+    });
     
     if (__DEV__) {
       console.log(`[Database] Updated message with server_id ${serverId}`);
     }
   } catch (error) {
     console.error('[Database] Error updating message by server_id:', error);
+  }
+}
+
+export async function deleteMessage(
+  serverId?: number,
+  localId?: number
+): Promise<void> {
+  try {
+    const database = await getDb();
+    if (!database) return;
+    
+    if (!serverId && !localId) {
+      if (__DEV__) {
+        console.warn('[Database] Cannot delete message: no server_id or local id provided');
+      }
+      return;
+    }
+    
+    // Enqueue write operation to prevent concurrent writes
+    await writeQueue.enqueue(async () => {
+      let messageId: number | null = null;
+      
+      // First, find the message to get its local ID
+      if (serverId) {
+        const message = await database.getFirstAsync<DatabaseMessage>(
+          `SELECT id FROM messages WHERE server_id = ?`,
+          [serverId]
+        );
+        if (message) {
+          messageId = message.id;
+        }
+      } else if (localId) {
+        messageId = localId;
+      }
+      
+      if (!messageId) {
+        if (__DEV__) {
+          console.warn(`[Database] Message not found for deletion: server_id=${serverId}, local_id=${localId}`);
+        }
+        return;
+      }
+      
+      await retryWithBackoff(async () => {
+        // Delete attachments first (foreign key constraint)
+        await database.runAsync(
+          `DELETE FROM attachments WHERE message_id = ?`,
+          [messageId!]
+        );
+        
+        // Delete the message
+        await database.runAsync(
+          `DELETE FROM messages WHERE id = ?`,
+          [messageId!]
+        );
+      });
+    });
+    
+    if (__DEV__) {
+      console.log(`[Database] Deleted message: server_id=${serverId}, local_id=${localId}`);
+    }
+  } catch (error) {
+    console.error('[Database] Error deleting message:', error);
   }
 }
 
