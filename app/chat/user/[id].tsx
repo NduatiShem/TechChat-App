@@ -351,13 +351,17 @@ export default function UserChatScreen() {
   const isInitialLoadRef = useRef<boolean>(true); // Track if this is the initial load
   const lastScrollOffsetRef = useRef<number>(0); // Track last scroll offset to detect user scrolling
   const shouldAutoScrollRef = useRef<boolean>(true); // Flag to determine if auto-scroll should happen
+  const scrollTimeoutRef = useRef<NodeJS.Timeout | null>(null); // Debounced scroll timeout to prevent multiple rapid scrolls
+  const contentSizeRef = useRef<{ width: number; height: number } | null>(null); // Track content size
+  const viewportSizeRef = useRef<{ width: number; height: number } | null>(null); // Track viewport size
+  const hasAttemptedInitialScrollRef = useRef<boolean>(false); // Track if we've attempted initial scroll
+  const hasFetchedForConversationRef = useRef<string | null>(null); // Track which conversation we've fetched for
   
   // Pagination state
   const [currentPage, setCurrentPage] = useState(1);
   const [hasMoreMessages, setHasMoreMessages] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [lastScrollTrigger, setLastScrollTrigger] = useState(0);
-  const [initialScrollIndex, setInitialScrollIndex] = useState<number | undefined>(undefined);
   const [dbInitialized, setDbInitialized] = useState(false);
   const [loadedMessagesCount, setLoadedMessagesCount] = useState(0);
   const MESSAGES_PER_PAGE = 50; // Load 50 messages at a time
@@ -715,15 +719,11 @@ export default function UserChatScreen() {
         }
       }
       
-      // Set initialScrollIndex to last message for automatic scroll on mount
-      // Get current messages state for this
+      // Set latest message ID for tracking
       setMessages(current => {
         if (current.length > 0) {
-          setInitialScrollIndex(current.length - 1);
           const latestMsg = current[current.length - 1];
           latestMessageIdRef.current = latestMsg.id;
-        } else {
-          setInitialScrollIndex(undefined);
         }
         return current; // Don't modify state, just use it for side effects
       });
@@ -979,8 +979,8 @@ export default function UserChatScreen() {
           
             // Auto-scroll to bottom when receiving new messages
             // Only scroll if user is near bottom (hasn't manually scrolled up)
-            // Use shouldAutoScrollRef to check if user is at bottom
-            if (shouldAutoScrollRef.current && !userScrolledRef.current) {
+            // Prevent during initial load - onLayout handles initial scroll
+            if (shouldAutoScrollRef.current && !userScrolledRef.current && hasAttemptedInitialScrollRef.current) {
               // Small delay to let state update complete
               requestAnimationFrame(() => {
                 setTimeout(() => {
@@ -1063,7 +1063,7 @@ export default function UserChatScreen() {
       retryTimeoutRef.current = null;
     }
     
-    fetchMessages(true);
+    // Note: fetchMessages is handled by useFocusEffect to prevent duplicate fetches
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]); // Only depend on id, fetchMessages is stable
   
@@ -1081,8 +1081,13 @@ export default function UserChatScreen() {
     };
   }, []);
 
-  // Simple scroll to bottom function using scrollToIndex
+  // Improved scroll to bottom function that uses content size to scroll to absolute bottom
   const scrollToBottom = useCallback((animated = false, delay = 0, force = false) => {
+    // Prevent scroll during initial load unless forced (onLayout handles initial scroll)
+    if (!force && !hasAttemptedInitialScrollRef.current) {
+      return;
+    }
+    
     // Check if we should auto-scroll (unless forced)
     if (!force && !shouldAutoScrollRef.current) {
       return;
@@ -1092,51 +1097,47 @@ export default function UserChatScreen() {
       return;
     }
     
+    // Clear any pending scroll to prevent multiple rapid scrolls
+    if (scrollTimeoutRef.current) {
+      clearTimeout(scrollTimeoutRef.current);
+      scrollTimeoutRef.current = null;
+    }
+    
     const performScroll = () => {
       if (!flatListRef.current || messages.length === 0) {
         return;
       }
       
       try {
-        // Use requestAnimationFrame to ensure render cycle is complete
-        requestAnimationFrame(() => {
-          if (!flatListRef.current || messages.length === 0) return;
+        // If we have content size and viewport size, use scrollToOffset for precise positioning
+        if (contentSizeRef.current && viewportSizeRef.current) {
+          const contentHeight = contentSizeRef.current.height;
+          const viewportHeight = viewportSizeRef.current.height;
+          const targetOffset = Math.max(0, contentHeight - viewportHeight);
           
-          try {
-            const lastIndex = messages.length - 1;
-            if (lastIndex >= 0) {
-              (flatListRef.current as any).scrollToIndex({ 
-                index: lastIndex, 
-                animated,
-                viewPosition: 1 // 1 = bottom (0 = top, 1 = bottom)
-              });
-              setHasScrolledToBottom(true);
-              if (!force) {
-                shouldAutoScrollRef.current = false; // Reset after successful scroll
-              }
-            }
-          } catch (error) {
-            // Fallback: try scrollToEnd if scrollToIndex fails
-            try {
-              (flatListRef.current as any).scrollToEnd({ animated });
-              setHasScrolledToBottom(true);
-              if (!force) {
-                shouldAutoScrollRef.current = false;
-              }
-            } catch (scrollError) {
-              console.warn('Scroll failed:', scrollError);
-            }
-          }
-        });
+          (flatListRef.current as any).scrollToOffset({ 
+            offset: targetOffset, 
+            animated 
+          });
+          setHasScrolledToBottom(true);
+        } else {
+          // Fallback to scrollToEnd if sizes aren't available yet
+          (flatListRef.current as any).scrollToEnd({ animated });
+          setHasScrolledToBottom(true);
+        }
+        
+        if (!force) {
+          shouldAutoScrollRef.current = false; // Reset after successful scroll
+        }
       } catch (error) {
-        console.warn('Scroll setup failed:', error);
+        console.warn('Scroll failed:', error);
       }
     };
     
     if (delay > 0) {
-      setTimeout(performScroll, delay);
+      scrollTimeoutRef.current = setTimeout(performScroll, delay);
     } else {
-      performScroll();
+      requestAnimationFrame(performScroll);
     }
   }, [messages.length]);
 
@@ -1150,6 +1151,9 @@ export default function UserChatScreen() {
       userScrolledRef.current = false;
       shouldAutoScrollRef.current = true;
       lastScrollOffsetRef.current = 0;
+      hasAttemptedInitialScrollRef.current = false;
+      contentSizeRef.current = null;
+      viewportSizeRef.current = null;
     }
   }, [id]);
 
@@ -1255,12 +1259,9 @@ export default function UserChatScreen() {
       
       fetchMessages(!hasExistingMessages);
       
-      // Scroll to bottom after a delay to ensure messages are loaded
       // Enable auto-scroll when conversation is focused
+      // Scroll will be handled by onContentSizeChange and onLayout
       shouldAutoScrollRef.current = true;
-      setTimeout(() => {
-        scrollToBottom(false, 0, false);
-      }, 500);
 
       const markMessagesAsRead = async () => {
         if (!ENABLE_MARK_AS_READ || !id || !user) return;
@@ -2904,7 +2905,6 @@ export default function UserChatScreen() {
               data={messages}
               renderItem={renderItem}
               extraData={messages.length} // Force re-render when messages array changes
-              initialScrollIndex={initialScrollIndex}
               initialNumToRender={30} // Render 30 items initially for better performance
               windowSize={10} // Keep 10 screens worth of items in memory (optimized)
               maxToRenderPerBatch={15} // Render 15 items per batch
@@ -2939,10 +2939,14 @@ export default function UserChatScreen() {
               keyboardDismissMode={Platform.OS === 'ios' ? 'interactive' : 'on-drag'}
               onScrollToIndexFailed={(info) => {
                 // Handle scrollToIndex failures (e.g., item not rendered yet)
-                // Fallback to scrollToEnd
+                // Prevent during initial load - onLayout handles initial scroll
+                if (!hasAttemptedInitialScrollRef.current) {
+                  return;
+                }
+                // Fallback to scrollToEnd only after initial scroll is done
                 const wait = new Promise(resolve => setTimeout(resolve, 500));
                 wait.then(() => {
-                  if (flatListRef.current && messages.length > 0) {
+                  if (flatListRef.current && messages.length > 0 && hasAttemptedInitialScrollRef.current) {
                     try {
                       (flatListRef.current as any).scrollToEnd({ animated: false });
                       setHasScrolledToBottom(true);
@@ -2954,6 +2958,10 @@ export default function UserChatScreen() {
               }}
               onScroll={({ nativeEvent }) => {
                 const { contentOffset, contentSize, layoutMeasurement } = nativeEvent;
+                
+                // Track content and viewport sizes for precise scrolling
+                contentSizeRef.current = { width: contentSize.width, height: contentSize.height };
+                viewportSizeRef.current = { width: layoutMeasurement.width, height: layoutMeasurement.height };
                 
                 // Detect user-initiated scrolling
                 const currentOffset = contentOffset.y;
@@ -3011,67 +3019,94 @@ export default function UserChatScreen() {
                   </View>
                 ) : null
               }
-              onContentSizeChange={() => {
+              onContentSizeChange={(contentWidth, contentHeight) => {
+                // Track content size for precise scrolling
+                contentSizeRef.current = { width: contentWidth, height: contentHeight };
+                
                 // Scroll to bottom when content size changes (e.g., images load, new messages)
-                // Only scroll if user is at bottom or it's initial load
-                if (!loading && messages.length > 0 && shouldAutoScrollRef.current && !userScrolledRef.current) {
-                  // Use scrollToEnd which is more reliable - wait a bit for content to be fully rendered
-                  setTimeout(() => {
-                    if (flatListRef.current && messages.length > 0 && shouldAutoScrollRef.current) {
+                // Only scroll if initial scroll has already happened (onLayout handles initial scroll)
+                // This prevents duplicate scrolls on initial load
+                // Also check isInitialLoadRef to prevent scrolling during initial load period
+                if (!loading && messages.length > 0 && !isInitialLoadRef.current && shouldAutoScrollRef.current && !userScrolledRef.current && hasAttemptedInitialScrollRef.current) {
+                  // Clear any pending scroll
+                  if (scrollTimeoutRef.current) {
+                    clearTimeout(scrollTimeoutRef.current);
+                  }
+                  
+                  // Wait for viewport size to be available, then scroll to absolute bottom
+                  scrollTimeoutRef.current = setTimeout(() => {
+                    if (flatListRef.current && messages.length > 0 && shouldAutoScrollRef.current && !userScrolledRef.current) {
                       try {
-                        (flatListRef.current as any).scrollToEnd({ animated: false });
-                        setHasScrolledToBottom(true);
-                        if (isInitialLoadRef.current) {
-                          isInitialLoadRef.current = false;
-                        }
-                      } catch (error) {
-                        // Fallback: try scrollToIndex
-                        try {
-                          const lastIndex = messages.length - 1;
-                          (flatListRef.current as any).scrollToIndex({ 
-                            index: lastIndex, 
-                            animated: false,
-                            viewPosition: 1
+                        // Use scrollToOffset for precise positioning if we have viewport size
+                        if (viewportSizeRef.current && contentSizeRef.current) {
+                          const targetOffset = Math.max(0, contentSizeRef.current.height - viewportSizeRef.current.height);
+                          (flatListRef.current as any).scrollToOffset({ 
+                            offset: targetOffset, 
+                            animated: false 
                           });
-                          setHasScrolledToBottom(true);
-                          if (isInitialLoadRef.current) {
-                            isInitialLoadRef.current = false;
-                          }
-                        } catch (scrollError) {
-                          console.warn('Scroll failed:', scrollError);
+                        } else {
+                          // Fallback to scrollToEnd
+                          (flatListRef.current as any).scrollToEnd({ animated: false });
                         }
+                        setHasScrolledToBottom(true);
+                        // Note: Don't set hasAttemptedInitialScrollRef here - onLayout handles initial scroll
+                      } catch (error) {
+                        console.warn('Scroll failed:', error);
                       }
                     }
-                  }, 200);
+                  }, 150);
                 }
               }}
-              onLayout={() => {
-                // Scroll to bottom when layout is ready (only on initial load)
-                if (!loading && messages.length > 0 && isInitialLoadRef.current && shouldAutoScrollRef.current) {
-                  // Use multiple attempts with increasing delays to ensure scroll happens
-                  const attemptScroll = (delay: number) => {
-                    setTimeout(() => {
-                      if (flatListRef.current && messages.length > 0 && isInitialLoadRef.current) {
-                        try {
-                          (flatListRef.current as any).scrollToEnd({ animated: false });
-                          setHasScrolledToBottom(true);
-                          isInitialLoadRef.current = false;
-                        } catch (error) {
-                          // Try again with longer delay if this attempt failed
-                          if (delay < 500) {
-                            attemptScroll(delay + 100);
-                          } else {
-                            console.warn('Scroll failed after multiple attempts:', error);
+              onLayout={(event) => {
+                // Track viewport size when layout is ready
+                const { width, height } = event.nativeEvent.layout;
+                viewportSizeRef.current = { width, height };
+                
+                // Scroll to bottom when layout is ready (only on initial load, once)
+                if (!loading && messages.length > 0 && isInitialLoadRef.current && shouldAutoScrollRef.current && !hasAttemptedInitialScrollRef.current) {
+                  // Set flag immediately to block onContentSizeChange from scrolling during initial load
+                  hasAttemptedInitialScrollRef.current = true;
+                  
+                  // Clear any pending scroll
+                  if (scrollTimeoutRef.current) {
+                    clearTimeout(scrollTimeoutRef.current);
+                  }
+                  
+                  // Wait for content to be measured, then scroll to absolute bottom
+                  scrollTimeoutRef.current = setTimeout(() => {
+                    if (flatListRef.current && messages.length > 0 && isInitialLoadRef.current) {
+                      try {
+                        // Use scrollToOffset for precise positioning if we have both sizes
+                        if (viewportSizeRef.current && contentSizeRef.current) {
+                          const targetOffset = Math.max(0, contentSizeRef.current.height - viewportSizeRef.current.height);
+                          (flatListRef.current as any).scrollToOffset({ 
+                            offset: targetOffset, 
+                            animated: false 
+                          });
+                        } else {
+                          // Fallback: try scrollToEnd, or scroll to last index
+                          try {
+                            (flatListRef.current as any).scrollToEnd({ animated: false });
+                          } catch (e) {
+                            // Last resort: scroll to last message index
+                            const lastIndex = messages.length - 1;
+                            if (lastIndex >= 0) {
+                              (flatListRef.current as any).scrollToIndex({ 
+                                index: lastIndex, 
+                                animated: false,
+                                viewPosition: 1
+                              });
+                            }
                           }
                         }
+                        setHasScrolledToBottom(true);
+                        isInitialLoadRef.current = false;
+                        // Note: hasAttemptedInitialScrollRef was set earlier to block competing scrolls
+                      } catch (error) {
+                        console.warn('Initial scroll failed:', error);
                       }
-                    }, delay);
-                  };
-                  
-                  // Start with requestAnimationFrame, then try with delays
-                  requestAnimationFrame(() => {
-                    attemptScroll(100);
-                  });
+                    }
+                  }, 400);
                 }
               }}
               ListEmptyComponent={() => (

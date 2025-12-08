@@ -354,6 +354,10 @@ export default function GroupChatScreen() {
   // Background sync state - for checking new messages (uses sync service + SQLite)
   const pollingIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const latestMessageIdRef = useRef<number | null>(null); // Track latest message ID to detect new messages
+  const scrollTimeoutRef = useRef<NodeJS.Timeout | null>(null); // Debounced scroll timeout to prevent multiple rapid scrolls
+  const contentSizeRef = useRef<{ width: number; height: number } | null>(null); // Track content size
+  const viewportSizeRef = useRef<{ width: number; height: number } | null>(null); // Track viewport size
+  const hasAttemptedInitialScrollRef = useRef<boolean>(false); // Track if we've attempted initial scroll
   const isPollingRef = useRef<boolean>(false); // Track if sync is active
   const POLLING_INTERVAL = 3000; // Sync every 3 seconds
   const MAX_RETRY_ATTEMPTS = 5; // Maximum retry attempts
@@ -951,7 +955,7 @@ export default function GroupChatScreen() {
       retryTimeoutRef.current = null;
     }
     
-    fetchMessages(true);
+    // Note: fetchMessages is handled by useFocusEffect to prevent duplicate fetches
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]); // Only depend on id, fetchMessages is stable
   
@@ -969,51 +973,50 @@ export default function GroupChatScreen() {
     };
   }, []);
 
-  // Function to scroll to bottom - can be called multiple times
+  // Improved scroll to bottom function that uses content size to scroll to absolute bottom
   const scrollToBottom = useCallback((animated = false, delay = 100) => {
+    // Prevent scroll during initial load (onLayout handles initial scroll)
+    if (!hasAttemptedInitialScrollRef.current) {
+      return;
+    }
+    
     if (!flatListRef.current || messages.length === 0) return;
     
-    const scroll = () => {
+    // Clear any pending scroll to prevent multiple rapid scrolls
+    if (scrollTimeoutRef.current) {
+      clearTimeout(scrollTimeoutRef.current);
+      scrollTimeoutRef.current = null;
+    }
+    
+    const performScroll = () => {
       if (!flatListRef.current || messages.length === 0) return;
       
       try {
-        // Try scrollToEnd first
-        flatListRef.current.scrollToEnd({ animated });
-        setHasScrolledToBottom(true);
-        console.log('Scrolled to bottom');
-      } catch (error) {
-        // Fallback: scroll to last index
-        try {
-          const lastIndex = messages.length - 1;
-          if (lastIndex >= 0) {
-            flatListRef.current.scrollToIndex({ 
-              index: lastIndex, 
-              animated,
-              viewPosition: 1 // 1 = bottom
-            });
-            setHasScrolledToBottom(true);
-            console.log('Scrolled to bottom via scrollToIndex');
-          }
-        } catch (scrollError) {
-          console.warn('Scroll failed:', scrollError);
-          // Last resort: try scrolling after a longer delay
-          setTimeout(() => {
-            if (flatListRef.current && messages.length > 0) {
-              try {
-                flatListRef.current.scrollToEnd({ animated: false });
-              } catch (e) {
-                console.warn('Final scroll attempt failed:', e);
-              }
-            }
-          }, 500);
+        // If we have content size and viewport size, use scrollToOffset for precise positioning
+        if (contentSizeRef.current && viewportSizeRef.current) {
+          const contentHeight = contentSizeRef.current.height;
+          const viewportHeight = viewportSizeRef.current.height;
+          const targetOffset = Math.max(0, contentHeight - viewportHeight);
+          
+          (flatListRef.current as any).scrollToOffset({ 
+            offset: targetOffset, 
+            animated 
+          });
+          setHasScrolledToBottom(true);
+        } else {
+          // Fallback to scrollToEnd if sizes aren't available yet
+          flatListRef.current.scrollToEnd({ animated });
+          setHasScrolledToBottom(true);
         }
+      } catch (error) {
+        console.warn('Scroll failed:', error);
       }
     };
     
     if (delay > 0) {
-      setTimeout(scroll, delay);
+      scrollTimeoutRef.current = setTimeout(performScroll, delay);
     } else {
-      scroll();
+      requestAnimationFrame(performScroll);
     }
   }, [messages.length]);
 
@@ -1023,17 +1026,16 @@ export default function GroupChatScreen() {
     if (hasScrolledForThisConversation.current !== id) {
       hasScrolledForThisConversation.current = id as string;
       setHasScrolledToBottom(false);
+      hasAttemptedInitialScrollRef.current = false;
+      contentSizeRef.current = null;
+      viewportSizeRef.current = null;
     }
     
-    // Scroll when messages are loaded and not loading
-    if (!loading && messages.length > 0) {
-      // Multiple attempts with increasing delays to handle content rendering
-      scrollToBottom(false, 100);
+    // Scroll when messages are loaded and not loading (single attempt with debounce)
+    if (!loading && messages.length > 0 && !hasScrolledToBottom) {
       scrollToBottom(false, 300);
-      scrollToBottom(false, 600);
-      scrollToBottom(false, 1000);
     }
-  }, [loading, messages.length, id, scrollToBottom]);
+  }, [loading, messages.length, id, scrollToBottom, hasScrolledToBottom]);
 
   // Mark messages as read and refresh messages when group chat is opened
   useFocusEffect(
@@ -1083,10 +1085,7 @@ export default function GroupChatScreen() {
       
       fetchMessages(!hasExistingMessages);
       
-      // Scroll to bottom after a delay to ensure messages are loaded
-      setTimeout(() => {
-        scrollToBottom(false, 0);
-      }, 500);
+      // Scroll will be handled by onContentSizeChange and onLayout
 
       const markGroupMessagesAsRead = async () => {
         if (!ENABLE_MARK_AS_READ || !id || !user) return;
@@ -2585,10 +2584,7 @@ export default function GroupChatScreen() {
     setShowEmoji(false);
   };
 
-  useEffect(() => {
-    fetchMessages();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [id]); // fetchMessages is stable, no need to include in deps
+  // Removed duplicate fetchMessages call - useFocusEffect handles fetching to prevent duplicate loads
 
   // Format message date for separators
   const formatMessageDate = (dateString: string | null | undefined) => {
@@ -2870,7 +2866,11 @@ export default function GroupChatScreen() {
                 keyboardShouldPersistTaps="handled"
                 keyboardDismissMode={Platform.OS === 'ios' ? 'interactive' : 'on-drag'}
               onScroll={({ nativeEvent }) => {
-                const { contentOffset } = nativeEvent;
+                const { contentOffset, contentSize, layoutMeasurement } = nativeEvent;
+                
+                // Track content and viewport sizes for precise scrolling
+                contentSizeRef.current = { width: contentSize.width, height: contentSize.height };
+                viewportSizeRef.current = { width: layoutMeasurement.width, height: layoutMeasurement.height };
                 
                 const isAtTop = contentOffset.y <= 50;
                 
@@ -2903,16 +2903,93 @@ export default function GroupChatScreen() {
                   </View>
                 ) : null
               }
-              onContentSizeChange={() => {
+              onContentSizeChange={(contentWidth, contentHeight) => {
+                // Track content size for precise scrolling
+                contentSizeRef.current = { width: contentWidth, height: contentHeight };
+                
                 // Scroll to bottom when content size changes (e.g., images load)
-                if (!loading && messages.length > 0 && !hasScrolledToBottom) {
-                  scrollToBottom(false, 0);
+                // Only scroll if initial scroll has already happened (onLayout handles initial scroll)
+                // This prevents duplicate scrolls on initial load
+                // Also check hasScrolledToBottom to prevent scrolling during initial load period
+                if (!loading && messages.length > 0 && hasScrolledToBottom && hasAttemptedInitialScrollRef.current) {
+                  // Clear any pending scroll
+                  if (scrollTimeoutRef.current) {
+                    clearTimeout(scrollTimeoutRef.current);
+                  }
+                  
+                  // Wait for viewport size to be available, then scroll to absolute bottom
+                  scrollTimeoutRef.current = setTimeout(() => {
+                    if (flatListRef.current && messages.length > 0 && !hasScrolledToBottom) {
+                      try {
+                        // Use scrollToOffset for precise positioning if we have viewport size
+                        if (viewportSizeRef.current && contentSizeRef.current) {
+                          const targetOffset = Math.max(0, contentSizeRef.current.height - viewportSizeRef.current.height);
+                          (flatListRef.current as any).scrollToOffset({ 
+                            offset: targetOffset, 
+                            animated: false 
+                          });
+                        } else {
+                          // Fallback to scrollToEnd
+                          (flatListRef.current as any).scrollToEnd({ animated: false });
+                        }
+                        setHasScrolledToBottom(true);
+                        // Note: Don't set hasAttemptedInitialScrollRef here - onLayout handles initial scroll
+                      } catch (error) {
+                        console.warn('Scroll failed:', error);
+                      }
+                    }
+                  }, 150);
                 }
               }}
-              onLayout={() => {
-                // Scroll to bottom when layout is ready
-                if (!loading && messages.length > 0 && !hasScrolledToBottom) {
-                  scrollToBottom(false, 0);
+              onLayout={(event) => {
+                // Track viewport size when layout is ready
+                const { width, height } = event.nativeEvent.layout;
+                viewportSizeRef.current = { width, height };
+                
+                // Scroll to bottom when layout is ready (only on initial load, once)
+                if (!loading && messages.length > 0 && !hasScrolledToBottom && !hasAttemptedInitialScrollRef.current) {
+                  // Set flag immediately to block onContentSizeChange from scrolling during initial load
+                  hasAttemptedInitialScrollRef.current = true;
+                  
+                  // Clear any pending scroll
+                  if (scrollTimeoutRef.current) {
+                    clearTimeout(scrollTimeoutRef.current);
+                  }
+                  
+                  // Wait for content to be measured, then scroll to absolute bottom
+                  scrollTimeoutRef.current = setTimeout(() => {
+                    if (flatListRef.current && messages.length > 0 && !hasScrolledToBottom) {
+                      try {
+                        // Use scrollToOffset for precise positioning if we have both sizes
+                        if (viewportSizeRef.current && contentSizeRef.current) {
+                          const targetOffset = Math.max(0, contentSizeRef.current.height - viewportSizeRef.current.height);
+                          (flatListRef.current as any).scrollToOffset({ 
+                            offset: targetOffset, 
+                            animated: false 
+                          });
+                        } else {
+                          // Fallback: try scrollToEnd, or scroll to last index
+                          try {
+                            (flatListRef.current as any).scrollToEnd({ animated: false });
+                          } catch (e) {
+                            // Last resort: scroll to last message index
+                            const lastIndex = messages.length - 1;
+                            if (lastIndex >= 0) {
+                              (flatListRef.current as any).scrollToIndex({ 
+                                index: lastIndex, 
+                                animated: false,
+                                viewPosition: 1
+                              });
+                            }
+                          }
+                        }
+                        setHasScrolledToBottom(true);
+                        // Note: hasAttemptedInitialScrollRef was set earlier to block competing scrolls
+                      } catch (error) {
+                        console.warn('Initial scroll failed:', error);
+                      }
+                    }
+                  }, 400);
                 }
               }}
             />
