@@ -1,4 +1,4 @@
-import type { DatabaseAttachment, DatabaseConversation, DatabaseMessage, MessageWithAttachments, SyncState } from '@/types/database';
+import type { DatabaseAttachment, DatabaseConversation, DatabaseGroup, DatabaseMessage, MessageWithAttachments, SyncState } from '@/types/database';
 import { runMigrations } from '@/utils/dbMigrations';
 import * as SQLite from 'expo-sqlite';
 
@@ -754,8 +754,8 @@ export async function isDatabaseEmpty(): Promise<boolean> {
   }
 }
 
-// Get groups from SQLite (groups are stored in conversations table with type='group')
-export async function getGroups(): Promise<DatabaseConversation[]> {
+// Groups table functions (using dedicated groups table)
+export async function getGroups(): Promise<DatabaseGroup[]> {
   try {
     const database = await getDb();
     if (!database) {
@@ -764,13 +764,260 @@ export async function getGroups(): Promise<DatabaseConversation[]> {
       }
       return [];
     }
-    const groups = await database.getAllAsync<DatabaseConversation>(
-      `SELECT * FROM conversations WHERE conversation_type = 'group' ORDER BY updated_at DESC`
+    
+    // CRITICAL FIX: Ensure groups table exists (preventive measure)
+    try {
+      await database.getFirstAsync('SELECT 1 FROM groups LIMIT 1');
+    } catch (tableError: any) {
+      if (tableError?.message?.includes('no such table: groups')) {
+        console.warn('[Database] Groups table does not exist, creating it...');
+        try {
+          await database.execAsync(`
+            CREATE TABLE IF NOT EXISTS groups (
+              id INTEGER PRIMARY KEY,
+              name TEXT NOT NULL,
+              description TEXT,
+              owner_id INTEGER,
+              avatar_url TEXT,
+              member_count INTEGER DEFAULT 0,
+              last_message TEXT,
+              last_message_date TEXT,
+              unread_count INTEGER NOT NULL DEFAULT 0,
+              created_at TEXT NOT NULL DEFAULT (datetime('now')),
+              updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+              last_synced_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+          `);
+          await database.execAsync(`
+            CREATE INDEX IF NOT EXISTS idx_groups_updated_at ON groups(updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_groups_owner_id ON groups(owner_id);
+          `);
+          console.log('[Database] Groups table created successfully');
+        } catch (createError) {
+          console.error('[Database] Failed to create groups table:', createError);
+          return [];
+        }
+      } else {
+        throw tableError;
+      }
+    }
+    
+    const groups = await database.getAllAsync<DatabaseGroup>(
+      `SELECT * FROM groups ORDER BY updated_at DESC`
     );
-    return groups;
+    
+    return groups || [];
   } catch (error) {
     console.error('[Database] Error getting groups:', error);
     return [];
+  }
+}
+
+export async function saveGroups(
+  groups: Array<{
+    id: number;
+    name: string;
+    description?: string | null;
+    owner_id?: number | null;
+    avatar_url?: string | null;
+    member_count?: number;
+    last_message?: string | null;
+    last_message_date?: string | null;
+    unread_count?: number;
+    created_at?: string;
+    updated_at?: string;
+  }>
+): Promise<void> {
+  if (!groups || groups.length === 0) {
+    return;
+  }
+
+  try {
+    // CRITICAL FIX: Get database with retry
+    let database = await getDb();
+    if (!database) {
+      // Wait a bit and retry
+      let retries = 0;
+      while (!database && retries < 5) {
+        await new Promise(resolve => setTimeout(resolve, 200));
+        database = await getDb();
+        retries++;
+      }
+    }
+    
+    if (!database) {
+      if (__DEV__) {
+        console.warn('[Database] Database not available after retries, skipping save');
+      }
+      return;
+    }
+    
+    // CRITICAL FIX: Validate database is still valid before enqueueing
+    const isValid = await validateDatabase(database);
+    if (!isValid) {
+      console.error('[Database] Database invalid (NullPointerException), reinitializing...');
+      db = null; // Reset database
+      database = await initDatabase(); // Try to reinitialize
+      if (!database) {
+        console.error('[Database] Failed to reinitialize, skipping save');
+        return;
+      }
+    }
+    
+    // CRITICAL FIX: Capture database reference for use in callback
+    const dbRef = database;
+    
+    // Enqueue write operation to prevent concurrent writes
+    await writeQueue.enqueue(async () => {
+      // CRITICAL FIX: Re-validate database inside callback
+      let dbToUse: SQLite.SQLiteDatabase | null = dbRef;
+      if (!dbToUse) {
+        dbToUse = await getDb();
+        if (!dbToUse) {
+          console.error('[Database] Database became null in writeQueue callback');
+          return;
+        }
+      }
+      
+      // CRITICAL FIX: Validate database is still valid
+      const isValid = await validateDatabase(dbToUse);
+      if (!isValid || !dbToUse) {
+        console.error('[Database] Database invalid in callback, skipping operation');
+        return;
+      }
+      
+      // CRITICAL FIX: Ensure groups table exists (preventive measure)
+      try {
+        await dbToUse.getFirstAsync('SELECT 1 FROM groups LIMIT 1');
+      } catch (tableError: any) {
+        if (tableError?.message?.includes('no such table: groups')) {
+          console.warn('[Database] Groups table does not exist, creating it...');
+          try {
+            await dbToUse.execAsync(`
+              CREATE TABLE IF NOT EXISTS groups (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                description TEXT,
+                owner_id INTEGER,
+                avatar_url TEXT,
+                member_count INTEGER DEFAULT 0,
+                last_message TEXT,
+                last_message_date TEXT,
+                unread_count INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                last_synced_at TEXT NOT NULL DEFAULT (datetime('now'))
+              );
+            `);
+            await dbToUse.execAsync(`
+              CREATE INDEX IF NOT EXISTS idx_groups_updated_at ON groups(updated_at DESC);
+              CREATE INDEX IF NOT EXISTS idx_groups_owner_id ON groups(owner_id);
+            `);
+            console.log('[Database] Groups table created successfully');
+          } catch (createError) {
+            console.error('[Database] Failed to create groups table:', createError);
+            return; // Can't proceed without the table
+          }
+        } else {
+          throw tableError; // Re-throw if it's a different error
+        }
+      }
+      
+      // TypeScript now knows dbToUse is not null
+      const validDb = dbToUse;
+      
+      // Wrap transaction in try-catch to handle rollback errors with retry
+      try {
+        await retryWithBackoff(async () => {
+          await validDb.withTransactionAsync(async () => {
+            for (const group of groups) {
+              try {
+                // Check if group already exists
+                const existing = await validDb.getFirstAsync<{ id: number }>(
+                  `SELECT id FROM groups WHERE id = ?`,
+                  [group.id]
+                );
+                
+                if (existing) {
+                  // Update existing group
+                  await validDb.runAsync(
+                    `UPDATE groups SET
+                      name = ?,
+                      description = ?,
+                      owner_id = ?,
+                      avatar_url = ?,
+                      member_count = ?,
+                      last_message = ?,
+                      last_message_date = ?,
+                      unread_count = ?,
+                      updated_at = ?,
+                      last_synced_at = ?
+                    WHERE id = ?`,
+                    [
+                      group.name,
+                      group.description ?? null,
+                      group.owner_id ?? null,
+                      group.avatar_url ?? null,
+                      group.member_count ?? 0,
+                      group.last_message ?? null,
+                      group.last_message_date ?? null,
+                      group.unread_count ?? 0,
+                      group.updated_at ?? new Date().toISOString(),
+                      new Date().toISOString(),
+                      group.id,
+                    ]
+                  );
+                } else {
+                  // Insert new group
+                  await validDb.runAsync(
+                    `INSERT INTO groups (
+                      id, name, description, owner_id, avatar_url, member_count,
+                      last_message, last_message_date, unread_count,
+                      created_at, updated_at, last_synced_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                    [
+                      group.id,
+                      group.name,
+                      group.description ?? null,
+                      group.owner_id ?? null,
+                      group.avatar_url ?? null,
+                      group.member_count ?? 0,
+                      group.last_message ?? null,
+                      group.last_message_date ?? null,
+                      group.unread_count ?? 0,
+                      group.created_at ?? new Date().toISOString(),
+                      group.updated_at ?? new Date().toISOString(),
+                      new Date().toISOString(),
+                    ]
+                  );
+                }
+              } catch (groupError) {
+                // Log error for individual group but continue with others
+                if (!isDatabaseLockedError(groupError)) {
+                  console.error(`[Database] Error saving group ${group.id}:`, groupError);
+                }
+                // Don't throw - let other groups save
+              }
+            }
+          });
+        });
+      } catch (transactionError: any) {
+        // Handle transaction errors, including rollback issues
+        if (transactionError?.message?.includes('rollback') || 
+            transactionError?.message?.includes('transaction')) {
+          console.error('[Database] Transaction error (possibly rollback issue):', transactionError);
+          // Don't throw - allow app to continue
+        } else {
+          throw transactionError; // Re-throw other errors
+        }
+      }
+    });
+  } catch (error) {
+    // Log error but don't throw - allow app to continue
+    console.error('[Database] Error saving groups:', error);
+    if (__DEV__) {
+      console.error('[Database] Error details:', error instanceof Error ? error.message : String(error));
+    }
   }
 }
 

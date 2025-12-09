@@ -4,7 +4,7 @@ import { useAuth } from '@/context/AuthContext';
 import { useNotifications } from '@/context/NotificationContext';
 import { useTheme } from '@/context/ThemeContext';
 import { groupsAPI } from '@/services/api';
-import { getGroups as getDbGroups, initDatabase, saveConversations as saveDbGroups } from '@/services/database';
+import { getGroups as getDbGroups, initDatabase, saveGroups as saveDbGroups } from '@/services/database';
 import { MaterialCommunityIcons } from '@expo/vector-icons';
 import { useFocusEffect } from '@react-navigation/native';
 import { router } from 'expo-router';
@@ -94,10 +94,10 @@ export default function GroupsScreen() {
       
       // Transform database format to UI format
       return dbGroups.map(group => ({
-        id: group.group_id || group.conversation_id,
+        id: group.id,
         name: group.name,
-        description: undefined,
-        owner_id: 0, // Not stored in conversations table
+        description: group.description || undefined,
+        owner_id: group.owner_id || 0,
         last_message: group.last_message || undefined,
         last_message_date: group.last_message_date || undefined,
         created_at: group.created_at,
@@ -147,16 +147,14 @@ export default function GroupsScreen() {
       if (dbInitialized) {
         try {
           const groupsToSave = safeGroupsData.map((group: any) => ({
-            conversation_id: group.id,
-            conversation_type: 'group' as const,
-            group_id: group.id,
+            id: group.id,
             name: group.name || 'Unknown Group',
-            email: undefined,
-            avatar_url: group.avatar_url,
-            last_message: group.last_message,
-            last_message_date: group.last_message_date || group.updated_at,
-            last_message_sender_id: undefined,
-            last_message_read_at: undefined,
+            description: group.description || null,
+            owner_id: group.owner_id || null,
+            avatar_url: group.avatar_url || null,
+            member_count: group.users?.length || group.member_count || 0,
+            last_message: group.last_message || null,
+            last_message_date: group.last_message_date || group.updated_at || null,
             unread_count: group.unread_count ?? 0,
             created_at: group.created_at || new Date().toISOString(),
             updated_at: group.updated_at || group.last_message_date || new Date().toISOString(),

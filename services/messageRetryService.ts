@@ -1,9 +1,13 @@
 import type { DatabaseAttachment, DatabaseMessage } from '@/types/database';
+import { AppState, AppStateStatus } from 'react-native';
 import { messagesAPI } from './api';
 import { getDb, getPendingMessages, updateMessageStatus } from './database';
 
 let retryInterval: NodeJS.Timeout | null = null;
 let isRetrying = false;
+let appState: AppStateStatus = 'active';
+let backgroundRetryTimeout: NodeJS.Timeout | null = null;
+let appStateSubscription: any = null;
 
 /**
  * Retry sending pending/failed messages
@@ -317,29 +321,90 @@ async function retrySingleMessage(message: DatabaseMessage): Promise<void> {
 }
 
 /**
- * Start automatic retry service
+ * Schedule background retry based on app state
+ */
+function scheduleBackgroundRetry() {
+  // Clear any existing timeout
+  if (backgroundRetryTimeout) {
+    clearTimeout(backgroundRetryTimeout);
+  }
+  
+  // Schedule retry based on app state
+  if (appState === 'background' || appState === 'inactive') {
+    // When in background, retry less frequently (every 2 minutes)
+    backgroundRetryTimeout = setTimeout(() => {
+      retryPendingMessages().catch(error => {
+        console.error('[MessageRetry] Background retry error:', error);
+      });
+      // Schedule next retry
+      scheduleBackgroundRetry();
+    }, 2 * 60 * 1000); // 2 minutes
+  } else {
+    // When active, retry more frequently (every 10 seconds)
+    backgroundRetryTimeout = setTimeout(() => {
+      retryPendingMessages().catch(error => {
+        console.error('[MessageRetry] Active retry error:', error);
+      });
+      // Schedule next retry
+      scheduleBackgroundRetry();
+    }, 10000); // 10 seconds
+  }
+}
+
+/**
+ * Start automatic retry service with background/foreground handling
  */
 export function startRetryService(intervalMs: number = 30000): void {
   if (retryInterval) {
     stopRetryService();
   }
   
+  // Initialize app state
+  appState = AppState.currentState;
+  
+  // Set up AppState listener for background/foreground handling
+  if (appStateSubscription) {
+    appStateSubscription.remove();
+  }
+  
+  appStateSubscription = AppState.addEventListener('change', (nextAppState: AppStateStatus) => {
+    appState = nextAppState;
+    
+    if (nextAppState === 'active') {
+      // App came to foreground - retry immediately
+      retryPendingMessages().catch(error => {
+        console.error('[MessageRetry] Foreground retry error:', error);
+      });
+      // Restart scheduling with active interval
+      scheduleBackgroundRetry();
+    } else {
+      // App went to background - continue retrying but less frequently
+      scheduleBackgroundRetry();
+    }
+  });
+  
   // Initial delay before first retry to avoid immediate retries
   setTimeout(() => {
+    // Start interval-based retry for active state
     retryInterval = setInterval(() => {
-      retryPendingMessages().catch(error => {
-        console.error('[MessageRetry] Error in retry service:', error);
-      });
+      if (appState === 'active') {
+        retryPendingMessages().catch(error => {
+          console.error('[MessageRetry] Error in retry service:', error);
+        });
+      }
     }, intervalMs);
     
     // Also run immediately after delay
     retryPendingMessages().catch(error => {
       console.error('[MessageRetry] Error in initial retry:', error);
     });
-  }, 5000); // 5 second delay before first retry
+    
+    // Start background retry scheduling
+    scheduleBackgroundRetry();
+  }, 2000); // 2 second delay before first retry
   
   if (__DEV__) {
-    console.log(`[MessageRetry] Started retry service (interval: ${intervalMs}ms, initial delay: 5s)`);
+    console.log(`[MessageRetry] Started global retry service (interval: ${intervalMs}ms, background: 2min, foreground: 10s)`);
   }
 }
 
@@ -350,9 +415,17 @@ export function stopRetryService(): void {
   if (retryInterval) {
     clearInterval(retryInterval);
     retryInterval = null;
-    if (__DEV__) {
-      console.log('[MessageRetry] Stopped retry service');
-    }
+  }
+  if (backgroundRetryTimeout) {
+    clearTimeout(backgroundRetryTimeout);
+    backgroundRetryTimeout = null;
+  }
+  if (appStateSubscription) {
+    appStateSubscription.remove();
+    appStateSubscription = null;
+  }
+  if (__DEV__) {
+    console.log('[MessageRetry] Stopped retry service');
   }
 }
 

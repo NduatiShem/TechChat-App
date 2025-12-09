@@ -13,7 +13,7 @@ import { useNotifications } from '@/context/NotificationContext';
 import { useTheme } from '@/context/ThemeContext';
 import { messagesAPI, usersAPI } from '@/services/api';
 import { deleteMessage as deleteDbMessage, fixDuplicateMessagesWithWrongTimestamps, getDb, getMessages as getDbMessages, hasMessagesForConversation, initDatabase, saveMessages as saveDbMessages, updateMessageByServerId, updateMessageStatus } from '@/services/database';
-import { startRetryService } from '@/services/messageRetryService';
+import { startRetryService, retryPendingMessages } from '@/services/messageRetryService';
 import { syncConversationMessages, syncOlderMessages } from '@/services/syncService';
 import { isVideoAttachment } from '@/utils/textUtils';
 import { MaterialCommunityIcons, MaterialIcons } from '@expo/vector-icons';
@@ -1914,14 +1914,20 @@ export default function UserChatScreen() {
             }
           }
           
-          // Show user-friendly error (non-blocking)
-          if (!isNetworkError) {
-            Alert.alert(
-              'Message Pending',
-              'Your message was saved locally but couldn\'t be sent. It will be retried automatically.',
-              [{ text: 'OK' }]
-            );
+          // Silently retry immediately - no popup, process in background
+          // Trigger immediate retry for network/server errors
+          if (isNetworkError || (apiError.response?.status >= 500)) {
+            // Network/server error - trigger immediate retry after short delay
+            setTimeout(() => {
+              retryPendingMessages().catch(err => {
+                if (__DEV__) {
+                  console.error('[UserChat] Immediate retry failed:', err);
+                }
+              });
+            }, 2000); // Retry after 2 seconds
           }
+          // For 4xx errors, keep as pending/failed - retry service will handle it
+          // No popup - process silently in background
         }
       })();
       
@@ -3036,9 +3042,9 @@ export default function UserChatScreen() {
 
       <KeyboardAvoidingView
         style={{ flex: 1 }}
-        behavior={Platform.OS === 'ios' ? 'padding' : undefined} // ✅ Fixed: Remove 'height' behavior on Android
+        behavior={Platform.OS === 'ios' ? 'padding' : 'height'} // ✅ Re-enable for Android with 'height' behavior
         keyboardVerticalOffset={Platform.OS === 'ios' ? 0 : 0}
-        enabled={Platform.OS === 'ios'} // ✅ Fixed: Only enable on iOS, let Android handle it natively
+        enabled={true} // ✅ Enable for both platforms
       >
         <View style={{ 
           flex: 1,
@@ -3380,8 +3386,8 @@ export default function UserChatScreen() {
             paddingHorizontal: 16,
             paddingVertical: 8,
             paddingBottom: Platform.OS === 'android' 
-              ? (keyboardHeight > 0 ? 0 : Math.max(insets.bottom, 8)) // ✅ Fixed: Use max to prevent extra space
-              : (keyboardHeight > 0 ? 8 : Math.max(insets.bottom, 16)), // ✅ Fixed: Consistent padding
+              ? Math.max(insets.bottom, 8) // ✅ Always use safe area padding, let KeyboardAvoidingView handle keyboard
+              : (keyboardHeight > 0 ? 8 : Math.max(insets.bottom, 16)), // ✅ iOS keeps keyboard-aware padding
             borderTopWidth: 1,
             borderTopColor: isDark ? '#374151' : '#E5E7EB',
           }}
