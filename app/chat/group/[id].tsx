@@ -1455,6 +1455,9 @@ export default function GroupChatScreen() {
       setShowEmoji(false);
       setSending(false); // Reset sending state - API call happens in background
       
+      // CRITICAL FIX: Dismiss keyboard after sending to prevent extra space
+      Keyboard.dismiss();
+      
       // STEP 3: Send to API in background (non-blocking)
       (async () => {
         try {
@@ -2906,8 +2909,9 @@ export default function GroupChatScreen() {
 
       <KeyboardAvoidingView
         style={{ flex: 1 }}
-        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-        keyboardVerticalOffset={0}
+        behavior={Platform.OS === 'ios' ? 'padding' : undefined} // ✅ Fixed: Remove 'height' behavior on Android
+        keyboardVerticalOffset={Platform.OS === 'ios' ? 0 : 0}
+        enabled={Platform.OS === 'ios'} // ✅ Fixed: Only enable on iOS, let Android handle it natively
       >
         <View style={{ 
           flex: 1,
@@ -3222,8 +3226,8 @@ export default function GroupChatScreen() {
                 paddingHorizontal: 16,
                 paddingVertical: 8,
                 paddingBottom: Platform.OS === 'android' 
-                  ? (keyboardHeight > 0 ? 0 : insets.bottom) // ✅ No padding when keyboard open, safe area padding when dismissed
-                  : Math.max(insets.bottom + 8, keyboardHeight > 0 ? 8 : 16),
+                  ? (keyboardHeight > 0 ? 0 : Math.max(insets.bottom, 8)) // ✅ Fixed: Use max to prevent extra space
+                  : (keyboardHeight > 0 ? 8 : Math.max(insets.bottom, 16)), // ✅ Fixed: Consistent padding
                 borderTopWidth: 1,
                 borderTopColor: isDark ? '#374151' : '#E5E7EB',
               }}
