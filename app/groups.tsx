@@ -130,6 +130,18 @@ export default function GroupsScreen() {
       // Ensure groupsData is always an array
       const safeGroupsData = Array.isArray(groupsData) ? groupsData : [];
       
+      // ✅ FIX: If API returns empty but we have cached data, use cached data
+      if (safeGroupsData.length === 0) {
+        const cachedGroups = await loadCachedGroups();
+        if (cachedGroups.length > 0) {
+          // Use cached data even if API returned empty (SQLite might have data)
+          setGroups(cachedGroups);
+          setFilteredGroups(cachedGroups);
+          setIsLoading(false);
+          return;
+        }
+      }
+      
       // Sync unread counts from backend to notification context
       if (safeGroupsData.length > 0) {
         let totalGroupUnread = 0;
@@ -165,13 +177,13 @@ export default function GroupsScreen() {
         }
       }
     } catch {
-      // Failed to load groups - try to load from SQLite
+      // ✅ FIX: Always try SQLite fallback on API failure
       const cachedGroups = await loadCachedGroups();
       if (cachedGroups.length > 0) {
         setGroups(cachedGroups);
         setFilteredGroups(cachedGroups);
       } else {
-        // No cache available - set empty array
+        // Only set empty if both API and SQLite are empty
         setGroups([]);
         setFilteredGroups([]);
       }

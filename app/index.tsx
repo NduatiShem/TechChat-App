@@ -238,6 +238,19 @@ export default function ConversationsScreen() {
       
       // Deduplicate before setting state
       const deduplicated = deduplicateConversations(uniqueConversations);
+      
+      // ✅ FIX: If API returns empty but we have cached data, use cached data
+      if (deduplicated.length === 0) {
+        const cachedConversations = await loadCachedConversations();
+        if (cachedConversations.length > 0) {
+          const cachedDeduplicated = deduplicateConversations(cachedConversations);
+          setConversations(cachedDeduplicated);
+          setFilteredConversations(cachedDeduplicated);
+          setIsLoading(false);
+          return;
+        }
+      }
+      
       setConversations(deduplicated);
       setFilteredConversations(deduplicated);
       
@@ -266,16 +279,15 @@ export default function ConversationsScreen() {
       }
     } catch (error: any) {
       console.error('Failed to load conversations:', error);
-      // If offline or network error, try to load from cache
-      if (!isOnline || error?.message?.includes('Network') || error?.code === 'NETWORK_ERROR') {
-        const cachedConversations = await loadCachedConversations();
-        if (cachedConversations.length > 0) {
-          const deduplicated = deduplicateConversations(cachedConversations);
-          setConversations(deduplicated);
-          setFilteredConversations(deduplicated);
-          setIsLoading(false);
-          return;
-        }
+      
+      // ✅ FIX: Always try SQLite fallback, not just on network errors
+      const cachedConversations = await loadCachedConversations();
+      if (cachedConversations.length > 0) {
+        const deduplicated = deduplicateConversations(cachedConversations);
+        setConversations(deduplicated);
+        setFilteredConversations(deduplicated);
+        setIsLoading(false);
+        return;
       }
       // Don't clear conversations on error - preserve existing data
       // Only clear if we have no existing conversations (initial load)

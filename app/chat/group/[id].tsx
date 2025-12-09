@@ -27,20 +27,20 @@ import { router, useLocalSearchParams } from 'expo-router';
 import * as Sharing from 'expo-sharing';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
-    ActivityIndicator,
-    Alert,
-    BackHandler,
-    FlatList,
-    Image,
-    Keyboard,
-    KeyboardAvoidingView,
-    Modal,
-    Platform,
-    StatusBar,
-    Text,
-    TextInput,
-    TouchableOpacity,
-    View
+  ActivityIndicator,
+  Alert,
+  BackHandler,
+  FlatList,
+  Image,
+  Keyboard,
+  KeyboardAvoidingView,
+  Modal,
+  Platform,
+  StatusBar,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  View
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
@@ -158,7 +158,18 @@ export default function GroupChatScreen() {
         const existingById = seenById.get(msg.id);
         
         if (existingById) {
-          // Same ID exists - prefer the one with synced status or more complete data
+          // Same ID exists - check if they're truly identical (exact duplicate)
+          const isIdentical = 
+            (existingById.message || '') === (msg.message || '') &&
+            existingById.sender_id === msg.sender_id &&
+            existingById.created_at === msg.created_at;
+          
+          if (isIdentical) {
+            // Truly identical - skip this duplicate
+            continue;
+          }
+          
+          // Same ID but different content - prefer the one with synced status or more complete data
           const existingIsBetter = 
             (existingById.sync_status === 'synced' && msg.sync_status !== 'synced') ||
             (existingById.attachments && !msg.attachments) ||
@@ -428,20 +439,25 @@ export default function GroupChatScreen() {
   const isPaginatingRef = useRef<boolean>(false); // Track if user is currently paginating (loading older messages)
   const lastFocusTimeRef = useRef<number>(0); // Track when screen last gained focus
   
-  // Scroll management refs
-  const userScrolledRef = useRef<boolean>(false); // Track if user manually scrolled
+  // Precise scroll position tracking
   const isInitialLoadRef = useRef<boolean>(true); // Track if this is the initial load
-  const lastScrollOffsetRef = useRef<number>(0); // Track last scroll offset to detect user scrolling
-  const shouldAutoScrollRef = useRef<boolean>(true); // Flag to determine if auto-scroll should happen
+  const initialScrollCompleteRef = useRef<boolean>(false); // Track if initial scroll to bottom is complete
+  const lastScrollOffsetRef = useRef<number>(0); // Track last scroll offset for pagination
+  const isAtBottomRef = useRef<boolean>(true); // Track if user is at bottom
+  const lastVisibleMessageIdRef = useRef<number | null>(null); // Track last visible message ID for anchor
   const needsMarkAsReadRef = useRef<boolean>(false); // Track if mark-read needs retry when network comes back
+  
+  // Precise position tracking refs
+  const viewportHeightRef = useRef<number>(0); // Viewport/window height
+  const lastMessageHeightRef = useRef<number>(0); // Last message bubble height
+  const lastMessageYPositionRef = useRef<number>(0); // Last message's Y position from top of content
+  const targetBottomOffsetRef = useRef<number>(20); // Desired distance from bottom (20px padding)
+  const shouldMaintainPositionRef = useRef<boolean>(false); // Whether to maintain fixed position
+  const messageHeightsRef = useRef<Map<number | string, number>>(new Map()); // Track heights of all messages
   
   // Background sync state - for checking new messages (uses sync service + SQLite)
   const pollingIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const latestMessageIdRef = useRef<number | null>(null); // Track latest message ID to detect new messages
-  const scrollTimeoutRef = useRef<NodeJS.Timeout | null>(null); // Debounced scroll timeout to prevent multiple rapid scrolls
-  const contentSizeRef = useRef<{ width: number; height: number } | null>(null); // Track content size
-  const viewportSizeRef = useRef<{ width: number; height: number } | null>(null); // Track viewport size
-  const hasAttemptedInitialScrollRef = useRef<boolean>(false); // Track if we've attempted initial scroll
   const isPollingRef = useRef<boolean>(false); // Track if sync is active
   const POLLING_INTERVAL = 3000; // Sync every 3 seconds
   const MAX_RETRY_ATTEMPTS = 5; // Maximum retry attempts
@@ -538,7 +554,7 @@ export default function GroupChatScreen() {
         } else {
           // No cache available - show loading spinner
           if (showLoading) {
-            setLoading(true);
+      setLoading(true);
           }
         }
       } catch (cacheError) {
@@ -650,8 +666,8 @@ export default function GroupChatScreen() {
         messagesLengthRef.current = messagesWithStatus.length;
       } else {
         // Reload from DB to get merged data (includes sync_status)
-        // CRITICAL FIX: Merge DB messages with prev state, but deduplicate by server_id
-        // This prevents duplicates when polling has already added messages to state
+        // CRITICAL FIX: Check if DB messages are identical to current state before merging
+        // This prevents duplicates when fetchMessages reloads the same data
         const mergedMessages = await loadMessagesFromDb(MESSAGES_PER_PAGE, 0);
         
         if (mergedMessages.length > 0) {
@@ -659,9 +675,56 @@ export default function GroupChatScreen() {
             new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
           );
           
-          // CRITICAL FIX: Filter out messages from prev that are already in DB by server_id
-          // This handles the case where polling added messages that are now in DB
+          // CRITICAL FIX: Check if DB messages are identical to current state before merging
           setMessages(prev => {
+            // Create Sets for fast comparison
+            const prevIds = new Set(prev.map(m => m.id).filter(id => id != null && typeof id === 'number' && id < 1000000000000));
+            const dbIds = new Set(sorted.map(m => m.id).filter(id => id != null && typeof id === 'number' && id < 1000000000000));
+            
+            // Check if DB has the same messages as prev (by ID count and content)
+            const prevIdsArray = Array.from(prevIds);
+            const dbIdsArray = Array.from(dbIds);
+            const sameIds = prevIdsArray.length === dbIdsArray.length && 
+                            prevIdsArray.length > 0 &&
+                            prevIdsArray.every(id => dbIds.has(id));
+            
+            // If DB messages are identical to prev state, just return prev (no merge needed)
+            if (sameIds && prev.length === sorted.length) {
+              // Double-check by comparing a few key messages to ensure they're truly identical
+              const sampleSize = Math.min(5, sorted.length);
+              const sampleMatch = sorted.slice(0, sampleSize).every(dbMsg => {
+                const prevMsg = prev.find(p => p.id === dbMsg.id);
+                return prevMsg && 
+                       (prevMsg.message || '') === (dbMsg.message || '') &&
+                       prevMsg.sender_id === dbMsg.sender_id;
+              });
+              
+              if (sampleMatch) {
+                // DB messages are identical to prev state - no merge needed
+                // Just preserve any pending messages that might not be in DB yet
+                const pendingMessages = prev.filter(msg => 
+                  msg.sync_status === 'pending' && 
+                  typeof msg.id === 'number' && 
+                  msg.id > 1000000000000 &&
+                  !dbIds.has(msg.id)
+                );
+                
+                if (pendingMessages.length > 0) {
+                  // We have pending messages not in DB - merge them
+                  const allMessages = [...sorted, ...pendingMessages].sort((a, b) => 
+                    new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
+                  );
+                  const deduplicated = deduplicateMessages(allMessages);
+                  messagesLengthRef.current = deduplicated.length;
+                  return deduplicated;
+                }
+                
+                // No pending messages, return prev as-is (no duplicates)
+                return prev;
+              }
+            }
+            
+            // DB messages are different from prev - perform merge with deduplication
             // Create a Set of server_ids from DB messages for fast lookup
             const dbServerIds = new Set(sorted.map(msg => msg.id).filter(id => id != null));
             
@@ -736,7 +799,7 @@ export default function GroupChatScreen() {
       
       // Set loading to false - scroll will happen after content is rendered
       if (showLoading) {
-        setLoading(false);
+      setLoading(false);
       }
       
       // Reset scroll flag to allow initial scroll
@@ -781,8 +844,8 @@ export default function GroupChatScreen() {
       const hasExistingMessages = messagesLengthRef.current > 0;
       
       if (showLoading) {
-        setLoading(false);
-      }
+      setLoading(false);
+    }
       
       // Check if this is a network-related error that we should retry
       const isNetworkError = 
@@ -901,16 +964,52 @@ export default function GroupChatScreen() {
         if (newMessages.length > 0) {
           // Update UI with all messages from SQLite (ensures consistency)
           setMessages(prev => {
-            // Merge with existing messages, ensuring no duplicates
-            const existingIds = new Set(prev.map(m => m.id));
+            // CRITICAL FIX: Use comprehensive duplicate check (ID + content+sender+timestamp)
+            const existingIds = new Set(prev.map(m => m.id).filter(id => id != null));
+            const existingMessagesMap = new Map<number | string, Message>();
+            prev.forEach(m => {
+              if (m.id != null) {
+                existingMessagesMap.set(m.id, m);
+              }
+            });
+            
+            // Filter out messages that are truly duplicates
+            const uniqueNewMessages = newMessages.filter(newMsg => {
+              // Check 1: Same ID
+              if (newMsg.id != null && existingIds.has(newMsg.id)) {
+                return false; // Duplicate by ID
+              }
+              
+              // Check 2: Same content + sender + timestamp (within 1 second) - exact duplicate
+              const isExactDuplicate = prev.some(existing => {
+                if (existing.id === newMsg.id) return true; // Already checked above
+                
+                const timeDiff = Math.abs(
+                  new Date(existing.created_at).getTime() - new Date(newMsg.created_at).getTime()
+                );
+                const contentMatch = (existing.message || '') === (newMsg.message || '');
+                const senderMatch = existing.sender_id === newMsg.sender_id;
+                
+                // If same content, sender, and timestamp within 1 second, it's an exact duplicate
+                return contentMatch && senderMatch && timeDiff < 1000;
+              });
+              
+              return !isExactDuplicate;
+            });
+            
+            if (uniqueNewMessages.length === 0) {
+              return prev; // No new unique messages
+            }
+            
+            // Merge with existing messages
             const allUniqueMessages = [
-              ...prev.filter(msg => !newMessages.some(nm => nm.id === msg.id)), // Keep existing that aren't in new
-              ...newMessages // Add new messages
+              ...prev,
+              ...uniqueNewMessages
             ].sort((a: Message, b: Message) => 
               new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
             );
             
-            // Deduplicate to be safe
+            // CRITICAL: Always deduplicate (defense in depth)
             const deduplicated = deduplicateMessages(allUniqueMessages);
             
             // Update latest message ID
@@ -926,13 +1025,11 @@ export default function GroupChatScreen() {
           // Auto-scroll to bottom when receiving new messages
           // Only scroll if user is near bottom (hasn't manually scrolled up)
           // Prevent during initial load - onLayout handles initial scroll
-          if (shouldAutoScrollRef.current && !userScrolledRef.current && hasAttemptedInitialScrollRef.current) {
-            // Small delay to let state update complete
-            requestAnimationFrame(() => {
-              setTimeout(() => {
-                scrollToBottom(false, 0, false); // animated = false, delay = 0, force = false
-              }, 100);
-            });
+          // Auto-scroll to bottom when receiving new messages (only if user is at bottom)
+          // Position maintenance will be handled by onContentSizeChange
+          if (isAtBottomRef.current && !isInitialLoadRef.current) {
+            shouldMaintainPositionRef.current = true;
+            // onContentSizeChange will handle the scroll adjustment
           }
           
           if (__DEV__) {
@@ -979,7 +1076,7 @@ export default function GroupChatScreen() {
         pollingIntervalRef.current = null;
       }
     };
-  }, [id, loadingMore, sending, messages.length, dbInitialized, syncForNewMessages]);
+  }, [id, loadingMore, sending, dbInitialized, syncForNewMessages]); // CRITICAL FIX: Removed 'messages.length' to prevent stale closure
   
   // Start retry service on mount
   useEffect(() => {
@@ -1001,6 +1098,7 @@ export default function GroupChatScreen() {
     lastFocusTimeRef.current = 0; // Reset focus time
     latestMessageIdRef.current = null; // Reset latest message ID
     isPollingRef.current = false; // Reset sync flag
+    initialScrollCompleteRef.current = false; // Reset initial scroll flag
     
     // Clear sync interval
     if (pollingIntervalRef.current) {
@@ -1032,26 +1130,10 @@ export default function GroupChatScreen() {
     };
   }, []);
 
-  // Improved scroll to bottom function that uses content size to scroll to absolute bottom
+  // Simplified scroll to bottom function - maintainVisibleContentPosition handles most cases
   const scrollToBottom = useCallback((animated = false, delay = 0, force = false) => {
-    // Prevent scroll during initial load unless forced (onLayout handles initial scroll)
-    if (!force && !hasAttemptedInitialScrollRef.current) {
-      return;
-    }
-    
-    // Check if we should auto-scroll (unless forced)
-    if (!force && !shouldAutoScrollRef.current) {
-      return;
-    }
-    
     if (!flatListRef.current || messages.length === 0) {
       return;
-    }
-    
-    // Clear any pending scroll to prevent multiple rapid scrolls
-    if (scrollTimeoutRef.current) {
-      clearTimeout(scrollTimeoutRef.current);
-      scrollTimeoutRef.current = null;
     }
     
     const performScroll = () => {
@@ -1060,25 +1142,14 @@ export default function GroupChatScreen() {
       }
       
       try {
-        // If we have content size and viewport size, use scrollToOffset for precise positioning
-        if (contentSizeRef.current && viewportSizeRef.current) {
-          const contentHeight = contentSizeRef.current.height;
-          const viewportHeight = viewportSizeRef.current.height;
-          const targetOffset = Math.max(0, contentHeight - viewportHeight);
-          
-          (flatListRef.current as any).scrollToOffset({ 
-            offset: targetOffset, 
-            animated 
-          });
-          setHasScrolledToBottom(true);
-        } else {
-          // Fallback to scrollToEnd if sizes aren't available yet
-          (flatListRef.current as any).scrollToEnd({ animated });
-          setHasScrolledToBottom(true);
-        }
+        // Simply scroll to end - maintainVisibleContentPosition will handle position maintenance
+        (flatListRef.current as any).scrollToEnd({ animated });
+        setHasScrolledToBottom(true);
+        isAtBottomRef.current = true;
         
-        if (!force) {
-          shouldAutoScrollRef.current = false; // Reset after successful scroll
+        // Update anchor message when scrolling to bottom
+        if (messages.length > 0) {
+          lastVisibleMessageIdRef.current = messages[messages.length - 1].id;
         }
       } catch (error) {
         console.warn('Scroll failed:', error);
@@ -1086,25 +1157,26 @@ export default function GroupChatScreen() {
     };
     
     if (delay > 0) {
-      scrollTimeoutRef.current = setTimeout(performScroll, delay);
+      setTimeout(performScroll, delay);
     } else {
       requestAnimationFrame(performScroll);
     }
   }, [messages.length]);
 
-  // Scroll to bottom when messages are loaded or conversation changes
+  // Reset scroll state when conversation changes
   useEffect(() => {
-    // Reset scroll flag when conversation changes
     if (hasScrolledForThisConversation.current !== id) {
       hasScrolledForThisConversation.current = id as string;
       setHasScrolledToBottom(false);
       isInitialLoadRef.current = true;
-      userScrolledRef.current = false;
-      shouldAutoScrollRef.current = true;
+      isAtBottomRef.current = true;
+      shouldMaintainPositionRef.current = false; // Reset on conversation change
       lastScrollOffsetRef.current = 0;
-      hasAttemptedInitialScrollRef.current = false;
-      contentSizeRef.current = null;
-      viewportSizeRef.current = null;
+      lastVisibleMessageIdRef.current = null;
+      viewportHeightRef.current = 0;
+      lastMessageHeightRef.current = 0;
+      lastMessageYPositionRef.current = 0;
+      messageHeightsRef.current.clear(); // Clear message heights cache
     }
   }, [id]);
 
@@ -1156,14 +1228,12 @@ export default function GroupChatScreen() {
       const shouldResetScroll = !loadingMore && !isPaginatingRef.current && currentPage === 1;
       
       if (shouldResetScroll) {
-        // Reset scroll flag so we scroll to bottom after refresh
+        // Reset scroll flag on focus if at bottom or initial load
         setHasScrolledToBottom(false);
-        // Enable auto-scroll when conversation is focused
-        // Scroll will be handled by onContentSizeChange and onLayout
-        shouldAutoScrollRef.current = true;
+        isAtBottomRef.current = true;
       } else {
         // User is viewing old messages, don't auto-scroll
-        shouldAutoScrollRef.current = false;
+        isAtBottomRef.current = false;
       }
       
       fetchMessages(!hasExistingMessages);
@@ -1216,15 +1286,15 @@ export default function GroupChatScreen() {
               console.log('[GroupChat] Mark as read failed - network error, will retry when online');
             }
           } else {
-            // 429 = Too Many Requests (rate limit) - expected, handled gracefully
-            // 422 = Validation error - expected in some cases
-            // 404 = Not found - endpoint might not exist yet
-            // Only log unexpected errors in development
-            if (statusCode !== 429 && statusCode !== 422 && statusCode !== 404) {
-              if (__DEV__) {
-                console.error('Error marking group messages as read:', statusCode || error?.message || error);
-              }
+          // 429 = Too Many Requests (rate limit) - expected, handled gracefully
+          // 422 = Validation error - expected in some cases
+          // 404 = Not found - endpoint might not exist yet
+          // Only log unexpected errors in development
+          if (statusCode !== 429 && statusCode !== 422 && statusCode !== 404) {
+            if (__DEV__) {
+              console.error('Error marking group messages as read:', statusCode || error?.message || error);
             }
+          }
           }
         }
       };
@@ -1296,8 +1366,8 @@ export default function GroupChatScreen() {
     
     // CRITICAL FIX: Disable auto-scroll when loading older messages
     // User wants to stay at the top viewing old messages
-    shouldAutoScrollRef.current = false;
-    userScrolledRef.current = true; // Mark as user-initiated (viewing old messages)
+    isAtBottomRef.current = false;
+    shouldMaintainPositionRef.current = false; // Don't maintain position when loading older messages
     isPaginatingRef.current = true; // Mark that we're paginating
     setLoadingMore(true);
     try {
@@ -1415,17 +1485,17 @@ export default function GroupChatScreen() {
     }
     
     setSending(true);
-    
+      
     // Prepare message text
-    let messageText = input.trim();
-    if (attachment && !messageText) {
-      if (attachment.type?.startsWith('image/') || attachment.isImage) {
-        messageText = '[IMAGE]';
-      } else {
-        messageText = '[FILE]';
+      let messageText = input.trim();
+      if (attachment && !messageText) {
+        if (attachment.type?.startsWith('image/') || attachment.isImage) {
+          messageText = '[IMAGE]';
+        } else {
+          messageText = '[FILE]';
+        }
       }
-    }
-    
+      
     if (voiceRecording) {
       const voiceMessage = `[VOICE_MESSAGE:${voiceRecording.duration}]`;
       messageText = messageText ? `${messageText} ${voiceMessage}` : voiceMessage;
@@ -1534,9 +1604,12 @@ export default function GroupChatScreen() {
           latestMessageIdRef.current = latestMsg.id;
         }
         
-        // Scroll to bottom
-        shouldAutoScrollRef.current = true;
-        userScrolledRef.current = false;
+        // Scroll to bottom after sending
+        isAtBottomRef.current = true;
+        shouldMaintainPositionRef.current = true;
+        if (uniqueMessages.length > 0) {
+          lastVisibleMessageIdRef.current = uniqueMessages[uniqueMessages.length - 1].id;
+        }
         requestAnimationFrame(() => {
           setTimeout(() => {
             if (flatListRef.current) {
@@ -1620,38 +1693,38 @@ export default function GroupChatScreen() {
           }
           
           let formData = new FormData();
-          formData.append('group_id', id as string);
-          
-          if (replyingTo) {
-            formData.append('reply_to_id', replyingTo.id.toString());
-          }
-          
-          if (attachment) {
-            formData.append('attachments[]', {
-              uri: attachment.uri,
-              name: attachment.name,
-              type: attachment.type,
-            } as any);
-          }
-          
-          if (messageText && !voiceRecording) {
+      formData.append('group_id', id as string);
+      
+      if (replyingTo) {
+        formData.append('reply_to_id', replyingTo.id.toString());
+      }
+      
+      if (attachment) {
+        formData.append('attachments[]', {
+          uri: attachment.uri,
+          name: attachment.name,
+          type: attachment.type,
+        } as any);
+      }
+      
+      if (messageText && !voiceRecording) {
+        formData.append('message', messageText);
+      }
+      
+      if (voiceRecording) {
             formData.append('message', messageText);
-          }
-          
-          if (voiceRecording) {
-            formData.append('message', messageText);
-            formData.append('attachments[]', {
-              uri: voiceRecording.uri,
-              name: 'voice_message.m4a',
-              type: 'audio/m4a',
-            } as any);
-            formData.append('voice_duration', voiceRecording.duration.toString());
-            formData.append('is_voice_message', 'true');
-          }
-          
+        formData.append('attachments[]', {
+          uri: voiceRecording.uri,
+          name: 'voice_message.m4a',
+          type: 'audio/m4a',
+        } as any);
+        formData.append('voice_duration', voiceRecording.duration.toString());
+        formData.append('is_voice_message', 'true');
+      }
+      
           // Send to API
-          const res = await messagesAPI.sendMessage(formData);
-          
+      const res = await messagesAPI.sendMessage(formData);
+      
           // CRITICAL: Log response structure for debugging in production
           if (__DEV__ || process.env.EXPO_PUBLIC_DEBUG_API === 'true') {
             console.log('[GroupChat] API Response:', {
@@ -1693,7 +1766,7 @@ export default function GroupChatScreen() {
               await updateMessageStatus(tempLocalId, messageId, 'synced', serverCreatedAt);
               
               // Update UI message with server ID and server timestamp, checking for duplicates
-              setMessages(prev => {
+      setMessages(prev => {
                 // Check if message with server ID already exists (from a sync)
                 const existingIds = new Set(prev.map(m => m.id));
                 const serverIdExists = existingIds.has(messageId);
@@ -1791,7 +1864,7 @@ export default function GroupChatScreen() {
           // Trigger immediate retry for network/server errors
           if (isNetworkError || (apiError.response?.status >= 500)) {
             // Network/server error - trigger immediate retry after short delay
-            setTimeout(() => {
+          setTimeout(() => {
               retryPendingMessages().catch(err => {
                 if (__DEV__) {
                   console.error('[GroupChat] Immediate retry failed:', err);
@@ -1809,11 +1882,11 @@ export default function GroupChatScreen() {
       console.error('[GroupChat] Error in handleSend:', error);
       setSending(false);
       
-      Alert.alert(
+          Alert.alert(
         'Error',
         'Failed to save message. Please try again.',
-        [{ text: 'OK' }]
-      );
+            [{ text: 'OK' }]
+          );
     }
   };
 
@@ -2158,6 +2231,7 @@ export default function GroupChatScreen() {
     const isMine = senderId === currentUserId && senderId !== 0;
     const previousMessage = index > 0 ? messages[index - 1] : null;
     const showDateSeparator = shouldShowDateSeparator(item, previousMessage);
+    const isLastMessage = index === messages.length - 1; // Track if this is the last message
     
     const timestamp = formatMessageTime(item.created_at);
 
@@ -2421,6 +2495,37 @@ export default function GroupChatScreen() {
           activeOpacity={0.8}
         >
           <View
+            onLayout={(event) => {
+              // Measure message height for precise scroll calculations
+              const { height, y } = event.nativeEvent.layout;
+              messageHeightsRef.current.set(item.id, height);
+              
+              // If this is the last message, track its position and height
+              if (isLastMessage) {
+                lastMessageHeightRef.current = height;
+                lastMessageYPositionRef.current = y;
+                
+                // Calculate target scroll offset to keep message at fixed position from bottom
+                if (viewportHeightRef.current > 0 && shouldMaintainPositionRef.current) {
+                  // Calculate the exact offset needed to keep last message at targetBottomOffsetRef from bottom
+                  const targetScrollOffset = y + height + targetBottomOffsetRef.current - viewportHeightRef.current;
+                  
+                  // Apply scroll offset after a small delay to ensure layout is complete
+                  setTimeout(() => {
+                    if (flatListRef.current && shouldMaintainPositionRef.current) {
+                      try {
+                        flatListRef.current.scrollToOffset({
+                          offset: Math.max(0, targetScrollOffset),
+                          animated: false
+                        });
+                      } catch (error) {
+                        // Silently handle - scroll might not be ready yet
+                      }
+                    }
+                  }, 10);
+                }
+              }
+            }}
             style={{
               backgroundColor: isMine ? '#25D366' : (isDark ? '#374151' : '#E5E7EB'),
               borderRadius: 18,
@@ -3042,9 +3147,9 @@ export default function GroupChatScreen() {
               style={{ flex: 1 }}
             >
               <FlatList
-              ref={flatListRef}
-              data={messages}
-              renderItem={renderItem}
+                ref={flatListRef}
+                data={messages}
+                renderItem={renderItem}
               initialNumToRender={30}
               windowSize={10}
               maxToRenderPerBatch={15}
@@ -3080,45 +3185,44 @@ export default function GroupChatScreen() {
                   padding: 16, 
                   paddingBottom: 0, // Let KeyboardAvoidingView handle spacing
                 }}
-                inverted={false} // Make sure it's not inverted
+                inverted={false} // Normal scrolling - scroll down to see older messages
                 keyboardShouldPersistTaps="handled"
                 keyboardDismissMode={Platform.OS === 'ios' ? 'interactive' : 'on-drag'}
+              // CRITICAL: Maintain scroll position relative to last visible message
+              // This handles image loading, polling refetch, and content changes automatically
+              maintainVisibleContentPosition={
+                initialScrollCompleteRef.current ? {
+                  minIndexForVisible: 0, // Start maintaining from first item
+                  autoscrollToTopThreshold: 10, // Auto-scroll to top if less than 10 items visible
+                } : undefined
+              }
               onScroll={({ nativeEvent }) => {
                 const { contentOffset, contentSize, layoutMeasurement } = nativeEvent;
                 
-                // Track content and viewport sizes for precise scrolling
-                contentSizeRef.current = { width: contentSize.width, height: contentSize.height };
-                viewportSizeRef.current = { width: layoutMeasurement.width, height: layoutMeasurement.height };
+                // Track viewport height for precise calculations
+                viewportHeightRef.current = layoutMeasurement.height;
                 
-                // Detect user scrolling to manage auto-scroll
+                // Track scroll offset for pagination
                 const currentOffset = contentOffset.y;
-                const contentHeight = contentSize.height;
-                const viewportHeight = layoutMeasurement.height;
-                const previousOffset = lastScrollOffsetRef.current;
-                
-                // Check if user is near bottom (within 100 pixels)
-                const distanceFromBottom = contentHeight - (currentOffset + viewportHeight);
-                const isNearBottom = distanceFromBottom < 100;
-                
-                // Detect if this is a user-initiated scroll (not programmatic)
-                // If offset changed significantly and we're not near bottom, user scrolled
-                if (previousOffset !== 0 && Math.abs(currentOffset - previousOffset) > 10) {
-                  if (!isNearBottom) {
-                    // User scrolled away from bottom (viewing old messages)
-                    userScrolledRef.current = true;
-                    shouldAutoScrollRef.current = false;
-                  } else {
-                    // User scrolled back to bottom - only enable auto-scroll if not loading more
-                    if (!loadingMore && !isPaginatingRef.current) {
-                      userScrolledRef.current = false;
-                      shouldAutoScrollRef.current = true;
-                    }
-                  }
-                }
-                
                 lastScrollOffsetRef.current = currentOffset;
                 
-                // Load more messages when at top (existing functionality)
+                // Calculate if user is at bottom (within 50px threshold)
+                const contentHeight = contentSize.height;
+                const viewportHeight = layoutMeasurement.height;
+                const distanceFromBottom = contentHeight - (currentOffset + viewportHeight);
+                const isAtBottom = distanceFromBottom <= 50;
+                
+                // Update anchor message and position maintenance flag when user is at bottom
+                if (isAtBottom && messages.length > 0) {
+                  isAtBottomRef.current = true;
+                  shouldMaintainPositionRef.current = true;
+                  lastVisibleMessageIdRef.current = messages[messages.length - 1].id;
+                } else {
+                  isAtBottomRef.current = false;
+                  shouldMaintainPositionRef.current = false;
+                }
+                
+                // Load more messages when at top (pagination)
                 const isAtTop = contentOffset.y <= 50;
                 const now = Date.now();
                 if (isAtTop && hasMoreMessages && !loadingMore && (now - lastScrollTrigger > 2000)) {
@@ -3149,123 +3253,61 @@ export default function GroupChatScreen() {
                 ) : null
               }
               onContentSizeChange={(contentWidth, contentHeight) => {
-                // Track content size for precise scrolling
-                const previousContentHeight = contentSizeRef.current?.height || 0;
-                contentSizeRef.current = { width: contentWidth, height: contentHeight };
-                
-                // CRITICAL FIX: Don't scroll if:
-                // 1. Loading more messages (pagination) - user is viewing old messages at top
-                // 2. User has scrolled away from bottom
-                // 3. Still in initial load period
-                // 4. Content size decreased or didn't increase significantly (images unloading, not new messages)
-                const contentIncreased = contentHeight > previousContentHeight + 10; // At least 10px increase
-                
-                if (loadingMore || 
-                    loading || 
-                    userScrolledRef.current || 
-                    isInitialLoadRef.current || 
-                    !hasAttemptedInitialScrollRef.current ||
-                    !contentIncreased ||
-                    isPaginatingRef.current) {
-                  // Don't scroll - user is viewing old messages or content is shrinking
-                  return;
-                }
-                
-                // Only scroll if we're near bottom and content increased (new messages at bottom)
-                if (shouldAutoScrollRef.current && messages.length > 0) {
-                  // Check if we're near bottom before scrolling
-                  if (viewportSizeRef.current && lastScrollOffsetRef.current > 0) {
-                    const currentOffset = lastScrollOffsetRef.current;
-                    const viewportHeight = viewportSizeRef.current.height;
-                    const distanceFromBottom = contentHeight - (currentOffset + viewportHeight);
-                    const isNearBottom = distanceFromBottom < 200; // Within 200px of bottom
-                    
-                    if (!isNearBottom) {
-                      // User is not near bottom, don't auto-scroll
-                      return;
-                    }
-                  }
+                // Maintain fixed position of last message when content changes (polling, refetch, image loading)
+                if (shouldMaintainPositionRef.current && 
+                    !isInitialLoadRef.current && 
+                    initialScrollCompleteRef.current &&
+                    lastMessageHeightRef.current > 0 && 
+                    viewportHeightRef.current > 0 &&
+                    messages.length > 0) {
                   
-                  // Clear any pending scroll
-                  if (scrollTimeoutRef.current) {
-                    clearTimeout(scrollTimeoutRef.current);
-                  }
+                  // Calculate exact scroll offset to keep last message at fixed position from bottom
+                  // Formula: contentHeight - viewportHeight - targetBottomOffset
+                  const targetScrollOffset = contentHeight - viewportHeightRef.current - targetBottomOffsetRef.current;
                   
-                  // Wait for viewport size to be available, then scroll to absolute bottom
-                  scrollTimeoutRef.current = setTimeout(() => {
-                    if (flatListRef.current && messages.length > 0 && shouldAutoScrollRef.current && !userScrolledRef.current && !loadingMore && !isPaginatingRef.current) {
+                  setTimeout(() => {
+                    if (flatListRef.current && shouldMaintainPositionRef.current) {
                       try {
-                        // Use scrollToOffset for precise positioning if we have viewport size
-                        if (viewportSizeRef.current && contentSizeRef.current) {
-                          const targetOffset = Math.max(0, contentSizeRef.current.height - viewportSizeRef.current.height);
-                          (flatListRef.current as any).scrollToOffset({
-                            offset: targetOffset,
-                            animated: false
-                          });
-                        } else {
-                          // Fallback to scrollToEnd
-                          (flatListRef.current as any).scrollToEnd({ animated: false });
-                        }
-                        setHasScrolledToBottom(true);
-                        // Note: Don't set hasAttemptedInitialScrollRef here - onLayout handles initial scroll
+                        flatListRef.current.scrollToOffset({
+                          offset: Math.max(0, targetScrollOffset),
+                          animated: false
+                        });
                       } catch (error) {
-                        console.warn('Scroll failed:', error);
+                        // Silently handle - might be during layout
                       }
                     }
-                  }, 150);
+                  }, 50); // Small delay to ensure layout is complete
+                }
+                
+                // Initial scroll to bottom on first load - scroll to show latest message at bottom
+                if (isInitialLoadRef.current && !loading && messages.length > 0 && !initialScrollCompleteRef.current) {
+                  setTimeout(() => {
+                    if (flatListRef.current && messages.length > 0) {
+                      try {
+                        // Scroll to end to show latest message at bottom (before input)
+                        flatListRef.current.scrollToEnd({ animated: false });
+                        
+                        initialScrollCompleteRef.current = true;
+                        isInitialLoadRef.current = false;
+                        setHasScrolledToBottom(true);
+                        isAtBottomRef.current = true;
+                        shouldMaintainPositionRef.current = true;
+                        if (messages.length > 0) {
+                          lastVisibleMessageIdRef.current = messages[messages.length - 1].id;
+                        }
+                      } catch (error) {
+                        // Mark as complete even if scroll fails
+                        initialScrollCompleteRef.current = true;
+                        isInitialLoadRef.current = false;
+                      }
+                    }
+                  }, 100);
                 }
               }}
               onLayout={(event) => {
-                // Track viewport size when layout is ready
-                const { width, height } = event.nativeEvent.layout;
-                viewportSizeRef.current = { width, height };
-                
-                // Scroll to bottom when layout is ready (only on initial load, once)
-                if (!loading && messages.length > 0 && isInitialLoadRef.current && shouldAutoScrollRef.current && !hasAttemptedInitialScrollRef.current) {
-                  // Set flag immediately to block onContentSizeChange from scrolling during initial load
-                  hasAttemptedInitialScrollRef.current = true;
-                  
-                  // Clear any pending scroll
-                  if (scrollTimeoutRef.current) {
-                    clearTimeout(scrollTimeoutRef.current);
-                  }
-                  
-                  // Wait for content to be measured, then scroll to absolute bottom
-                  scrollTimeoutRef.current = setTimeout(() => {
-                    if (flatListRef.current && messages.length > 0 && isInitialLoadRef.current) {
-                      try {
-                        // Use scrollToOffset for precise positioning if we have both sizes
-                        if (viewportSizeRef.current && contentSizeRef.current) {
-                          const targetOffset = Math.max(0, contentSizeRef.current.height - viewportSizeRef.current.height);
-                          (flatListRef.current as any).scrollToOffset({ 
-                            offset: targetOffset, 
-                            animated: false 
-                          });
-                        } else {
-                          // Fallback: try scrollToEnd, or scroll to last index
-                          try {
-                            (flatListRef.current as any).scrollToEnd({ animated: false });
-                          } catch (e) {
-                            // Last resort: scroll to last message index
-                            const lastIndex = messages.length - 1;
-                            if (lastIndex >= 0) {
-                              (flatListRef.current as any).scrollToIndex({ 
-                                index: lastIndex, 
-                                animated: false,
-                                viewPosition: 1
-                              });
-                            }
-                          }
-                        }
-                        setHasScrolledToBottom(true);
-                        isInitialLoadRef.current = false;
-                        // Note: hasAttemptedInitialScrollRef was set earlier to block competing scrolls
-                      } catch (error) {
-                        console.warn('Initial scroll failed:', error);
-                      }
-                    }
-                  }, 400);
-                }
+                // Track viewport height when layout changes
+                const { height } = event.nativeEvent.layout;
+                viewportHeightRef.current = height;
               }}
             />
           </TouchableOpacity>
@@ -3296,8 +3338,8 @@ export default function GroupChatScreen() {
                   <MaterialCommunityIcons name="close-circle" size={24} color="#6B7280" />
                 </TouchableOpacity>
               </View>
-            )}
-            
+        )}
+        
             {/* Reply Preview */}
             {replyingTo && !editingMessage && (
               <ReplyPreview
@@ -3361,12 +3403,12 @@ export default function GroupChatScreen() {
             <View
               style={{
                 backgroundColor: isDark ? '#1F2937' : '#FFFFFF',
-            paddingHorizontal: 16,
-            paddingVertical: 8,
-            paddingBottom: Platform.OS === 'android' 
-              ? Math.max(insets.bottom, 8) // ✅ Always use safe area padding, let KeyboardAvoidingView handle keyboard
+                paddingHorizontal: 16,
+                paddingVertical: 8,
+                paddingBottom: Platform.OS === 'android' 
+              ? (keyboardHeight > 0 ? 0 : Math.max(insets.bottom, 8)) // ✅ No padding when keyboard is open - KeyboardAvoidingView handles it
               : (keyboardHeight > 0 ? 8 : Math.max(insets.bottom, 16)), // ✅ iOS keeps keyboard-aware padding
-            borderTopWidth: 1,
+                borderTopWidth: 1,
                 borderTopColor: isDark ? '#374151' : '#E5E7EB',
               }}
             >
@@ -3383,19 +3425,19 @@ export default function GroupChatScreen() {
               >
                 {/* Emoji Button - Hide when editing */}
                 {!editingMessage && (
-                  <TouchableOpacity 
-                    onPress={() => setShowEmoji(v => !v)} 
-                    style={{ 
-                      width: 42, 
-                      height: 42, 
-                      borderRadius: 21, 
-                      alignItems: 'center', 
-                      justifyContent: 'center',
-                      marginRight: 4,
-                    }}
-                  >
-                    <MaterialCommunityIcons name="emoticon-outline" size={24} color="#6B7280" />
-                  </TouchableOpacity>
+                <TouchableOpacity 
+                  onPress={() => setShowEmoji(v => !v)} 
+                  style={{ 
+                    width: 42, 
+                    height: 42, 
+                    borderRadius: 21, 
+                    alignItems: 'center', 
+                    justifyContent: 'center',
+                    marginRight: 4,
+                  }}
+                >
+                  <MaterialCommunityIcons name="emoticon-outline" size={24} color="#6B7280" />
+                </TouchableOpacity>
                 )}
 
                 {/* Text Input */}
@@ -3424,36 +3466,36 @@ export default function GroupChatScreen() {
 
                 {/* Gallery Button - Hide when editing */}
                 {!editingMessage && (
-                  <TouchableOpacity 
-                    onPress={pickImage} 
-                    style={{ 
-                      width: 42,
-                      height: 42,
-                      borderRadius: 21,
-                      alignItems: 'center',
-                      justifyContent: 'center',
-                      marginRight: 4,
-                    }}
-                  >
-                    <MaterialCommunityIcons name="image" size={24} color="#6B7280" />
-                  </TouchableOpacity>
+                <TouchableOpacity 
+                  onPress={pickImage} 
+                  style={{ 
+                    width: 42,
+                    height: 42,
+                    borderRadius: 21,
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    marginRight: 4,
+                  }}
+                >
+                  <MaterialCommunityIcons name="image" size={24} color="#6B7280" />
+                </TouchableOpacity>
                 )}
 
                 {/* Attachment Button - Hide when editing */}
                 {!editingMessage && (
-                  <TouchableOpacity 
-                    onPress={pickFile} 
-                    style={{ 
-                      width: 42, 
-                      height: 42, 
-                      borderRadius: 21, 
-                      alignItems: 'center', 
-                      justifyContent: 'center',
-                      marginRight: 4,
-                    }}
-                  >
-                    <MaterialCommunityIcons name="paperclip" size={24} color="#6B7280" />
-                  </TouchableOpacity>
+                <TouchableOpacity 
+                  onPress={pickFile} 
+                  style={{ 
+                    width: 42, 
+                    height: 42, 
+                    borderRadius: 21, 
+                    alignItems: 'center', 
+                    justifyContent: 'center',
+                    marginRight: 4,
+                  }}
+                >
+                  <MaterialCommunityIcons name="paperclip" size={24} color="#6B7280" />
+                </TouchableOpacity>
                 )}
 
                 {/* Send/Mic/Edit Button */}
