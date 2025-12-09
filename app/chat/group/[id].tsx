@@ -176,6 +176,9 @@ export default function GroupChatScreen() {
         
         // New ID, add it
         seenById.set(msg.id, msg);
+        // CRITICAL FIX: Also add to seenMessages immediately so content+sender check can find it
+        const messageKey = `${msg.id}_${msg.created_at}_${msg.message || ''}`;
+        seenMessages.set(messageKey, msg);
       }
       
       // Secondary deduplication: Check by content+sender for messages with same content
@@ -185,79 +188,71 @@ export default function GroupChatScreen() {
       const messageTime = new Date(msg.created_at).getTime();
       const senderId = msg.sender_id;
       
-      // Check if we already have this message by content+sender
+      // CRITICAL FIX: Check BOTH seenById AND seenMessages for content+sender duplicates
+      // This ensures we catch duplicates even if one is in seenById and one is in seenMessages
       let foundDuplicate = false;
-      for (const [key, existing] of seenMessages.entries()) {
+      
+      // First check seenById for duplicates (messages with IDs)
+      for (const existing of seenById.values()) {
+        if (existing.id === msg.id) continue; // Skip self
         const existingTime = new Date(existing.created_at).getTime();
         const timeDiff = Math.abs(existingTime - messageTime);
         const contentMatch = (existing.message || '') === messageContent;
         const senderMatch = existing.sender_id === senderId;
         
-        // CRITICAL FIX: For messages with same content+sender, check if they're duplicates
-        // regardless of timestamp if:
-        // 1. Both have server_id (synced messages) - match by content+sender only
-        // 2. One has tempLocalId and one has server_id - match if within reasonable time window
         if (contentMatch && senderMatch) {
           const msgHasServerId = msg.id && typeof msg.id === 'number' && msg.id < 1000000000000;
           const existingHasServerId = existing.id && typeof existing.id === 'number' && existing.id < 1000000000000;
           
-          // Case 1: Both have server_id - match regardless of timestamp (they're the same message)
+          // Case 1: Both have server_id - match regardless of timestamp
           if (msgHasServerId && existingHasServerId) {
-            // Same content, same sender, both synced - they're duplicates
-            // Prefer the one with more recent timestamp or better sync status
+            // Prefer the one with better sync status or newer timestamp
             if (msg.sync_status === 'synced' && existing.sync_status !== 'synced') {
-              seenMessages.delete(key);
+              seenById.delete(existing.id);
+              seenById.set(msg.id, msg);
+              const existingKey = `${existing.id}_${existing.created_at}_${messageContent}`;
               const newKey = `${msg.id}_${msg.created_at}_${messageContent}`;
+              seenMessages.delete(existingKey);
               seenMessages.set(newKey, msg);
-              if (existing.id && seenById.has(existing.id)) {
-                seenById.delete(existing.id);
-                seenById.set(msg.id, msg);
-              }
             } else if (messageTime > existingTime && msg.sync_status === 'synced') {
-              // Prefer newer timestamp if both are synced
-              seenMessages.delete(key);
+              seenById.delete(existing.id);
+              seenById.set(msg.id, msg);
+              const existingKey = `${existing.id}_${existing.created_at}_${messageContent}`;
               const newKey = `${msg.id}_${msg.created_at}_${messageContent}`;
+              seenMessages.delete(existingKey);
               seenMessages.set(newKey, msg);
-              if (existing.id && seenById.has(existing.id)) {
-                seenById.delete(existing.id);
-                seenById.set(msg.id, msg);
-              }
             }
             foundDuplicate = true;
             break;
           }
           
           // Case 2: One has tempLocalId, one has server_id - match if within 10 minutes
-          // (allows for network delays and clock differences)
           if ((msgHasServerId && !existingHasServerId) || (!msgHasServerId && existingHasServerId)) {
             if (timeDiff < 600000) { // 10 minutes window
-              // Prefer the one with server_id (synced) over tempLocalId (pending)
+              // Prefer the one with server_id (synced)
               if (msg.sync_status === 'synced' && existing.sync_status !== 'synced') {
-                seenMessages.delete(key);
+                seenById.delete(existing.id);
+                seenById.set(msg.id, msg);
+                const existingKey = `${existing.id}_${existing.created_at}_${messageContent}`;
                 const newKey = `${msg.id}_${msg.created_at}_${messageContent}`;
+                seenMessages.delete(existingKey);
                 seenMessages.set(newKey, msg);
-                if (existing.id && seenById.has(existing.id)) {
-                  seenById.delete(existing.id);
-                  seenById.set(msg.id, msg);
-                }
               }
               foundDuplicate = true;
               break;
             }
           }
           
-          // Case 3: Both have tempLocalId - match if within 5 seconds (same send attempt)
+          // Case 3: Both have tempLocalId - match if within 5 seconds
           if (!msgHasServerId && !existingHasServerId) {
             if (timeDiff < 5000) {
-              // Prefer the one with better sync status
               if (msg.sync_status === 'synced' && existing.sync_status !== 'synced') {
-                seenMessages.delete(key);
+                seenById.delete(existing.id);
+                seenById.set(msg.id, msg);
+                const existingKey = `${existing.id}_${existing.created_at}_${messageContent}`;
                 const newKey = `${msg.id}_${msg.created_at}_${messageContent}`;
+                seenMessages.delete(existingKey);
                 seenMessages.set(newKey, msg);
-                if (existing.id && seenById.has(existing.id)) {
-                  seenById.delete(existing.id);
-                  seenById.set(msg.id, msg);
-                }
               }
               foundDuplicate = true;
               break;
@@ -266,11 +261,92 @@ export default function GroupChatScreen() {
         }
       }
       
+      // Then check seenMessages for duplicates (if not found in seenById)
       if (!foundDuplicate) {
-        // Create composite key for deduplication
-        const messageKey = msg.id 
-          ? `${msg.id}_${msg.created_at}_${messageContent}` 
-          : `${msg.created_at}_${messageContent}_${senderId}`;
+        for (const [key, existing] of seenMessages.entries()) {
+          const existingTime = new Date(existing.created_at).getTime();
+          const timeDiff = Math.abs(existingTime - messageTime);
+          const contentMatch = (existing.message || '') === messageContent;
+          const senderMatch = existing.sender_id === senderId;
+          
+          // CRITICAL FIX: For messages with same content+sender, check if they're duplicates
+          // regardless of timestamp if:
+          // 1. Both have server_id (synced messages) - match by content+sender only
+          // 2. One has tempLocalId and one has server_id - match if within reasonable time window
+          if (contentMatch && senderMatch) {
+            const msgHasServerId = msg.id && typeof msg.id === 'number' && msg.id < 1000000000000;
+            const existingHasServerId = existing.id && typeof existing.id === 'number' && existing.id < 1000000000000;
+            
+            // Case 1: Both have server_id - match regardless of timestamp (they're the same message)
+            if (msgHasServerId && existingHasServerId) {
+              // Same content, same sender, both synced - they're duplicates
+              // Prefer the one with more recent timestamp or better sync status
+              if (msg.sync_status === 'synced' && existing.sync_status !== 'synced') {
+                seenMessages.delete(key);
+                const newKey = `${msg.id}_${msg.created_at}_${messageContent}`;
+                seenMessages.set(newKey, msg);
+                if (existing.id && seenById.has(existing.id)) {
+                  seenById.delete(existing.id);
+                  seenById.set(msg.id, msg);
+                }
+              } else if (messageTime > existingTime && msg.sync_status === 'synced') {
+                // Prefer newer timestamp if both are synced
+                seenMessages.delete(key);
+                const newKey = `${msg.id}_${msg.created_at}_${messageContent}`;
+                seenMessages.set(newKey, msg);
+                if (existing.id && seenById.has(existing.id)) {
+                  seenById.delete(existing.id);
+                  seenById.set(msg.id, msg);
+                }
+              }
+              foundDuplicate = true;
+              break;
+            }
+            
+            // Case 2: One has tempLocalId, one has server_id - match if within 10 minutes
+            // (allows for network delays and clock differences)
+            if ((msgHasServerId && !existingHasServerId) || (!msgHasServerId && existingHasServerId)) {
+              if (timeDiff < 600000) { // 10 minutes window
+                // Prefer the one with server_id (synced) over tempLocalId (pending)
+                if (msg.sync_status === 'synced' && existing.sync_status !== 'synced') {
+                  seenMessages.delete(key);
+                  const newKey = `${msg.id}_${msg.created_at}_${messageContent}`;
+                  seenMessages.set(newKey, msg);
+                  if (existing.id && seenById.has(existing.id)) {
+                    seenById.delete(existing.id);
+                    seenById.set(msg.id, msg);
+                  }
+                }
+                foundDuplicate = true;
+                break;
+              }
+            }
+            
+            // Case 3: Both have tempLocalId - match if within 5 seconds (same send attempt)
+            if (!msgHasServerId && !existingHasServerId) {
+              if (timeDiff < 5000) {
+                // Prefer the one with better sync status
+                if (msg.sync_status === 'synced' && existing.sync_status !== 'synced') {
+                  seenMessages.delete(key);
+                  const newKey = `${msg.id}_${msg.created_at}_${messageContent}`;
+                  seenMessages.set(newKey, msg);
+                  if (existing.id && seenById.has(existing.id)) {
+                    seenById.delete(existing.id);
+                    seenById.set(msg.id, msg);
+                  }
+                }
+                foundDuplicate = true;
+                break;
+              }
+            }
+          }
+        }
+      }
+      
+      // Only add to seenMessages if not already added (messages with IDs are already added above)
+      if (!foundDuplicate && (!msg.id || msg.id === undefined || msg.id === null || msg.id === 0)) {
+        // Create composite key for deduplication (only for messages without IDs)
+        const messageKey = `${msg.created_at}_${messageContent}_${senderId}`;
         seenMessages.set(messageKey, msg);
       }
     }
@@ -574,7 +650,8 @@ export default function GroupChatScreen() {
         messagesLengthRef.current = messagesWithStatus.length;
       } else {
         // Reload from DB to get merged data (includes sync_status)
-        // FIX: Don't merge with prev state - DB is source of truth after sync
+        // CRITICAL FIX: Merge DB messages with prev state, but deduplicate by server_id
+        // This prevents duplicates when polling has already added messages to state
         const mergedMessages = await loadMessagesFromDb(MESSAGES_PER_PAGE, 0);
         
         if (mergedMessages.length > 0) {
@@ -582,28 +659,44 @@ export default function GroupChatScreen() {
             new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
           );
           
-          // FIX: Only get truly pending messages from prev state (not synced ones)
+          // CRITICAL FIX: Filter out messages from prev that are already in DB by server_id
+          // This handles the case where polling added messages that are now in DB
           setMessages(prev => {
-            // Get ONLY pending messages that don't have server_id yet
-            const trulyPendingMessages = prev.filter(msg => 
-              msg.sync_status === 'pending' && 
-              typeof msg.id === 'number' && 
-              msg.id > 1000000000000 && // tempLocalId is timestamp-based
-              !sorted.some(dbMsg => {
-                // Check if this pending message matches a DB message by content+sender
-                // This handles tempLocalId -> server_id mapping
-                const timeDiff = Math.abs(
-                  new Date(dbMsg.created_at).getTime() - new Date(msg.created_at).getTime()
-                );
-                const messageMatch = (dbMsg.message || '') === (msg.message || '');
-                const senderMatch = dbMsg.sender_id === msg.sender_id;
-                
-                return messageMatch && senderMatch && timeDiff < 10000; // 10 second window
-              })
-            );
+            // Create a Set of server_ids from DB messages for fast lookup
+            const dbServerIds = new Set(sorted.map(msg => msg.id).filter(id => id != null));
             
-            // Combine DB messages with truly pending messages
-            const allMessages = [...sorted, ...trulyPendingMessages];
+            // Filter out messages from prev that are already in DB by server_id
+            const prevMessagesNotInDb = prev.filter(msg => {
+              // If message has a server_id, check if it's already in DB
+              if (msg.id && typeof msg.id === 'number' && msg.id < 1000000000000) {
+                // This is a synced message - exclude it if it's already in DB
+                return !dbServerIds.has(msg.id);
+              }
+              
+              // If message has tempLocalId (pending), check if it matches a DB message
+              if (msg.sync_status === 'pending' && 
+                  typeof msg.id === 'number' && 
+                  msg.id > 1000000000000) {
+                // Check if this pending message matches a DB message by content+sender
+                const matchesDb = sorted.some(dbMsg => {
+                  const timeDiff = Math.abs(
+                    new Date(dbMsg.created_at).getTime() - new Date(msg.created_at).getTime()
+                  );
+                  const messageMatch = (dbMsg.message || '') === (msg.message || '');
+                  const senderMatch = dbMsg.sender_id === msg.sender_id;
+                  
+                  return messageMatch && senderMatch && timeDiff < 10000; // 10 second window
+                });
+                
+                return !matchesDb; // Only keep if it doesn't match a DB message
+              }
+              
+              // Keep other pending messages
+              return msg.sync_status === 'pending';
+            });
+            
+            // Combine: DB messages (source of truth) + prev messages not in DB
+            const allMessages = [...sorted, ...prevMessagesNotInDb];
             const sortedAll = allMessages.sort((a, b) => 
               new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
             );
@@ -1058,14 +1151,22 @@ export default function GroupChatScreen() {
       // Don't show loading spinner if messages already exist (to avoid flickering)
       const hasExistingMessages = messages.length > 0;
       
-      // Reset scroll flag so we scroll to bottom after refresh
-      setHasScrolledToBottom(false);
+      // CRITICAL FIX: Don't reset scroll flags if user is viewing old messages
+      // Only reset if we're at the bottom or it's a fresh conversation
+      const shouldResetScroll = !loadingMore && !isPaginatingRef.current && currentPage === 1;
+      
+      if (shouldResetScroll) {
+        // Reset scroll flag so we scroll to bottom after refresh
+        setHasScrolledToBottom(false);
+        // Enable auto-scroll when conversation is focused
+        // Scroll will be handled by onContentSizeChange and onLayout
+        shouldAutoScrollRef.current = true;
+      } else {
+        // User is viewing old messages, don't auto-scroll
+        shouldAutoScrollRef.current = false;
+      }
       
       fetchMessages(!hasExistingMessages);
-      
-      // Enable auto-scroll when conversation is focused
-      // Scroll will be handled by onContentSizeChange and onLayout
-      shouldAutoScrollRef.current = true;
 
       const markGroupMessagesAsRead = async () => {
         if (!ENABLE_MARK_AS_READ || !id || !user) return;
@@ -1193,6 +1294,10 @@ export default function GroupChatScreen() {
   const loadMoreMessages = async () => {
     if (loadingMore || !hasMoreMessages) return;
     
+    // CRITICAL FIX: Disable auto-scroll when loading older messages
+    // User wants to stay at the top viewing old messages
+    shouldAutoScrollRef.current = false;
+    userScrolledRef.current = true; // Mark as user-initiated (viewing old messages)
     isPaginatingRef.current = true; // Mark that we're paginating
     setLoadingMore(true);
     try {
@@ -2945,13 +3050,9 @@ export default function GroupChatScreen() {
               maxToRenderPerBatch={15}
               removeClippedSubviews={true}
               updateCellsBatchingPeriod={50}
-              onEndReached={() => {
-                if (hasMoreMessages && !loadingMore) {
-                  loadMoreMessages();
-                }
-              }}
-              onEndReachedThreshold={0.1}
-                extraData={messages.length} // Force re-render when messages array changes
+              // REMOVED: onEndReached - it fires at bottom (newest messages) but we want to load at top (oldest)
+              // Loading more messages is handled by onScroll handler when user scrolls to top
+              extraData={messages.length} // Force re-render when messages array changes
                 keyExtractor={(item, index) => {
                   // Create a unique key that handles temporary IDs and prevents duplicates
                   // Always include index as a fallback to ensure uniqueness even with duplicate IDs
@@ -3003,13 +3104,15 @@ export default function GroupChatScreen() {
                 // If offset changed significantly and we're not near bottom, user scrolled
                 if (previousOffset !== 0 && Math.abs(currentOffset - previousOffset) > 10) {
                   if (!isNearBottom) {
-                    // User scrolled away from bottom
+                    // User scrolled away from bottom (viewing old messages)
                     userScrolledRef.current = true;
                     shouldAutoScrollRef.current = false;
                   } else {
-                    // User scrolled back to bottom
-                    userScrolledRef.current = false;
-                    shouldAutoScrollRef.current = true;
+                    // User scrolled back to bottom - only enable auto-scroll if not loading more
+                    if (!loadingMore && !isPaginatingRef.current) {
+                      userScrolledRef.current = false;
+                      shouldAutoScrollRef.current = true;
+                    }
                   }
                 }
                 
@@ -3047,13 +3150,42 @@ export default function GroupChatScreen() {
               }
               onContentSizeChange={(contentWidth, contentHeight) => {
                 // Track content size for precise scrolling
+                const previousContentHeight = contentSizeRef.current?.height || 0;
                 contentSizeRef.current = { width: contentWidth, height: contentHeight };
                 
-                // Scroll to bottom when content size changes (e.g., images load)
-                // Only scroll if initial scroll has already happened (onLayout handles initial scroll)
-                // This prevents duplicate scrolls on initial load
-                // Also check isInitialLoadRef to prevent scrolling during initial load period
-                if (!loading && messages.length > 0 && !isInitialLoadRef.current && shouldAutoScrollRef.current && !userScrolledRef.current && hasAttemptedInitialScrollRef.current) {
+                // CRITICAL FIX: Don't scroll if:
+                // 1. Loading more messages (pagination) - user is viewing old messages at top
+                // 2. User has scrolled away from bottom
+                // 3. Still in initial load period
+                // 4. Content size decreased or didn't increase significantly (images unloading, not new messages)
+                const contentIncreased = contentHeight > previousContentHeight + 10; // At least 10px increase
+                
+                if (loadingMore || 
+                    loading || 
+                    userScrolledRef.current || 
+                    isInitialLoadRef.current || 
+                    !hasAttemptedInitialScrollRef.current ||
+                    !contentIncreased ||
+                    isPaginatingRef.current) {
+                  // Don't scroll - user is viewing old messages or content is shrinking
+                  return;
+                }
+                
+                // Only scroll if we're near bottom and content increased (new messages at bottom)
+                if (shouldAutoScrollRef.current && messages.length > 0) {
+                  // Check if we're near bottom before scrolling
+                  if (viewportSizeRef.current && lastScrollOffsetRef.current > 0) {
+                    const currentOffset = lastScrollOffsetRef.current;
+                    const viewportHeight = viewportSizeRef.current.height;
+                    const distanceFromBottom = contentHeight - (currentOffset + viewportHeight);
+                    const isNearBottom = distanceFromBottom < 200; // Within 200px of bottom
+                    
+                    if (!isNearBottom) {
+                      // User is not near bottom, don't auto-scroll
+                      return;
+                    }
+                  }
+                  
                   // Clear any pending scroll
                   if (scrollTimeoutRef.current) {
                     clearTimeout(scrollTimeoutRef.current);
@@ -3061,7 +3193,7 @@ export default function GroupChatScreen() {
                   
                   // Wait for viewport size to be available, then scroll to absolute bottom
                   scrollTimeoutRef.current = setTimeout(() => {
-                    if (flatListRef.current && messages.length > 0 && shouldAutoScrollRef.current && !userScrolledRef.current) {
+                    if (flatListRef.current && messages.length > 0 && shouldAutoScrollRef.current && !userScrolledRef.current && !loadingMore && !isPaginatingRef.current) {
                       try {
                         // Use scrollToOffset for precise positioning if we have viewport size
                         if (viewportSizeRef.current && contentSizeRef.current) {
