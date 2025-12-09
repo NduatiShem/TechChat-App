@@ -1145,6 +1145,281 @@ export async function updateSyncState(
   }
 }
 
+// Users table functions
+export interface DatabaseUser {
+  id: number;
+  name: string;
+  email: string;
+  avatar_url?: string | null;
+  created_at: string;
+  updated_at: string;
+  last_synced_at: string;
+}
+
+export async function getUsers(): Promise<DatabaseUser[]> {
+  try {
+    const database = await getDb();
+    if (!database) {
+      if (__DEV__) {
+        console.warn('[Database] Database not available, returning empty array');
+      }
+      return [];
+    }
+    
+    const users = await database.getAllAsync<DatabaseUser>(
+      `SELECT * FROM users ORDER BY name ASC`
+    );
+    
+    return users || [];
+  } catch (error) {
+    console.error('[Database] Error getting users:', error);
+    return [];
+  }
+}
+
+export async function saveUsers(
+  users: Array<{
+    id: number;
+    name: string;
+    email: string;
+    avatar_url?: string | null;
+    created_at?: string;
+    updated_at?: string;
+  }>
+): Promise<void> {
+  if (!users || users.length === 0) {
+    return;
+  }
+
+  try {
+    // CRITICAL FIX: Get database with retry
+    let database = await getDb();
+    if (!database) {
+      // Wait a bit and retry
+      let retries = 0;
+      while (!database && retries < 5) {
+        await new Promise(resolve => setTimeout(resolve, 200));
+        database = await getDb();
+        retries++;
+      }
+    }
+    
+    if (!database) {
+      if (__DEV__) {
+        console.warn('[Database] Database not available after retries, skipping save');
+      }
+      return;
+    }
+    
+    // CRITICAL FIX: Validate database is still valid before enqueueing
+    const isValid = await validateDatabase(database);
+    if (!isValid) {
+      console.error('[Database] Database invalid (NullPointerException), reinitializing...');
+      db = null; // Reset database
+      database = await initDatabase(); // Try to reinitialize
+      if (!database) {
+        console.error('[Database] Failed to reinitialize, skipping save');
+        return;
+      }
+    }
+    
+    // CRITICAL FIX: Capture database reference for use in callback
+    const dbRef = database;
+    
+    // Enqueue write operation to prevent concurrent writes
+    await writeQueue.enqueue(async () => {
+      // CRITICAL FIX: Re-validate database inside callback
+      let dbToUse: SQLite.SQLiteDatabase | null = dbRef;
+      if (!dbToUse) {
+        dbToUse = await getDb();
+        if (!dbToUse) {
+          console.error('[Database] Database became null in writeQueue callback');
+          return;
+        }
+      }
+      
+      // CRITICAL FIX: Validate database is still valid
+      const isValid = await validateDatabase(dbToUse);
+      if (!isValid || !dbToUse) {
+        console.error('[Database] Database invalid in callback, skipping operation');
+        return;
+      }
+      
+      // CRITICAL FIX: Ensure users table exists (preventive measure)
+      try {
+        await dbToUse.getFirstAsync('SELECT 1 FROM users LIMIT 1');
+      } catch (tableError: any) {
+        if (tableError?.message?.includes('no such table: users')) {
+          console.warn('[Database] Users table does not exist, creating it...');
+          try {
+            await dbToUse.execAsync(`
+              CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                email TEXT NOT NULL,
+                avatar_url TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                last_synced_at TEXT NOT NULL DEFAULT (datetime('now'))
+              );
+            `);
+            await dbToUse.execAsync(`
+              CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+            `);
+            console.log('[Database] Users table created successfully');
+          } catch (createError) {
+            console.error('[Database] Failed to create users table:', createError);
+            return; // Can't proceed without the table
+          }
+        } else {
+          throw tableError; // Re-throw if it's a different error
+        }
+      }
+      
+      // TypeScript now knows dbToUse is not null
+      const validDb = dbToUse;
+      
+      // Wrap transaction in try-catch to handle rollback errors with retry
+      try {
+        await retryWithBackoff(async () => {
+          await validDb.withTransactionAsync(async () => {
+            for (const user of users) {
+              try {
+                const existing = await validDb.getFirstAsync<DatabaseUser>(
+                  `SELECT * FROM users WHERE id = ?`,
+                  [user.id]
+                );
+
+                if (existing) {
+                  await validDb.runAsync(
+                    `UPDATE users SET
+                      name = ?,
+                      email = ?,
+                      avatar_url = ?,
+                      updated_at = ?,
+                      last_synced_at = datetime('now')
+                    WHERE id = ?`,
+                    [
+                      user.name,
+                      user.email,
+                      user.avatar_url ?? null,
+                      user.updated_at ?? new Date().toISOString(),
+                      user.id,
+                    ]
+                  );
+                } else {
+                  await validDb.runAsync(
+                    `INSERT INTO users (
+                      id, name, email, avatar_url, created_at, updated_at, last_synced_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, datetime('now'))`,
+                    [
+                      user.id,
+                      user.name,
+                      user.email,
+                      user.avatar_url ?? null,
+                      user.created_at ?? new Date().toISOString(),
+                      user.updated_at ?? new Date().toISOString(),
+                    ]
+                  );
+                }
+              } catch (userError) {
+                // Log error for individual user but continue with others
+                if (!isDatabaseLockedError(userError)) {
+                  console.error(`[Database] Error saving user ${user.id}:`, userError);
+                }
+                // Don't throw - let other users save
+              }
+            }
+          });
+        });
+      } catch (transactionError: any) {
+        // Handle transaction errors, including rollback issues
+        if (transactionError?.message?.includes('rollback') || 
+            transactionError?.message?.includes('transaction') ||
+            isDatabaseLockedError(transactionError)) {
+          if (__DEV__) {
+            console.warn('[Database] Transaction error, falling back to individual saves:', transactionError);
+          }
+          
+          // Fallback: Save users individually with retry
+          for (const user of users) {
+            try {
+              await retryWithBackoff(async () => {
+                // CRITICAL FIX: Re-validate database in fallback
+                let fallbackDb: SQLite.SQLiteDatabase | null = dbToUse;
+                if (!fallbackDb) {
+                  fallbackDb = await getDb();
+                  if (!fallbackDb) {
+                    throw new Error('Database not available in fallback');
+                  }
+                }
+                
+                const isValid = await validateDatabase(fallbackDb);
+                if (!isValid || !fallbackDb) {
+                  throw new Error('Database invalid in fallback');
+                }
+                
+                const validFallbackDb = fallbackDb;
+                
+                const existing = await validFallbackDb.getFirstAsync<DatabaseUser>(
+                  `SELECT * FROM users WHERE id = ?`,
+                  [user.id]
+                );
+
+                if (existing) {
+                  await validFallbackDb.runAsync(
+                    `UPDATE users SET
+                      name = ?,
+                      email = ?,
+                      avatar_url = ?,
+                      updated_at = ?,
+                      last_synced_at = datetime('now')
+                    WHERE id = ?`,
+                    [
+                      user.name,
+                      user.email,
+                      user.avatar_url ?? null,
+                      user.updated_at ?? new Date().toISOString(),
+                      user.id,
+                    ]
+                  );
+                } else {
+                  await validFallbackDb.runAsync(
+                    `INSERT INTO users (
+                      id, name, email, avatar_url, created_at, updated_at, last_synced_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, datetime('now'))`,
+                    [
+                      user.id,
+                      user.name,
+                      user.email,
+                      user.avatar_url ?? null,
+                      user.created_at ?? new Date().toISOString(),
+                      user.updated_at ?? new Date().toISOString(),
+                    ]
+                  );
+                }
+              });
+            } catch (individualError) {
+              if (!isDatabaseLockedError(individualError)) {
+                console.error(`[Database] Error saving individual user ${user.id}:`, individualError);
+              }
+            }
+          }
+        } else {
+          // Re-throw if it's not a transaction/rollback/locked error
+          throw transactionError;
+        }
+      }
+    });
+
+    if (__DEV__) {
+      console.log(`[Database] Saved ${users.length} users`);
+    }
+  } catch (error) {
+    console.error('[Database] Error saving users:', error);
+  }
+}
+
 export async function getPendingMessages(): Promise<DatabaseMessage[]> {
   try {
     let database = await getDb();

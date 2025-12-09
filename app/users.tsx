@@ -2,6 +2,7 @@ import UserAvatar from '@/components/UserAvatar';
 import { useAuth } from '@/context/AuthContext';
 import { useTheme } from '@/context/ThemeContext';
 import { usersAPI } from '@/services/api';
+import { getUsers as getDbUsers, initDatabase, saveUsers as saveDbUsers } from '@/services/database';
 import { MaterialCommunityIcons } from '@expo/vector-icons';
 import { router } from 'expo-router';
 import React, { useEffect, useState } from 'react';
@@ -29,12 +30,80 @@ export default function UsersScreen() {
   const [filteredUsers, setFilteredUsers] = useState<User[]>([]);
   const [searchQuery, setSearchQuery] = useState('');
   const [isLoading, setIsLoading] = useState(true);
+  const [dbInitialized, setDbInitialized] = useState(false);
   const { user } = useAuth();
   const { currentTheme } = useTheme();
 
   const isDark = currentTheme === 'dark';
 
+  // Initialize database on mount
+  useEffect(() => {
+    let mounted = true;
+    const initDb = async () => {
+      try {
+        await initDatabase();
+        if (mounted) {
+          setDbInitialized(true);
+        }
+      } catch (error) {
+        console.error('[Users] Failed to initialize database:', error);
+        if (mounted) {
+          setDbInitialized(true); // Still allow app to work
+        }
+      }
+    };
+    initDb();
+    return () => {
+      mounted = false;
+    };
+  }, []);
+
+  // Load cached users from SQLite (for instant display)
+  const loadCachedUsers = async () => {
+    if (!dbInitialized) return [];
+    
+    try {
+      const cachedUsers = await getDbUsers();
+      if (cachedUsers && cachedUsers.length > 0) {
+        // Filter out current user and convert to User interface
+        const userList = cachedUsers
+          .filter((item) => item.id !== user?.id)
+          .map((item) => ({
+            id: item.id,
+            name: item.name,
+            email: item.email,
+            avatar_url: item.avatar_url || undefined,
+            created_at: item.created_at,
+            updated_at: item.updated_at,
+          }));
+        
+        return userList;
+      }
+    } catch (error) {
+      console.error('[Users] Error loading cached users:', error);
+    }
+    return [];
+  };
+
+  // Load users from API (API-first with cache preview)
   const loadUsers = async () => {
+    setIsLoading(true);
+    
+    // STEP 1: Load cached users instantly (if available)
+    if (dbInitialized) {
+      try {
+        const cachedUsers = await loadCachedUsers();
+        if (cachedUsers.length > 0) {
+          setUsers(cachedUsers);
+          setFilteredUsers(cachedUsers);
+          setIsLoading(false); // Clear loading if cache is displayed instantly
+        }
+      } catch (cacheError) {
+        console.error('[Users] Error loading users from cache:', cacheError);
+      }
+    }
+    
+    // STEP 2: Fetch fresh data from API
     try {
       const response = await usersAPI.getAll();
       let usersData = response.data;
@@ -44,37 +113,73 @@ export default function UsersScreen() {
           usersData = JSON.parse(response.data);
         } catch (parseError) {
           console.error('Failed to parse users data:', parseError);
-          setUsers([]);
+          // Keep cached data if available
+          if (users.length === 0) {
+            setUsers([]);
+            setFilteredUsers([]);
+          }
+          setIsLoading(false);
           return;
         }
       }
       
       // Ensure we have an array and filter out the current user
-      // Backend already filters active users, so we don't need to filter here
       if (Array.isArray(usersData)) {
         const userList = usersData.filter((item: any) => 
           item.id !== user?.id
         );
         
+        // Update UI with fresh API data
         setUsers(userList);
         setFilteredUsers(userList);
+        
+        // STEP 3: Save to SQLite in background
+        if (dbInitialized) {
+          try {
+            const usersToSave = userList.map((item: any) => ({
+              id: item.id,
+              name: item.name,
+              email: item.email,
+              avatar_url: item.avatar_url || null,
+              created_at: item.created_at || new Date().toISOString(),
+              updated_at: item.updated_at || new Date().toISOString(),
+            }));
+            await saveDbUsers(usersToSave);
+            
+            if (__DEV__) {
+              console.log(`[Users] Saved ${usersToSave.length} users to database`);
+            }
+          } catch (dbError) {
+            console.error('[Users] Error saving to database:', dbError);
+            // Don't fail the whole operation if DB save fails
+          }
+        }
       } else {
         console.error('Response data is not an array:', usersData);
-        setUsers([]);
-        setFilteredUsers([]);
+        // Keep cached data if available
+        if (users.length === 0) {
+          setUsers([]);
+          setFilteredUsers([]);
+        }
       }
     } catch (error) {
       console.error('Failed to load users:', error);
-      setUsers([]);
+      // Keep cached data if available, otherwise show empty
+      if (users.length === 0) {
+        setUsers([]);
+        setFilteredUsers([]);
+      }
     } finally {
       setIsLoading(false);
     }
   };
 
   useEffect(() => {
-    loadUsers();
+    if (dbInitialized) {
+      loadUsers();
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []); // loadUsers is stable, no need to include
+  }, [dbInitialized]); // Load when database is initialized
 
   useEffect(() => {
     if (searchQuery.trim() === '') {
