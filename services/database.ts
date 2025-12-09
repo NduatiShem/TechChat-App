@@ -3,6 +3,8 @@ import { runMigrations } from '@/utils/dbMigrations';
 import * as SQLite from 'expo-sqlite';
 
 let db: SQLite.SQLiteDatabase | null = null;
+let isInitializing = false; // Add initialization lock
+let initPromise: Promise<SQLite.SQLiteDatabase | null> | null = null; // Track ongoing initialization
 
 // Database operation queue to serialize write operations and prevent locks
 type QueueOperation<T> = () => Promise<T>;
@@ -112,31 +114,140 @@ async function retryWithBackoff<T>(
   throw lastError;
 }
 
-export async function initDatabase(): Promise<SQLite.SQLiteDatabase | null> {
-  if (db) {
-    return db;
+// CRITICAL FIX: Database health check function
+async function validateDatabase(database: SQLite.SQLiteDatabase | null): Promise<boolean> {
+  if (!database) {
+    return false;
   }
-
+  
   try {
-    db = await SQLite.openDatabaseAsync('techchat.db');
-    await runMigrations(db);
-    
-    if (__DEV__) {
-      console.log('[Database] Initialized successfully');
+    await database.getFirstAsync('SELECT 1');
+    return true;
+  } catch (error: any) {
+    if (error?.message?.includes('NullPointerException') || 
+        error?.message?.includes('prepareAsync') ||
+        error?.message?.includes('execAsync')) {
+      return false;
     }
-    
-    return db;
-  } catch (error) {
-    console.error('[Database] Failed to initialize:', error);
-    db = null;
-    return null;
+    throw error;
   }
 }
 
+export async function initDatabase(): Promise<SQLite.SQLiteDatabase | null> {
+  // If already initialized, return it
+  if (db) {
+    // CRITICAL FIX: Validate database is still valid
+    const isValid = await validateDatabase(db);
+    if (isValid) {
+      return db;
+    } else {
+      // Database is invalid, reset it
+      console.warn('[Database] Existing database is invalid, reinitializing...');
+      db = null;
+    }
+  }
+  
+  // If currently initializing, wait for the existing initialization
+  if (isInitializing && initPromise) {
+    return await initPromise;
+  }
+  
+  // Start initialization
+  isInitializing = true;
+  initPromise = (async () => {
+    try {
+      // CRITICAL FIX: Add retry logic for database opening
+      let database: SQLite.SQLiteDatabase | null = null;
+      let retries = 0;
+      const maxRetries = 3;
+      
+      while (!database && retries < maxRetries) {
+        try {
+          database = await SQLite.openDatabaseAsync('techchat.db');
+          
+          // CRITICAL FIX: Verify database is valid before running migrations
+          if (!database) {
+            throw new Error('Database object is null after opening');
+          }
+          
+          // Test database is ready by doing a simple query
+          await database.getFirstAsync('SELECT 1');
+          
+          break; // Success, exit retry loop
+        } catch (openError: any) {
+          retries++;
+          if (retries >= maxRetries) {
+            throw openError;
+          }
+          // Wait before retry
+          await new Promise(resolve => setTimeout(resolve, 200 * retries));
+        }
+      }
+      
+      if (!database) {
+        throw new Error('Failed to open database after retries');
+      }
+      
+      // CRITICAL FIX: Run migrations with error handling
+      try {
+        await runMigrations(database);
+      } catch (migrationError: any) {
+        console.error('[Database] Migration failed:', migrationError);
+        // If migration fails, try to close and reopen
+        try {
+          await database.closeAsync();
+        } catch (closeError) {
+          // Ignore close errors
+        }
+        throw migrationError;
+      }
+      
+      db = database;
+      
+      if (__DEV__) {
+        console.log('[Database] Initialized successfully');
+      }
+      
+      return db;
+    } catch (error: any) {
+      console.error('[Database] Failed to initialize:', error);
+      db = null;
+      
+      // CRITICAL FIX: If it's a NullPointerException, log warning
+      if (error?.message?.includes('NullPointerException')) {
+        console.warn('[Database] NullPointerException detected, database may be corrupted');
+      }
+      
+      return null;
+    } finally {
+      isInitializing = false;
+      initPromise = null;
+    }
+  })();
+  
+  return await initPromise;
+}
+
 export async function getDb(): Promise<SQLite.SQLiteDatabase | null> {
-  if (!db) {
+  if (!db && !isInitializing) {
     return await initDatabase();
   }
+  
+  // If initializing, wait for it
+  if (isInitializing && initPromise) {
+    return await initPromise;
+  }
+  
+  // If db exists, validate it
+  if (db) {
+    const isValid = await validateDatabase(db);
+    if (!isValid) {
+      console.warn('[Database] Database invalid, reinitializing...');
+      db = null;
+      return await initDatabase();
+    }
+  }
+  
   return db;
 }
 
@@ -151,52 +262,106 @@ export async function getMessages(
   offset: number = 0
 ): Promise<MessageWithAttachments[]> {
   try {
-    const database = await getDb();
+    let database = await getDb();
+    if (!database) {
+      // CRITICAL FIX: Wait a bit if database is still initializing
+      let retries = 0;
+      while (!database && retries < 3) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+        database = await getDb();
+        retries++;
+      }
+    }
+    
     if (!database) {
       if (__DEV__) {
-        console.warn('[Database] Database not available, returning empty array');
+        console.warn('[Database] Database not available after retries, returning empty array');
       }
       return [];
     }
     
-    const messages = await database.getAllAsync<DatabaseMessage>(
-      `SELECT * FROM messages 
-       WHERE conversation_id = ? AND conversation_type = ?
-       ORDER BY created_at DESC
-       LIMIT ? OFFSET ?`,
-      [conversationId, conversationType, limit, offset]
-    );
+    // CRITICAL FIX: Wrap query in try-catch to handle NullPointerException
+    let messages: DatabaseMessage[] = [];
+    try {
+      messages = await database.getAllAsync<DatabaseMessage>(
+        `SELECT * FROM messages 
+         WHERE conversation_id = ? AND conversation_type = ?
+         ORDER BY created_at DESC
+         LIMIT ? OFFSET ?`,
+        [conversationId, conversationType, limit, offset]
+      );
+    } catch (queryError: any) {
+      // Check if it's a NullPointerException or database not ready error
+      if (queryError?.message?.includes('NullPointerException') || 
+          queryError?.message?.includes('prepareAsync')) {
+        console.error('[Database] Database not ready for query (NullPointerException):', queryError);
+        return [];
+      }
+      throw queryError; // Re-throw other errors
+    }
 
     const reversedMessages = messages.reverse();
 
-    const messagesWithDetails: MessageWithAttachments[] = await Promise.all(
-      reversedMessages.map(async (msg) => {
-        const attachments = await database!.getAllAsync<DatabaseAttachment>(
-          `SELECT * FROM attachments WHERE message_id = ?`,
-          [msg.id]
-        );
+    const messagesWithDetails = await Promise.all(
+      reversedMessages.map(async (msg): Promise<MessageWithAttachments | null> => {
+        // CRITICAL FIX: Remove non-null assertion, add null check
+        if (!database) return null;
+        
+        let attachments: DatabaseAttachment[] = [];
+        try {
+          attachments = await database.getAllAsync<DatabaseAttachment>(
+            `SELECT * FROM attachments WHERE message_id = ?`,
+            [msg.id]
+          );
+        } catch (attachError: any) {
+          if (attachError?.message?.includes('NullPointerException')) {
+            console.error('[Database] Error loading attachments (NullPointerException):', attachError);
+            attachments = [];
+          } else {
+            throw attachError;
+          }
+        }
 
         let replyTo = undefined;
-        if (msg.reply_to_id) {
-          const replyMsg = await database!.getFirstAsync<DatabaseMessage>(
-            `SELECT * FROM messages WHERE id = ?`,
-            [msg.reply_to_id]
-          );
-          if (replyMsg) {
-            const replyAttachments = await database!.getAllAsync<DatabaseAttachment>(
-              `SELECT * FROM attachments WHERE message_id = ?`,
-              [replyMsg.id]
+        if (msg.reply_to_id && database) {
+          try {
+            const replyMsg = await database.getFirstAsync<DatabaseMessage>(
+              `SELECT * FROM messages WHERE id = ?`,
+              [msg.reply_to_id]
             );
-            replyTo = {
-              id: replyMsg.id,
-              message: replyMsg.message,
-              sender: {
-                id: replyMsg.sender_id,
-                name: 'Unknown User',
-              },
-              attachments: replyAttachments,
-              created_at: replyMsg.created_at,
-            };
+            if (replyMsg && database) {
+              let replyAttachments: DatabaseAttachment[] = [];
+              try {
+                replyAttachments = await database.getAllAsync<DatabaseAttachment>(
+                  `SELECT * FROM attachments WHERE message_id = ?`,
+                  [replyMsg.id]
+                );
+              } catch (replyAttachError: any) {
+                if (replyAttachError?.message?.includes('NullPointerException')) {
+                  console.error('[Database] Error loading reply attachments (NullPointerException):', replyAttachError);
+                  replyAttachments = [];
+                } else {
+                  throw replyAttachError;
+                }
+              }
+              
+              replyTo = {
+                id: replyMsg.id,
+                message: replyMsg.message,
+                sender: {
+                  id: replyMsg.sender_id,
+                  name: 'Unknown User',
+                },
+                attachments: replyAttachments,
+                created_at: replyMsg.created_at,
+              };
+            }
+          } catch (replyError: any) {
+            if (replyError?.message?.includes('NullPointerException')) {
+              console.error('[Database] Error loading reply message (NullPointerException):', replyError);
+            } else {
+              throw replyError;
+            }
           }
         }
 
@@ -208,7 +373,10 @@ export async function getMessages(
       })
     );
 
-    return messagesWithDetails;
+    // CRITICAL FIX: Filter out null values and ensure type safety
+    return messagesWithDetails.filter((msg): msg is MessageWithAttachments => {
+      return msg !== null;
+    }) as MessageWithAttachments[];
   } catch (error) {
     console.error('[Database] Error getting messages:', error);
     return [];
@@ -675,30 +843,76 @@ export async function saveConversations(
   }>
 ): Promise<void> {
   try {
-    const database = await getDb();
+    // CRITICAL FIX: Get database with retry
+    let database = await getDb();
+    if (!database) {
+      // Wait a bit and retry
+      let retries = 0;
+      while (!database && retries < 5) {
+        await new Promise(resolve => setTimeout(resolve, 200));
+        database = await getDb();
+        retries++;
+      }
+    }
+    
     if (!database) {
       if (__DEV__) {
-        console.warn('[Database] Database not available, skipping save');
+        console.warn('[Database] Database not available after retries, skipping save');
       }
       return;
     }
     
+    // CRITICAL FIX: Validate database is still valid before enqueueing
+    const isValid = await validateDatabase(database);
+    if (!isValid) {
+      console.error('[Database] Database invalid (NullPointerException), reinitializing...');
+      db = null; // Reset database
+      database = await initDatabase(); // Try to reinitialize
+      if (!database) {
+        console.error('[Database] Failed to reinitialize, skipping save');
+        return;
+      }
+    }
+    
+    // CRITICAL FIX: Capture database reference for use in callback
+    const dbRef = database;
+    
     // Enqueue write operation to prevent concurrent writes
     await writeQueue.enqueue(async () => {
+      // CRITICAL FIX: Re-validate database inside callback
+      let dbToUse: SQLite.SQLiteDatabase | null = dbRef;
+      if (!dbToUse) {
+        dbToUse = await getDb();
+        if (!dbToUse) {
+          console.error('[Database] Database became null in writeQueue callback');
+          return;
+        }
+      }
+      
+      // CRITICAL FIX: Validate database is still valid
+      const isValid = await validateDatabase(dbToUse);
+      if (!isValid || !dbToUse) {
+        console.error('[Database] Database invalid in callback, skipping operation');
+        return;
+      }
+      
+      // TypeScript now knows dbToUse is not null
+      const validDb = dbToUse;
+      
       // Wrap transaction in try-catch to handle rollback errors with retry
       try {
         await retryWithBackoff(async () => {
-          await database.withTransactionAsync(async () => {
+          await validDb.withTransactionAsync(async () => {
             for (const conv of conversations) {
               try {
-                const existing = await database.getFirstAsync<DatabaseConversation>(
+                const existing = await validDb.getFirstAsync<DatabaseConversation>(
                   `SELECT * FROM conversations 
                    WHERE conversation_id = ? AND conversation_type = ?`,
                   [conv.conversation_id, conv.conversation_type]
                 );
 
                 if (existing) {
-                  await database.runAsync(
+                  await validDb.runAsync(
                     `UPDATE conversations SET
                       name = ?,
                       email = ?,
@@ -725,7 +939,7 @@ export async function saveConversations(
                     ]
                   );
                 } else {
-                  await database.runAsync(
+                  await validDb.runAsync(
                     `INSERT INTO conversations (
                       conversation_id, conversation_type, user_id, group_id, name, email, avatar_url,
                       last_message, last_message_date, last_message_sender_id, last_message_read_at,
@@ -773,14 +987,30 @@ export async function saveConversations(
           for (const conv of conversations) {
           try {
             await retryWithBackoff(async () => {
-              const existing = await database.getFirstAsync<DatabaseConversation>(
+              // CRITICAL FIX: Re-validate database in fallback
+              let fallbackDb: SQLite.SQLiteDatabase | null = dbToUse;
+              if (!fallbackDb) {
+                fallbackDb = await getDb();
+                if (!fallbackDb) {
+                  throw new Error('Database not available in fallback');
+                }
+              }
+              
+              const isValid = await validateDatabase(fallbackDb);
+              if (!isValid || !fallbackDb) {
+                throw new Error('Database invalid in fallback');
+              }
+              
+              const validFallbackDb = fallbackDb;
+              
+              const existing = await validFallbackDb.getFirstAsync<DatabaseConversation>(
                 `SELECT * FROM conversations 
                  WHERE conversation_id = ? AND conversation_type = ?`,
                 [conv.conversation_id, conv.conversation_type]
               );
 
               if (existing) {
-                await database.runAsync(
+                await validFallbackDb.runAsync(
                   `UPDATE conversations SET
                     name = ?,
                     email = ?,
@@ -807,7 +1037,7 @@ export async function saveConversations(
                   ]
                 );
               } else {
-                await database.runAsync(
+                await validFallbackDb.runAsync(
                   `INSERT INTO conversations (
                     conversation_id, conversation_type, user_id, group_id, name, email, avatar_url,
                     last_message, last_message_date, last_message_sender_id, last_message_read_at,
@@ -917,17 +1147,42 @@ export async function updateSyncState(
 
 export async function getPendingMessages(): Promise<DatabaseMessage[]> {
   try {
-    const database = await getDb();
-    if (!database) return [];
-    // Get messages that are pending
-    // Exclude messages that already have server_id (they're already synced)
-    const messages = await database.getAllAsync<DatabaseMessage>(
-      `SELECT * FROM messages 
-       WHERE sync_status = 'pending' 
-       AND server_id IS NULL
-       ORDER BY created_at ASC`
-    );
-    return messages;
+    let database = await getDb();
+    if (!database) {
+      // CRITICAL FIX: Wait a bit if database is still initializing
+      let retries = 0;
+      while (!database && retries < 3) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+        database = await getDb();
+        retries++;
+      }
+    }
+    
+    if (!database) {
+      if (__DEV__) {
+        console.warn('[Database] Database not available for getPendingMessages');
+      }
+      return [];
+    }
+    
+    // CRITICAL FIX: Add try-catch around the actual query to handle NullPointerException
+    try {
+      const messages = await database.getAllAsync<DatabaseMessage>(
+        `SELECT * FROM messages 
+         WHERE sync_status = 'pending' 
+         AND server_id IS NULL
+         ORDER BY created_at ASC`
+      );
+      return messages || [];
+    } catch (queryError: any) {
+      // Check if it's a NullPointerException or database not ready error
+      if (queryError?.message?.includes('NullPointerException') || 
+          queryError?.message?.includes('prepareAsync')) {
+        console.error('[Database] Database not ready for query (NullPointerException):', queryError);
+        return [];
+      }
+      throw queryError; // Re-throw other errors
+    }
   } catch (error) {
     console.error('[Database] Error getting pending messages:', error);
     return [];
@@ -1291,6 +1546,7 @@ export async function clearDatabase(): Promise<void> {
     console.error('[Database] Error clearing database:', error);
   }
 }
+
 
 
 

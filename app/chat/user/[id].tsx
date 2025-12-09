@@ -19,6 +19,7 @@ import { isVideoAttachment } from '@/utils/textUtils';
 import { MaterialCommunityIcons, MaterialIcons } from '@expo/vector-icons';
 import { useFocusEffect } from '@react-navigation/native';
 import { Picker } from 'emoji-mart-native';
+import NetInfo from '@react-native-community/netinfo';
 import * as DocumentPicker from 'expo-document-picker';
 import * as FileSystem from 'expo-file-system/legacy';
 import * as ImagePicker from 'expo-image-picker';
@@ -356,6 +357,7 @@ export default function UserChatScreen() {
   const viewportSizeRef = useRef<{ width: number; height: number } | null>(null); // Track viewport size
   const hasAttemptedInitialScrollRef = useRef<boolean>(false); // Track if we've attempted initial scroll
   const hasFetchedForConversationRef = useRef<string | null>(null); // Track which conversation we've fetched for
+  const needsMarkAsReadRef = useRef<boolean>(false); // Track if mark-read needs retry when network comes back
   
   // Pagination state
   const [currentPage, setCurrentPage] = useState(1);
@@ -430,97 +432,50 @@ export default function UserChatScreen() {
 
   // Fetch messages and user info
   const fetchMessages = useCallback(async (showLoading = true) => {
-    if (showLoading) {
-      setLoading(true);
-    }
     // Only reset scroll flag if this is initial load or user hasn't scrolled away
     // This prevents unwanted scrolls when refreshing content while user is viewing older messages
     if (isInitialLoadRef.current || (!userScrolledRef.current && shouldAutoScrollRef.current)) {
       setHasScrolledToBottom(false);
     }
     
-    // Check if this is first-time opening this conversation (no messages in DB)
+    // STEP 1: Show cached data instantly (if available) - NO loading spinner
     if (dbInitialized) {
-      const hasMessages = await hasMessagesForConversation(Number(id), 'individual');
-      
-      if (!hasMessages) {
-        // First-time: Fetch from API first, then save to SQLite
-        if (__DEV__) {
-          console.log('[UserChat] First-time opening conversation, fetching from API...');
-        }
-        try {
-          const syncResult = await syncConversationMessages(Number(id), 'individual', user?.id || 0);
-          if (syncResult.success) {
-            // Fix existing duplicates with wrong timestamps
-            try {
-              const response = await messagesAPI.getByUser(Number(id), 1, 50);
-              const messagesData = response.data.messages?.data || response.data.messages || [];
-              
-              if (messagesData.length > 0) {
-                await fixDuplicateMessagesWithWrongTimestamps(
-                  Number(id),
-                  'individual',
-                  messagesData.map((msg: any) => ({
-                    id: msg.id,
-                    created_at: msg.created_at,
-                    message: msg.message,
-                    sender_id: msg.sender_id,
-                  }))
-                );
-              }
-            } catch (cleanupError) {
-              // Silently fail - cleanup is not critical
-              if (__DEV__) {
-                console.warn('[UserChat] Error cleaning up duplicates:', cleanupError);
-              }
-            }
-            
-            if (syncResult.newMessagesCount > 0) {
-              // Load from database after sync
-              const syncedMessages = await loadMessagesFromDb(MESSAGES_PER_PAGE, 0);
-              if (syncedMessages.length > 0) {
-                const sorted = syncedMessages.sort((a, b) => 
-                  new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
-                );
-                // Deduplicate before setting
-                const uniqueMessages = deduplicateMessages(sorted);
-                setMessages(uniqueMessages);
-                setLoadedMessagesCount(uniqueMessages.length);
-                if (uniqueMessages.length > 0) {
-                  const latestMsg = uniqueMessages[uniqueMessages.length - 1];
-                  latestMessageIdRef.current = latestMsg.id;
-                }
-              }
-            }
-          }
-        } catch (syncError) {
-          console.error('[UserChat] Error in first-time sync:', syncError);
-        }
-      } else {
-        // Returning: Load from local database for instant display
-        const localMessages = await loadMessagesFromDb(MESSAGES_PER_PAGE, 0);
-        if (localMessages.length > 0) {
-          const sortedMessages = localMessages.sort((a, b) => 
+      try {
+        const cachedMessages = await loadMessagesFromDb(MESSAGES_PER_PAGE, 0);
+        if (cachedMessages.length > 0) {
+          const sortedMessages = cachedMessages.sort((a, b) => 
             new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
           );
-          // Deduplicate before setting to prevent duplicates
           const uniqueMessages = deduplicateMessages(sortedMessages);
           setMessages(uniqueMessages);
           setLoadedMessagesCount(uniqueMessages.length);
-          if (showLoading) {
-            setLoading(false);
-          }
           
-          // Update latest message ID
           if (uniqueMessages.length > 0) {
             const latestMsg = uniqueMessages[uniqueMessages.length - 1];
             latestMessageIdRef.current = latestMsg.id;
           }
+          
+          // Don't set loading to false yet - we'll fetch fresh data
+        } else {
+          // No cache available - show loading spinner
+          if (showLoading) {
+            setLoading(true);
+          }
         }
+      } catch (cacheError) {
+        // If cache load fails, show loading spinner
+        if (showLoading) {
+          setLoading(true);
+        }
+      }
+    } else {
+      // Database not initialized - show loading spinner
+      if (showLoading) {
+        setLoading(true);
       }
     }
     
-    // Then sync from API in background (for updates)
+    // STEP 2: Fetch from API in parallel (always) - API is source of truth
     try {
       // Fetch more messages (50) to match syncConversationMessages and ensure all messages are loaded
       const res = await messagesAPI.getByUser(Number(id), 1, 50);
@@ -819,13 +774,46 @@ export default function UserChatScreen() {
         retryTimeoutRef.current = null;
       }
     } catch (error: any) {
-      // Preserve existing messages - don't clear them on error
-      // Only clear messages if this is the initial load and we have no messages
-      // Use ref to get current messages length (avoids stale closure issues)
-      const hasExistingMessages = messagesLengthRef.current > 0;
+      console.error('[UserChat] API fetch failed:', error);
+      
+      // STEP 3: If API fails and we have cache, keep showing cache
+      // Cache is already displayed in STEP 1, so we just need to ensure loading is off
+      const hasCachedMessages = messagesLengthRef.current > 0;
       
       if (showLoading) {
         setLoading(false);
+      }
+      
+      // If we have cached messages, keep them displayed (already shown in STEP 1)
+      if (!hasCachedMessages) {
+        // No cache and API failed - try loading from cache one more time as fallback
+        if (dbInitialized) {
+          try {
+            const fallbackMessages = await loadMessagesFromDb(MESSAGES_PER_PAGE, 0);
+            if (fallbackMessages.length > 0) {
+              const sortedMessages = fallbackMessages.sort((a, b) => 
+                new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
+              );
+              const uniqueMessages = deduplicateMessages(sortedMessages);
+              setMessages(uniqueMessages);
+              setLoadedMessagesCount(uniqueMessages.length);
+              
+              if (uniqueMessages.length > 0) {
+                const latestMsg = uniqueMessages[uniqueMessages.length - 1];
+                latestMessageIdRef.current = latestMsg.id;
+              }
+            } else {
+              // No cache available - show empty state
+              setMessages([]);
+            }
+          } catch (cacheError) {
+            console.error('[UserChat] Error loading from cache fallback:', cacheError);
+            setMessages([]);
+          }
+        } else {
+          // No database - show empty state
+          setMessages([]);
+        }
       }
       
       // Check if this is a network-related error that we should retry
@@ -862,18 +850,13 @@ export default function UserChatScreen() {
           }
         }
         
-        // Only clear messages if this was initial load and we have no existing messages
-        if (!hasExistingMessages && showLoading) {
-          setMessages([]);
-        }
-        
         // Log error for debugging (only in dev mode)
         if (__DEV__) {
           console.error('[UserChat] Failed to fetch messages:', {
             error: error.message,
             status: error.response?.status,
             retryAttempts: retryAttemptRef.current,
-            hasExistingMessages
+            hasCachedMessages
           });
         }
       }
@@ -1245,11 +1228,47 @@ export default function UserChatScreen() {
         // Still mark messages as read, but don't refresh
         if (ENABLE_MARK_AS_READ && id && user) {
           const markMessagesAsRead = async () => {
+            // CRITICAL FIX: Check network connectivity before making API call
+            try {
+              const netInfo = await NetInfo.fetch();
+              if (!netInfo.isConnected) {
+                if (__DEV__) {
+                  console.log('[UserChat] Skipping mark as read - no network connection');
+                }
+                needsMarkAsReadRef.current = true; // Set flag to retry when network comes back
+                return;
+              }
+            } catch (netError) {
+              // If NetInfo fails, assume offline to be safe
+              if (__DEV__) {
+                console.warn('[UserChat] Could not check network status:', netError);
+              }
+              needsMarkAsReadRef.current = true;
+              return;
+            }
+            
             try {
               await messagesAPI.markMessagesAsRead(Number(id));
               updateUnreadCount(Number(id), 0);
-            } catch (error) {
-              // Silently ignore errors
+              needsMarkAsReadRef.current = false; // Reset flag on success
+            } catch (error: any) {
+              // Handle network errors gracefully
+              const isNetworkError = 
+                error?.code === 'ERR_NETWORK' ||
+                error?.message?.includes('Network Error') ||
+                !error?.response;
+              
+              if (isNetworkError) {
+                needsMarkAsReadRef.current = true; // Set flag to retry when network comes back
+                if (__DEV__) {
+                  console.log('[UserChat] Mark as read failed - network error, will retry when online');
+                }
+              } else {
+                // Other errors - silently ignore
+                if (__DEV__) {
+                  console.error('[UserChat] Error marking messages as read:', error);
+                }
+              }
             }
           };
           markMessagesAsRead();
@@ -1273,6 +1292,25 @@ export default function UserChatScreen() {
       const markMessagesAsRead = async () => {
         if (!ENABLE_MARK_AS_READ || !id || !user) return;
         
+        // CRITICAL FIX: Check network connectivity before making API call
+        try {
+          const netInfo = await NetInfo.fetch();
+          if (!netInfo.isConnected) {
+            if (__DEV__) {
+              console.log('[UserChat] Skipping mark as read - no network connection');
+            }
+            needsMarkAsReadRef.current = true; // Set flag to retry when network comes back
+            return; // Don't make API call if offline
+          }
+        } catch (netError) {
+          // If NetInfo fails, assume offline to be safe
+          if (__DEV__) {
+            console.warn('[UserChat] Could not check network status:', netError);
+          }
+          needsMarkAsReadRef.current = true; // Set flag to retry when network comes back
+          return;
+        }
+        
         try {
           // Mark all unread messages from this user as read
           // Use the new route: PUT /api/messages/mark-read/{userId}
@@ -1294,11 +1332,30 @@ export default function UserChatScreen() {
           // Update unread count to 0 for this conversation (instead of removing it)
           // This ensures the UI updates immediately
           updateUnreadCount(Number(id), 0);
+          needsMarkAsReadRef.current = false; // Reset flag on success
           
-          console.log('Messages marked as read for conversation:', id);
-        } catch (error) {
-          console.error('Error marking messages as read:', error);
-          // Don't show error to user - this is a background operation
+          if (__DEV__) {
+            console.log('Messages marked as read for conversation:', id);
+          }
+        } catch (error: any) {
+          // Handle network errors gracefully
+          const isNetworkError = 
+            error?.code === 'ERR_NETWORK' ||
+            error?.message?.includes('Network Error') ||
+            !error?.response;
+          
+          if (isNetworkError) {
+            // Network error - set flag to retry when network comes back
+            needsMarkAsReadRef.current = true;
+            if (__DEV__) {
+              console.log('[UserChat] Mark as read failed - network error, will retry when online');
+            }
+          } else {
+            // Other errors (auth, validation, etc.) - log for debugging
+            if (__DEV__) {
+              console.error('[UserChat] Error marking messages as read:', error);
+            }
+          }
         }
       };
 
@@ -1314,6 +1371,65 @@ export default function UserChatScreen() {
       };
     }, [id, user, ENABLE_MARK_AS_READ, updateUnreadCount, setActiveConversation, clearActiveConversation, fetchMessages, messages.length, scrollToBottom, loadingMore, currentPage])
   );
+
+  // CRITICAL FIX: Network listener to retry mark-read when network comes back
+  useEffect(() => {
+    if (!ENABLE_MARK_AS_READ || !id || !user) return;
+    
+    // Set up network listener
+    const unsubscribe = NetInfo.addEventListener(state => {
+      const isConnected = state.isConnected ?? false;
+      
+      if (isConnected && needsMarkAsReadRef.current) {
+        // Network came back and we need to retry mark-read
+        const retryMarkAsRead = async () => {
+          try {
+            await messagesAPI.markMessagesAsRead(Number(id));
+            
+            // Update local messages state
+            setMessages(prevMessages => {
+              const now = new Date().toISOString();
+              return prevMessages.map(msg => {
+                if (msg.sender_id === Number(id) && msg.receiver_id === user.id && !msg.read_at) {
+                  return { ...msg, read_at: now };
+                }
+                return msg;
+              });
+            });
+            
+            updateUnreadCount(Number(id), 0);
+            needsMarkAsReadRef.current = false; // Reset flag
+            
+            if (__DEV__) {
+              console.log('[UserChat] Mark as read retried successfully after network reconnect');
+            }
+          } catch (error: any) {
+            // If it still fails, check if it's a network error
+            const isNetworkError = 
+              error?.code === 'ERR_NETWORK' ||
+              error?.message?.includes('Network Error') ||
+              !error?.response;
+            
+            if (!isNetworkError) {
+              // Non-network error - reset flag to avoid infinite retries
+              needsMarkAsReadRef.current = false;
+            }
+            
+            if (__DEV__) {
+              console.error('[UserChat] Mark as read retry failed:', error);
+            }
+          }
+        };
+        
+        // Small delay to ensure network is stable
+        setTimeout(retryMarkAsRead, 500);
+      }
+    });
+    
+    return () => {
+      unsubscribe();
+    };
+  }, [id, user, ENABLE_MARK_AS_READ, updateUnreadCount]);
 
   // Handle mobile hardware back button
   useFocusEffect(
@@ -1333,115 +1449,101 @@ export default function UserChatScreen() {
   const loadMoreMessages = async () => {
     if (loadingMore || !hasMoreMessages) return;
     
-    isPaginatingRef.current = true; // Mark that we're paginating
+    isPaginatingRef.current = true;
     setLoadingMore(true);
     
     try {
-      // Load older messages from database first (incremental pagination)
-      const currentOffset = loadedMessagesCount;
-      let newMessages: Message[] = [];
+      // API-FIRST: Fetch older messages from API (comprehensive data)
+      const nextPage = currentPage + 1;
+      const res = await messagesAPI.getByUser(Number(id), nextPage, MESSAGES_PER_PAGE);
       
+      const apiMessages = res.data.messages?.data || res.data.messages || [];
+      const pagination = res.data.messages || {};
+      
+      if (apiMessages.length === 0) {
+        setHasMoreMessages(false);
+        return;
+      }
+      
+      // Process messages
+      const processedMessages = apiMessages.map((msg: any) => ({
+        id: msg.id,
+        message: msg.message || '',
+        sender_id: msg.sender_id,
+        receiver_id: msg.receiver_id,
+        created_at: msg.created_at,
+        read_at: msg.read_at,
+        edited_at: msg.edited_at,
+        attachments: msg.attachments,
+        reply_to: msg.reply_to,
+        sync_status: 'synced' as const,
+      }));
+      
+      // Prepend older messages to existing messages
+      setMessages(prev => {
+        const existingIds = new Set(prev.map(m => m.id));
+        const uniqueNewMessages = processedMessages.filter((msg: any) => !existingIds.has(msg.id));
+        
+        if (uniqueNewMessages.length === 0) {
+          return prev;
+        }
+        
+        // Combine and sort
+        const allMessages = [...prev, ...uniqueNewMessages];
+        return deduplicateMessages(allMessages.sort((a, b) => 
+          new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
+        ));
+      });
+      
+      setCurrentPage(nextPage);
+      const hasMore = pagination.current_page < pagination.last_page || 
+                     (apiMessages.length >= MESSAGES_PER_PAGE);
+      setHasMoreMessages(hasMore);
+      
+      // BACKGROUND SYNC: Save to SQLite for offline access
       if (dbInitialized) {
-        // Load next batch from database
-        newMessages = await loadMessagesFromDb(MESSAGES_PER_PAGE, currentOffset);
-        
-        if (newMessages.length > 0) {
-          // Prepend older messages to existing messages
-          setMessages(prev => {
-            const existingIds = new Set(prev.map(m => m.id));
-            const uniqueNewMessages = newMessages.filter(msg => !existingIds.has(msg.id));
-            
-            if (uniqueNewMessages.length === 0) {
-              return prev;
-            }
-            
-            // Combine and sort
-            const allMessages = [...uniqueNewMessages, ...prev];
-            return deduplicateMessages(allMessages);
-          });
-          
-          setLoadedMessagesCount(prev => prev + newMessages.length);
-          
-          // If we got fewer messages than requested, we've reached the end
-          if (newMessages.length < MESSAGES_PER_PAGE) {
-            setHasMoreMessages(false);
+        try {
+          await syncOlderMessages(Number(id), 'individual', nextPage, MESSAGES_PER_PAGE);
+        } catch (syncError) {
+          // Silently fail - SQLite sync is not critical
+          if (__DEV__) {
+            console.warn('[UserChat] Error syncing older messages to SQLite:', syncError);
           }
-        } else {
-          // No more messages in database, check if we need to sync from API
-          setHasMoreMessages(false);
         }
       }
-      
-      // Sync older messages from API in background (for next time)
-      if (hasMoreMessages && dbInitialized) {
-        const nextPage = currentPage + 1;
-        syncOlderMessages(Number(id), 'individual', nextPage, MESSAGES_PER_PAGE).then(result => {
-          if (result.success && result.messagesCount > 0) {
-            // Reload from database to get synced messages
-            loadMessagesFromDb(MESSAGES_PER_PAGE * 2, 0).then(synced => {
-              if (synced.length > loadedMessagesCount) {
-                setMessages(synced.sort((a, b) => 
-                  new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
-                ));
-                setLoadedMessagesCount(synced.length);
-                setHasMoreMessages(result.hasMore);
-              }
-            });
-          } else if (!result.hasMore) {
-            setHasMoreMessages(false);
-          }
-        }).catch(error => {
-          console.error('[UserChat] Error syncing older messages:', error);
-        });
-      } else if (!dbInitialized) {
-        // Fallback to API if database not initialized
-        const nextPage = currentPage + 1;
-        const res = await messagesAPI.getByUser(Number(id), nextPage, MESSAGES_PER_PAGE);
-        const apiMessages = res.data.messages?.data || res.data.messages || [];
-        const pagination = res.data.messages || {};
-        
-        if (apiMessages.length === 0) {
-          setHasMoreMessages(false);
-          return;
-        }
-        
-        const processedMessages = apiMessages.map((msg: any) => ({
-          id: msg.id,
-          message: msg.message || '',
-          sender_id: msg.sender_id,
-          receiver_id: msg.receiver_id,
-          created_at: msg.created_at,
-          read_at: msg.read_at,
-          edited_at: msg.edited_at,
-          attachments: msg.attachments,
-          reply_to: msg.reply_to,
-        }));
-        
-        setMessages(prev => {
-          const existingIds = new Set(prev.map(m => m.id));
-          const uniqueNew = processedMessages.filter((msg: any) => !existingIds.has(msg.id));
-          return deduplicateMessages([...uniqueNew, ...prev]);
-        });
-        
-        setCurrentPage(nextPage);
-        const hasMore = pagination.current_page < pagination.last_page || 
-                       (apiMessages.length >= MESSAGES_PER_PAGE);
-        setHasMoreMessages(hasMore);
-      }
-      
-      // Maintain scroll position after loading more messages
-      setTimeout(() => {
-        if (flatListRef.current && newMessages.length > 0) {
-          const newScrollPosition = newMessages.length * 100; // Approximate height per message
-          (flatListRef.current as any).scrollToOffset({ 
-            offset: newScrollPosition, 
-            animated: false 
-          });
-        }
-      }, 100);
       
     } catch (error) {
       console.error('[UserChat] Error loading more messages:', error);
+      
+      // FALLBACK: Try SQLite cache if API fails
+      if (dbInitialized) {
+        try {
+          const currentOffset = loadedMessagesCount;
+          const cachedMessages = await loadMessagesFromDb(MESSAGES_PER_PAGE, currentOffset);
+          
+          if (cachedMessages.length > 0) {
+            setMessages(prev => {
+              const existingIds = new Set(prev.map(m => m.id));
+              const uniqueNew = cachedMessages.filter(msg => !existingIds.has(msg.id));
+              return deduplicateMessages([...prev, ...uniqueNew].sort((a, b) => 
+                new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
+              ));
+            });
+            setLoadedMessagesCount(prev => prev + cachedMessages.length);
+            
+            if (cachedMessages.length < MESSAGES_PER_PAGE) {
+              setHasMoreMessages(false);
+            }
+          } else {
+            setHasMoreMessages(false);
+          }
+        } catch (cacheError) {
+          console.error('[UserChat] Error loading from cache:', cacheError);
+          setHasMoreMessages(false);
+        }
+      } else {
+        setHasMoreMessages(false);
+      }
     } finally {
       setLoadingMore(false);
       setTimeout(() => {
@@ -1674,18 +1776,51 @@ export default function UserChatScreen() {
           // Send to API
           const res = await messagesAPI.sendMessage(formData);
           
+          // CRITICAL: Log response structure for debugging in production
+          if (__DEV__ || process.env.EXPO_PUBLIC_DEBUG_API === 'true') {
+            console.log('[UserChat] API Response:', {
+              status: res.status,
+              hasData: !!res.data,
+              dataKeys: res.data ? Object.keys(res.data) : [],
+              dataId: res.data?.id,
+              dataCreatedAt: res.data?.created_at,
+              fullResponse: JSON.stringify(res.data, null, 2).substring(0, 500),
+            });
+          }
+          
           // STEP 4: Update SQLite with server response (change status to synced, update server_id and timestamp)
-          if (res.data && res.data.id && dbInitialized) {
+          // Handle different response structures
+          let messageId: number | undefined;
+          let serverCreatedAt: string | undefined;
+          
+          if (res.data) {
+            // Standard structure: res.data.id
+            if (res.data.id) {
+              messageId = res.data.id;
+              serverCreatedAt = res.data.created_at;
+            }
+            // Alternative: res.data.data.id (nested)
+            else if (res.data.data && res.data.data.id) {
+              messageId = res.data.data.id;
+              serverCreatedAt = res.data.data.created_at;
+            }
+            // Alternative: res.data.message?.id
+            else if (res.data.message && res.data.message.id) {
+              messageId = res.data.message.id;
+              serverCreatedAt = res.data.message.created_at;
+            }
+          }
+          
+          if (messageId && dbInitialized) {
             try {
               // Update with server timestamp to prevent duplicates with different timestamps
-              const serverCreatedAt = res.data.created_at;
-              await updateMessageStatus(tempLocalId, res.data.id, 'synced', serverCreatedAt);
+              await updateMessageStatus(tempLocalId, messageId, 'synced', serverCreatedAt);
               
               // Update UI message with server ID and server timestamp, checking for duplicates
               setMessages(prev => {
                 // Check if message with server ID already exists (from a sync)
                 const existingIds = new Set(prev.map(m => m.id));
-                const serverIdExists = existingIds.has(res.data.id);
+                const serverIdExists = existingIds.has(messageId);
                 
                 if (serverIdExists) {
                   // Server ID already exists, remove the tempLocalId message to avoid duplication
@@ -1701,7 +1836,7 @@ export default function UserChatScreen() {
                     msg.id === tempLocalId 
                       ? { 
                           ...msg, 
-                          id: res.data.id, 
+                          id: messageId, 
                           sync_status: 'synced',
                           created_at: serverCreatedAt || msg.created_at // Use server timestamp
                         }
@@ -1713,10 +1848,10 @@ export default function UserChatScreen() {
               });
               
               // Update latest message ID
-              latestMessageIdRef.current = res.data.id;
+              latestMessageIdRef.current = messageId;
               
-              if (__DEV__) {
-                console.log('[UserChat] Message synced successfully:', tempLocalId, '->', res.data.id, 'with timestamp:', serverCreatedAt);
+              if (__DEV__ || process.env.EXPO_PUBLIC_DEBUG_API === 'true') {
+                console.log('[UserChat] Message synced successfully:', tempLocalId, '->', messageId, 'with timestamp:', serverCreatedAt);
               }
             } catch (updateError) {
               console.error('[UserChat] Error updating message status:', updateError);
@@ -1732,7 +1867,18 @@ export default function UserChatScreen() {
           
         } catch (apiError: any) {
           // STEP 5: Handle API failure gracefully
-          console.error('[UserChat] Error sending message to API:', apiError);
+          // CRITICAL: Always log errors in production for debugging
+          console.error('[UserChat] Error sending message to API:', {
+            message: apiError.message,
+            status: apiError.response?.status,
+            statusText: apiError.response?.statusText,
+            data: apiError.response?.data,
+            code: apiError.code,
+            url: apiError.config?.url,
+            baseURL: apiError.config?.baseURL,
+            method: apiError.config?.method,
+            tempLocalId: tempLocalId,
+          });
           
           // Check if it's a network error (retryable) or permanent error
           const isNetworkError = 

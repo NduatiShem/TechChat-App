@@ -19,6 +19,7 @@ import { isVideoAttachment } from '@/utils/textUtils';
 import { MaterialCommunityIcons, MaterialIcons } from '@expo/vector-icons';
 import { useFocusEffect } from '@react-navigation/native';
 import { Picker } from 'emoji-mart-native';
+import NetInfo from '@react-native-community/netinfo';
 import * as DocumentPicker from 'expo-document-picker';
 import * as FileSystem from 'expo-file-system/legacy';
 import * as ImagePicker from 'expo-image-picker';
@@ -356,6 +357,7 @@ export default function GroupChatScreen() {
   const isInitialLoadRef = useRef<boolean>(true); // Track if this is the initial load
   const lastScrollOffsetRef = useRef<number>(0); // Track last scroll offset to detect user scrolling
   const shouldAutoScrollRef = useRef<boolean>(true); // Flag to determine if auto-scroll should happen
+  const needsMarkAsReadRef = useRef<boolean>(false); // Track if mark-read needs retry when network comes back
   
   // Background sync state - for checking new messages (uses sync service + SQLite)
   const pollingIntervalRef = useRef<NodeJS.Timeout | null>(null);
@@ -437,95 +439,48 @@ export default function GroupChatScreen() {
 
   // Fetch messages
   const fetchMessages = useCallback(async (showLoading = true) => {
-    try {
+    setHasScrolledToBottom(false); // Reset scroll flag when fetching new messages
+    
+    // STEP 1: Show cached data instantly (if available) - NO loading spinner
+    if (dbInitialized) {
+      try {
+        const cachedMessages = await loadMessagesFromDb(MESSAGES_PER_PAGE, 0);
+        if (cachedMessages.length > 0) {
+          const sortedMessages = cachedMessages.sort((a, b) => 
+            new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
+          );
+          const uniqueMessages = deduplicateMessages(sortedMessages);
+          setMessages(uniqueMessages);
+          setLoadedMessagesCount(uniqueMessages.length);
+          
+          if (uniqueMessages.length > 0) {
+            const latestMsg = uniqueMessages[uniqueMessages.length - 1];
+            latestMessageIdRef.current = latestMsg.id;
+          }
+          
+          // Don't set loading to false yet - we'll fetch fresh data
+        } else {
+          // No cache available - show loading spinner
+          if (showLoading) {
+            setLoading(true);
+          }
+        }
+      } catch (cacheError) {
+        // If cache load fails, show loading spinner
+        if (showLoading) {
+          setLoading(true);
+        }
+      }
+    } else {
+      // Database not initialized - show loading spinner
       if (showLoading) {
         setLoading(true);
       }
-      setHasScrolledToBottom(false); // Reset scroll flag when fetching new messages
-      
-      // Check if this is first-time opening this conversation (no messages in DB)
-      if (dbInitialized) {
-        const hasMessages = await hasMessagesForConversation(Number(id), 'group');
-        
-        if (!hasMessages) {
-          // First-time: Fetch from API first, then save to SQLite
-          if (__DEV__) {
-            console.log('[GroupChat] First-time opening conversation, fetching from API...');
-          }
-          try {
-            const syncResult = await syncConversationMessages(Number(id), 'group', user?.id || 0);
-            if (syncResult.success) {
-              // Fix existing duplicates with wrong timestamps
-              try {
-                const response = await messagesAPI.getByGroup(Number(id), 1, 50);
-                const messagesData = response.data.messages?.data || response.data.messages || [];
-                
-                if (messagesData.length > 0) {
-                  await fixDuplicateMessagesWithWrongTimestamps(
-                    Number(id),
-                    'group',
-                    messagesData.map((msg: any) => ({
-                      id: msg.id,
-                      created_at: msg.created_at,
-                      message: msg.message,
-                      sender_id: msg.sender_id,
-                    }))
-                  );
-                }
-              } catch (cleanupError) {
-                // Silently fail - cleanup is not critical
-                if (__DEV__) {
-                  console.warn('[GroupChat] Error cleaning up duplicates:', cleanupError);
-                }
-              }
-              
-              if (syncResult.newMessagesCount > 0) {
-                // Load from database after sync
-                const syncedMessages = await loadMessagesFromDb(MESSAGES_PER_PAGE, 0);
-                if (syncedMessages.length > 0) {
-                  const sorted = syncedMessages.sort((a, b) => 
-                    new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
-                  );
-                  // Deduplicate before setting
-                  const uniqueMessages = deduplicateMessages(sorted);
-                  setMessages(uniqueMessages);
-                  setLoadedMessagesCount(uniqueMessages.length);
-                  if (uniqueMessages.length > 0) {
-                    const latestMsg = uniqueMessages[uniqueMessages.length - 1];
-                    latestMessageIdRef.current = latestMsg.id;
-                  }
-                }
-              }
-            }
-          } catch (syncError) {
-            console.error('[GroupChat] Error in first-time sync:', syncError);
-          }
-        } else {
-          // Returning: Load from local database for instant display
-          const localMessages = await loadMessagesFromDb(MESSAGES_PER_PAGE, 0);
-          if (localMessages.length > 0) {
-            const sortedMessages = localMessages.sort((a, b) => 
-              new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
-            );
-            // Deduplicate before setting
-            const uniqueMessages = deduplicateMessages(sortedMessages);
-            setMessages(uniqueMessages);
-            setLoadedMessagesCount(uniqueMessages.length);
-            if (showLoading) {
-              setLoading(false);
-            }
-            
-            // Update latest message ID
-            if (uniqueMessages.length > 0) {
-              const latestMsg = uniqueMessages[uniqueMessages.length - 1];
-              latestMessageIdRef.current = latestMsg.id;
-            }
-          }
-        }
-      }
-      
-      // Then sync from API in background (for updates)
-      // Fetch more messages (50) to match syncConversationMessages and ensure all messages are loaded
+    }
+    
+    // STEP 2: Fetch from API in parallel (always) - API is source of truth
+    try {
+      // Fetch messages from API (comprehensive data)
       const response = await messagesAPI.getByGroup(Number(id), 1, 50);
       // Handle Laravel pagination format
       const messagesData = response.data.messages?.data || response.data.messages || [];
@@ -782,7 +737,7 @@ export default function GroupChatScreen() {
             error: error.message,
             status: error.response?.status,
             retryAttempts: retryAttemptRef.current,
-            hasExistingMessages
+            hasCachedMessages
           });
         }
       }
@@ -1115,30 +1070,61 @@ export default function GroupChatScreen() {
       const markGroupMessagesAsRead = async () => {
         if (!ENABLE_MARK_AS_READ || !id || !user) return;
         
+        // CRITICAL FIX: Check network connectivity before making API call
+        try {
+          const netInfo = await NetInfo.fetch();
+          if (!netInfo.isConnected) {
+            if (__DEV__) {
+              console.log('[GroupChat] Skipping mark as read - no network connection');
+            }
+            needsMarkAsReadRef.current = true; // Set flag to retry when network comes back
+            return; // Don't make API call if offline
+          }
+        } catch (netError) {
+          // If NetInfo fails, assume offline to be safe
+          if (__DEV__) {
+            console.warn('[GroupChat] Could not check network status:', netError);
+          }
+          needsMarkAsReadRef.current = true; // Set flag to retry when network comes back
+          return;
+        }
+        
         try {
           // Mark all unread messages in this group as read
           await groupsAPI.markMessagesAsRead(Number(id));
           
           // Update unread count to 0 for this group
           updateUnreadCount(Number(id), 0);
+          needsMarkAsReadRef.current = false; // Reset flag on success
           
           if (__DEV__) {
             console.log('Group messages marked as read');
           }
         } catch (error: any) {
-          // Handle errors gracefully - don't show to user
+          // Handle errors gracefully
           const statusCode = error?.response?.status;
+          const isNetworkError = 
+            error?.code === 'ERR_NETWORK' ||
+            error?.message?.includes('Network Error') ||
+            !error?.response;
           
-          // 429 = Too Many Requests (rate limit) - expected, handled gracefully
-          // 422 = Validation error - expected in some cases
-          // 404 = Not found - endpoint might not exist yet
-          // Only log unexpected errors in development
-          if (statusCode !== 429 && statusCode !== 422 && statusCode !== 404) {
+          if (isNetworkError) {
+            // Network error - set flag to retry when network comes back
+            needsMarkAsReadRef.current = true;
             if (__DEV__) {
-              console.error('Error marking group messages as read:', statusCode || error?.message || error);
+              console.log('[GroupChat] Mark as read failed - network error, will retry when online');
+            }
+          } else {
+            // 429 = Too Many Requests (rate limit) - expected, handled gracefully
+            // 422 = Validation error - expected in some cases
+            // 404 = Not found - endpoint might not exist yet
+            // Only log unexpected errors in development
+            if (statusCode !== 429 && statusCode !== 422 && statusCode !== 404) {
+              if (__DEV__) {
+                console.error('Error marking group messages as read:', statusCode || error?.message || error);
+              }
             }
           }
-          // Silently ignore rate limit and validation errors
         }
       };
 
@@ -1154,6 +1140,54 @@ export default function GroupChatScreen() {
       };
     }, [id, user, ENABLE_MARK_AS_READ, updateUnreadCount, setActiveConversation, clearActiveConversation, fetchMessages, messages.length, scrollToBottom, loadingMore, currentPage])
   );
+
+  // CRITICAL FIX: Network listener to retry mark-read when network comes back
+  useEffect(() => {
+    if (!ENABLE_MARK_AS_READ || !id || !user) return;
+    
+    // Set up network listener
+    const unsubscribe = NetInfo.addEventListener(state => {
+      const isConnected = state.isConnected ?? false;
+      
+      if (isConnected && needsMarkAsReadRef.current) {
+        // Network came back and we need to retry mark-read
+        const retryMarkAsRead = async () => {
+          try {
+            await groupsAPI.markMessagesAsRead(Number(id));
+            
+            updateUnreadCount(Number(id), 0);
+            needsMarkAsReadRef.current = false; // Reset flag
+            
+            if (__DEV__) {
+              console.log('[GroupChat] Mark as read retried successfully after network reconnect');
+            }
+          } catch (error: any) {
+            // If it still fails, check if it's a network error
+            const isNetworkError = 
+              error?.code === 'ERR_NETWORK' ||
+              error?.message?.includes('Network Error') ||
+              !error?.response;
+            
+            if (!isNetworkError) {
+              // Non-network error - reset flag to avoid infinite retries
+              needsMarkAsReadRef.current = false;
+            }
+            
+            if (__DEV__) {
+              console.error('[GroupChat] Mark as read retry failed:', error);
+            }
+          }
+        };
+        
+        // Small delay to ensure network is stable
+        setTimeout(retryMarkAsRead, 500);
+      }
+    });
+    
+    return () => {
+      unsubscribe();
+    };
+  }, [id, user, ENABLE_MARK_AS_READ, updateUnreadCount]);
 
   // Load more messages function
   const loadMoreMessages = async () => {
@@ -1510,19 +1544,51 @@ export default function GroupChatScreen() {
           // Send to API
           const res = await messagesAPI.sendMessage(formData);
           
+          // CRITICAL: Log response structure for debugging in production
+          if (__DEV__ || process.env.EXPO_PUBLIC_DEBUG_API === 'true') {
+            console.log('[GroupChat] API Response:', {
+              status: res.status,
+              hasData: !!res.data,
+              dataKeys: res.data ? Object.keys(res.data) : [],
+              dataId: res.data?.id,
+              dataCreatedAt: res.data?.created_at,
+              fullResponse: JSON.stringify(res.data, null, 2).substring(0, 500),
+            });
+          }
+          
           // STEP 4: Update SQLite with server response (change status to synced, update server_id and timestamp)
-          if (res.data && res.data.id && dbInitialized) {
+          // Handle different response structures
+          let messageId: number | undefined;
+          let serverCreatedAt: string | undefined;
+          
+          if (res.data) {
+            // Standard structure: res.data.id
+            if (res.data.id) {
+              messageId = res.data.id;
+              serverCreatedAt = res.data.created_at;
+            }
+            // Alternative: res.data.data.id (nested)
+            else if (res.data.data && res.data.data.id) {
+              messageId = res.data.data.id;
+              serverCreatedAt = res.data.data.created_at;
+            }
+            // Alternative: res.data.message?.id
+            else if (res.data.message && res.data.message.id) {
+              messageId = res.data.message.id;
+              serverCreatedAt = res.data.message.created_at;
+            }
+          }
+          
+          if (messageId && dbInitialized) {
             try {
               // Update with server timestamp to prevent duplicates with different timestamps
-              const serverCreatedAt = res.data.created_at;
-              await updateMessageStatus(tempLocalId, res.data.id, 'synced', serverCreatedAt);
+              await updateMessageStatus(tempLocalId, messageId, 'synced', serverCreatedAt);
               
               // Update UI message with server ID and server timestamp, checking for duplicates
               setMessages(prev => {
-                const serverId = res.data.id;
                 // Check if message with server ID already exists (from a sync)
                 const existingIds = new Set(prev.map(m => m.id));
-                const serverIdExists = existingIds.has(serverId);
+                const serverIdExists = existingIds.has(messageId);
                 
                 if (serverIdExists) {
                   // Server ID already exists, remove the tempLocalId message to avoid duplication
@@ -1538,7 +1604,7 @@ export default function GroupChatScreen() {
                     msg.id === tempLocalId 
                       ? { 
                           ...msg, 
-                          id: serverId, 
+                          id: messageId, 
                           sync_status: 'synced',
                           created_at: serverCreatedAt || msg.created_at // Use server timestamp
                         }
@@ -1550,10 +1616,10 @@ export default function GroupChatScreen() {
               });
               
               // Update latest message ID
-              latestMessageIdRef.current = res.data.id;
+              latestMessageIdRef.current = messageId;
               
-              if (__DEV__) {
-                console.log('[GroupChat] Message synced successfully:', tempLocalId, '->', res.data.id, 'with timestamp:', serverCreatedAt);
+              if (__DEV__ || process.env.EXPO_PUBLIC_DEBUG_API === 'true') {
+                console.log('[GroupChat] Message synced successfully:', tempLocalId, '->', messageId, 'with timestamp:', serverCreatedAt);
               }
             } catch (updateError) {
               console.error('[GroupChat] Error updating message status:', updateError);
@@ -1569,7 +1635,18 @@ export default function GroupChatScreen() {
           
         } catch (apiError: any) {
           // STEP 5: Handle API failure gracefully
-          console.error('[GroupChat] Error sending message to API:', apiError);
+          // CRITICAL: Always log errors in production for debugging
+          console.error('[GroupChat] Error sending message to API:', {
+            message: apiError.message,
+            status: apiError.response?.status,
+            statusText: apiError.response?.statusText,
+            data: apiError.response?.data,
+            code: apiError.code,
+            url: apiError.config?.url,
+            baseURL: apiError.config?.baseURL,
+            method: apiError.config?.method,
+            tempLocalId: tempLocalId,
+          });
           
           // Check if it's a network error (retryable) or permanent error
           const isNetworkError = 

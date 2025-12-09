@@ -353,70 +353,37 @@ export default function ConversationsScreen() {
     if (user && dbInitialized) {
       const loadData = async () => {
         try {
-          // Check if database is empty (first-time user)
-          const isEmpty = await isDatabaseEmpty();
-          
-          if (isEmpty) {
-            // First-time user: Fetch from API first, then save to SQLite
-            if (__DEV__) {
-              console.log('[Conversations] First-time user detected, fetching from API...');
-            }
+          // STEP 1: Show cached data instantly (if available) - NO loading spinner
+          const cachedConversations = await loadCachedConversations();
+          if (cachedConversations.length > 0) {
+            const deduplicated = deduplicateConversations(cachedConversations);
+            setConversations(deduplicated);
+            setFilteredConversations(deduplicated);
+            // Don't set loading to false yet - we'll fetch fresh data
+          } else {
+            // No cache available - show loading spinner
             setIsLoading(true);
+          }
+          
+          // STEP 2: Fetch from API in parallel (always) - API is source of truth
+          try {
+            await loadConversations(); // This fetches from API and saves to SQLite
+          } catch (apiError) {
+            console.error('[Conversations] API fetch failed:', apiError);
             
-            const syncResult = await syncConversations();
-            
-            if (syncResult.success) {
-              // Load from database after sync
-              const synced = await loadCachedConversations();
-              if (synced.length > 0) {
-                const deduplicated = deduplicateConversations(synced);
-                setConversations(deduplicated);
-                setFilteredConversations(deduplicated);
-              }
+            // STEP 3: If API fails and we have cache, keep showing cache
+            if (cachedConversations.length > 0) {
+              // Cache already displayed above, just ensure loading is off
               setIsLoading(false);
             } else {
-              // Fallback to regular API load if sync fails
-              await loadConversations();
+              // No cache and API failed - show error state
+              setIsLoading(false);
+              // Keep empty state (already set above)
             }
-          } else {
-            // Returning user: Load from SQLite instantly
-            if (__DEV__) {
-              console.log('[Conversations] Returning user, loading from SQLite...');
-            }
-            loadCachedConversations().then(cached => {
-              if (cached.length > 0) {
-                const deduplicated = deduplicateConversations(cached);
-                setConversations(deduplicated);
-                setFilteredConversations(deduplicated);
-                setIsLoading(false);
-              } else {
-                // If no cached data, fetch from API
-                loadConversations();
-              }
-            });
-            
-            // Then sync from API in background (will update database if successful)
-            syncConversations().then(result => {
-              if (result.success) {
-                // Reload from database to get synced data
-                loadCachedConversations().then(synced => {
-                  if (synced.length > 0) {
-                    const deduplicated = deduplicateConversations(synced);
-                    setConversations(deduplicated);
-                    setFilteredConversations(deduplicated);
-                  }
-                });
-              }
-            }).catch((error) => {
-              if (__DEV__) {
-                console.error('[Conversations] Background sync failed:', error);
-              }
-            });
           }
         } catch (error) {
           console.error('[Conversations] Error in loadData:', error);
-          // Fallback to regular API load
-          await loadConversations();
+          setIsLoading(false);
         }
       };
       
@@ -434,27 +401,28 @@ export default function ConversationsScreen() {
     useCallback(() => {
       // Only reload if user is authenticated and database is initialized
       if (user && dbInitialized) {
-        // Load from local DB first for instant display
-        loadCachedConversations().then(cached => {
-          if (cached.length > 0) {
-            const deduplicated = deduplicateConversations(cached);
+        // OPTIMIZED: Show cached data instantly, then fetch fresh from API
+        const refreshData = async () => {
+          // Show cached data instantly (if available)
+          const cachedConversations = await loadCachedConversations();
+          if (cachedConversations.length > 0) {
+            const deduplicated = deduplicateConversations(cachedConversations);
             setConversations(deduplicated);
             setFilteredConversations(deduplicated);
           }
-        });
-        
-        // Then sync in background
-        syncConversations().then(result => {
-          if (result.success) {
-            loadCachedConversations().then(synced => {
-              if (synced.length > 0) {
-                const deduplicated = deduplicateConversations(synced);
-                setConversations(deduplicated);
-                setFilteredConversations(deduplicated);
-              }
-            });
+          
+          // Fetch fresh data from API (always)
+          try {
+            await loadConversations(); // This fetches from API and updates SQLite
+          } catch (error) {
+            // If API fails, cached data is already displayed
+            if (__DEV__) {
+              console.error('[Conversations] Background refresh failed:', error);
+            }
           }
-        });
+        };
+        
+        refreshData();
       }
       // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [user, dbInitialized]) // loadConversations is stable, no need to include
