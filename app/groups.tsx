@@ -1,11 +1,13 @@
-import LastMessagePreview from '@/components/LastMessagePreview';
 import GroupAvatar from '@/components/GroupAvatar';
+import LastMessagePreview from '@/components/LastMessagePreview';
 import { useAuth } from '@/context/AuthContext';
 import { useNotifications } from '@/context/NotificationContext';
 import { useTheme } from '@/context/ThemeContext';
 import { groupsAPI } from '@/services/api';
 import { getGroups as getDbGroups, initDatabase, saveGroups as saveDbGroups } from '@/services/database';
 import { MaterialCommunityIcons } from '@expo/vector-icons';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import NetInfo from '@react-native-community/netinfo';
 import { useFocusEffect } from '@react-navigation/native';
 import { router } from 'expo-router';
 import React, { useEffect, useState } from 'react';
@@ -20,8 +22,6 @@ import {
   View,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import NetInfo from '@react-native-community/netinfo';
-import AsyncStorage from '@react-native-async-storage/async-storage';
 
 // Hybrid Cache Strategy: AsyncStorage (fast) + SQLite (persistent) + API (source of truth)
 const GROUPS_CACHE_KEY = '@techchat_groups';
@@ -138,35 +138,42 @@ export default function GroupsScreen() {
   };
 
   const loadGroups = async (forceRefresh = false) => {
-    // ✅ HYBRID CACHE STRATEGY:
-    // 1. Load AsyncStorage first (instant display)
-    // 2. Fetch API in background (update both caches)
-    // 3. On error, keep showing AsyncStorage (never clear)
-
-    // STEP 1: Load AsyncStorage immediately (fastest, instant display)
-    const asyncStorageGroups = await loadAsyncStorageGroups();
-    if (asyncStorageGroups.length > 0) {
-      setGroups(asyncStorageGroups);
-      setFilteredGroups(asyncStorageGroups);
-      setIsLoading(false); // Show data immediately, don't wait for API
-    }
-
+    // ✅ API-FIRST STRATEGY: Try API first, fallback to AsyncStorage/SQLite only if API fails
+    // Only show empty state if API returns empty AND all fallbacks are empty AND requests completed successfully
+    
     // If offline and not forcing refresh, use cached data only
     if (!isOnline && !forceRefresh) {
-      // Try SQLite as fallback if AsyncStorage is empty
-      if (asyncStorageGroups.length === 0) {
-        const sqliteGroups = await loadCachedGroups();
-        if (sqliteGroups.length > 0) {
-          setGroups(sqliteGroups);
-          setFilteredGroups(sqliteGroups);
-          // Also save to AsyncStorage for next time
-          await saveAsyncStorageGroups(sqliteGroups);
-        }
+      // Try AsyncStorage first
+      const asyncStorageGroups = await loadAsyncStorageGroups();
+      if (asyncStorageGroups.length > 0) {
+        setGroups(asyncStorageGroups);
+        setFilteredGroups(asyncStorageGroups);
+        setIsLoading(false);
+        return;
       }
+      
+      // Try SQLite as fallback
+      const sqliteGroups = await loadCachedGroups();
+      if (sqliteGroups.length > 0) {
+        setGroups(sqliteGroups);
+        setFilteredGroups(sqliteGroups);
+        await saveAsyncStorageGroups(sqliteGroups);
+        setIsLoading(false);
+        return;
+      }
+      
+      // Both empty - show empty state
+      setGroups([]);
+      setFilteredGroups([]);
+      setIsLoading(false);
       return;
     }
 
-    // STEP 2: Fetch from API in background (update both caches)
+    // STEP 1: Try API first (source of truth)
+    let apiSuccess = false;
+    let apiGroups: Group[] = [];
+    let apiError: any = null;
+    
     try {
       const response = await groupsAPI.getAll();
       const groupsData = response.data;
@@ -174,25 +181,9 @@ export default function GroupsScreen() {
       // Ensure groupsData is always an array
       const safeGroupsData = Array.isArray(groupsData) ? groupsData : [];
       
-      // ✅ HYBRID CACHE: If API returns empty, try all fallbacks
-      if (safeGroupsData.length === 0) {
-        // Try AsyncStorage first
-        if (asyncStorageGroups.length > 0) {
-          setGroups(asyncStorageGroups);
-          setFilteredGroups(asyncStorageGroups);
-          setIsLoading(false);
-          return;
-        }
-        // Try SQLite
-        const sqliteGroups = await loadCachedGroups();
-        if (sqliteGroups.length > 0) {
-          setGroups(sqliteGroups);
-          setFilteredGroups(sqliteGroups);
-          await saveAsyncStorageGroups(sqliteGroups);
-          setIsLoading(false);
-          return;
-        }
-      }
+      // Mark API as successful
+      apiSuccess = true;
+      apiGroups = safeGroupsData;
       
       // Sync unread counts from backend to notification context
       if (safeGroupsData.length > 0) {
@@ -204,11 +195,7 @@ export default function GroupsScreen() {
         updateGroupUnreadCount(totalGroupUnread);
       }
       
-      setGroups(safeGroupsData);
-      setFilteredGroups(safeGroupsData);
-      
-      // ✅ HYBRID CACHE: Save to both AsyncStorage (fast) and SQLite (persistent)
-      // Save to AsyncStorage first (fastest)
+      // Save to both AsyncStorage (fast) and SQLite (persistent)
       await saveAsyncStorageGroups(safeGroupsData);
       
       // Save groups to SQLite for offline access
@@ -230,17 +217,26 @@ export default function GroupsScreen() {
           await saveDbGroups(groupsToSave);
         } catch (dbError) {
           console.error('[Groups] Error saving to database:', dbError);
-          // Continue even if SQLite fails - AsyncStorage is already saved
         }
       }
     } catch (error: any) {
+      apiError = error;
       console.error('Failed to load groups from API:', error);
-      
-      // ✅ HYBRID CACHE: On API error, try all fallbacks but NEVER clear existing data
-      // Priority: AsyncStorage → SQLite → Keep existing state
-      
-      // If we already have data from AsyncStorage, keep it (don't clear)
-      if (groups.length > 0) {
+    }
+    
+    // STEP 2: Handle API result or fallback to AsyncStorage/SQLite
+    if (apiSuccess) {
+      // ✅ API succeeded - use API data (even if empty, it's the truth)
+      setGroups(apiGroups);
+      setFilteredGroups(apiGroups);
+      setIsLoading(false);
+    } else {
+      // ❌ API failed - fallback to AsyncStorage → SQLite
+      // Try AsyncStorage first
+      const asyncStorageGroups = await loadAsyncStorageGroups();
+      if (asyncStorageGroups.length > 0) {
+        setGroups(asyncStorageGroups);
+        setFilteredGroups(asyncStorageGroups);
         setIsLoading(false);
         return;
       }
@@ -250,29 +246,14 @@ export default function GroupsScreen() {
       if (sqliteGroups.length > 0) {
         setGroups(sqliteGroups);
         setFilteredGroups(sqliteGroups);
-        // Also save to AsyncStorage for next time
         await saveAsyncStorageGroups(sqliteGroups);
         setIsLoading(false);
         return;
       }
       
-      // Try AsyncStorage one more time (in case it wasn't loaded initially)
-      const asyncStorageGroups = await loadAsyncStorageGroups();
-      if (asyncStorageGroups.length > 0) {
-        setGroups(asyncStorageGroups);
-        setFilteredGroups(asyncStorageGroups);
-        setIsLoading(false);
-        return;
-      }
-      
-      // ✅ CRITICAL: Only show empty state if ALL three sources are empty
-      // Never clear state on error - preserve existing data
-      if (groups.length === 0) {
-        // All caches empty - this is truly empty, not an app failure
-        setGroups([]);
-        setFilteredGroups([]);
-      }
-    } finally {
+      // ❌ Both API and fallbacks are empty - show empty state
+      setGroups([]);
+      setFilteredGroups([]);
       setIsLoading(false);
     }
   };
@@ -323,78 +304,27 @@ export default function GroupsScreen() {
   useEffect(() => {
     // Only load groups if user is authenticated and database is initialized
     if (user && dbInitialized) {
-      const loadData = async () => {
-        try {
-          // ✅ HYBRID CACHE: Load AsyncStorage first (instant display)
-          const asyncStorageGroups = await loadAsyncStorageGroups();
-          if (asyncStorageGroups.length > 0) {
-            setGroups(asyncStorageGroups);
-            setFilteredGroups(asyncStorageGroups);
-            setIsLoading(false); // Show data immediately
-          } else {
-            // Try SQLite as fallback
-            const sqliteGroups = await loadCachedGroups();
-            if (sqliteGroups.length > 0) {
-              setGroups(sqliteGroups);
-              setFilteredGroups(sqliteGroups);
-              // Save to AsyncStorage for next time
-              await saveAsyncStorageGroups(sqliteGroups);
-              setIsLoading(false);
-            } else {
-              // No cache available - show loading spinner
-              setIsLoading(true);
-            }
-          }
-          
-          // STEP 2: Fetch from API in background (always) - updates both caches
-          try {
-            await loadGroups(); // This fetches from API and saves to both caches
-          } catch (apiError) {
-            console.error('[Groups] API fetch failed:', apiError);
-            // Don't clear state - keep showing cached data
-            setIsLoading(false);
-          }
-        } catch (error) {
-          console.error('[Groups] Error in loadData:', error);
-          setIsLoading(false);
-        }
-      };
-      
-      loadData();
-      
-      // Then load from API (will update SQLite if successful)
-      loadGroups();
+      // ✅ API-FIRST: Try API first, fallback to cache only if API fails
+      setIsLoading(true);
+      loadGroups().catch((error) => {
+        console.error('[Groups] Error in loadGroups:', error);
+        setIsLoading(false);
+      });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [user]); // loadGroups is stable, no need to include
+  }, [user, dbInitialized]); // loadGroups is stable, no need to include
 
   // Refresh groups when screen comes into focus
-  // Reload groups when screen comes into focus
   useFocusEffect(
     React.useCallback(() => {
       // Only reload if user is authenticated and database is initialized
       if (user && dbInitialized) {
-        // ✅ HYBRID CACHE: Show AsyncStorage instantly, then fetch fresh from API
-        const refreshData = async () => {
-          // Show AsyncStorage data instantly (if available)
-          const asyncStorageGroups = await loadAsyncStorageGroups();
-          if (asyncStorageGroups.length > 0) {
-            setGroups(asyncStorageGroups);
-            setFilteredGroups(asyncStorageGroups);
+        // ✅ API-FIRST: Try API first, fallback to cache only if API fails
+        loadGroups().catch((error) => {
+          if (__DEV__) {
+            console.error('[Groups] Background refresh failed:', error);
           }
-          
-          // Fetch fresh data from API in background (updates both caches)
-          try {
-            await loadGroups(); // This fetches from API and updates both caches
-          } catch (error) {
-            // If API fails, cached data is already displayed
-            if (__DEV__) {
-              console.error('[Groups] Background refresh failed:', error);
-            }
-          }
-        };
-        
-        refreshData();
+        });
       }
       // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [user, dbInitialized]) // loadGroups is stable, no need to include
@@ -467,13 +397,13 @@ export default function GroupsScreen() {
               {item.name ? String(item.name) : ' '}
             </Text>
             {/* Show unread count on the right side - like WhatsApp */}
-            {item.unread_count > 0 && (
+            {(item.unread_count ?? 0) > 0 && (
               <View 
                 className="ml-2 h-5 px-1.5 rounded-full bg-green-500 items-center justify-center"
                 style={{ minWidth: 20 }}
               >
                 <Text className="text-white text-xs font-bold">
-                  {item.unread_count > 99 ? '99+' : item.unread_count.toString()}
+                  {(item.unread_count ?? 0) > 99 ? '99+' : (item.unread_count ?? 0).toString()}
                 </Text>
               </View>
             )}

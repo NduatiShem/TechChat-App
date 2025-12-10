@@ -536,149 +536,78 @@ export default function UserChatScreen() {
   }, [id, dbInitialized]);
 
   // Fetch messages and user info
+  // ✅ API-FIRST STRATEGY: Try API first, fallback to SQLite only if API fails
   const fetchMessages = useCallback(async (showLoading = true) => {
       // Reset scroll flag on initial load
       if (isInitialLoadRef.current) {
         setHasScrolledToBottom(false);
       }
     
-    // STEP 1: Show cached data instantly (if available) - NO loading spinner
-    if (dbInitialized) {
-      try {
-        const cachedMessages = await loadMessagesFromDb(MESSAGES_PER_PAGE, 0);
-        if (cachedMessages.length > 0) {
-          const sortedMessages = cachedMessages.sort((a, b) => 
-            new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
-          );
-          const uniqueMessages = deduplicateMessages(sortedMessages);
-          setMessages(uniqueMessages);
-          setLoadedMessagesCount(uniqueMessages.length);
-          
-          // Initially show only last N messages (latest at bottom)
-          if (isInitialLoadRef.current && uniqueMessages.length > INITIAL_VISIBLE_MESSAGES) {
-            const startIndex = uniqueMessages.length - INITIAL_VISIBLE_MESSAGES;
-            setVisibleMessagesStartIndex(startIndex);
-          } else if (visibleMessagesStartIndex === null && uniqueMessages.length > 0) {
-            // If not initial load and no start index set, show all
-            setVisibleMessagesStartIndex(null);
-          }
-          
-          if (uniqueMessages.length > 0) {
-            const latestMsg = uniqueMessages[uniqueMessages.length - 1];
-            latestMessageIdRef.current = latestMsg.id;
-          }
-          
-          // Don't set loading to false yet - we'll fetch fresh data
-        } else {
-          // No cache available - show loading spinner
-          if (showLoading) {
+    // Show loading spinner if requested
+    if (showLoading) {
       setLoading(true);
-          }
-        }
-      } catch (cacheError) {
-        // If cache load fails, show loading spinner
-        if (showLoading) {
-          setLoading(true);
-        }
-      }
-    } else {
-      // Database not initialized - show loading spinner
-      if (showLoading) {
-        setLoading(true);
-      }
     }
     
-    // STEP 2: Fetch from API in parallel (always) - API is source of truth
+    // STEP 1: Try API first (source of truth)
+    let apiSuccess = false;
+    let apiMessages: Message[] = [];
+    let apiError: any = null;
+    
     try {
       // Fetch more messages (50) to match syncConversationMessages and ensure all messages are loaded
       const res = await messagesAPI.getByUser(Number(id), 1, 50);
-        
-        // Handle Laravel pagination format
-        const messagesData = res.data.messages?.data || res.data.messages || [];
-        const pagination = res.data.messages || {};
-        
-        // Debug each message's attachments
-        messagesData.forEach((message: any, index: number) => {
-          if (message.attachments && message.attachments.length > 0) {
-            // Message has attachments
-          }
-        });
-        
-        // Check if there are more messages using Laravel pagination
-        // Try multiple possible pagination formats
-        const hasMore = pagination.current_page < pagination.last_page || 
-                       pagination.current_page < pagination.lastPage ||
-                       (pagination.current_page && pagination.last_page && pagination.current_page < pagination.last_page) ||
-                       (messagesData.length >= 10); // Fallback: if we got 10 messages, assume there might be more
-        
-        setHasMoreMessages(hasMore);
-        
-        // Debug: Log messages with reply_to_id to check backend response
-        const messagesWithReply = messagesData.filter((msg: any) => msg.reply_to_id);
-        if (messagesWithReply.length > 0) {
-          console.log('Messages with reply_to_id:', messagesWithReply.map((msg: any) => ({
-            id: msg.id,
-            message: msg.message,
-            reply_to_id: msg.reply_to_id,
-            has_reply_to_object: !!msg.reply_to,
-            reply_to: msg.reply_to
-          })));
-        }
-        
-        // Process messages to ensure reply_to data is properly structured
-        // If a message has reply_to_id but no reply_to object, we need to find the original message
-        const processedMessages = messagesData.map((msg: any) => {
-          // If message already has reply_to object, use it (backend loaded it correctly)
-          if (msg.reply_to) {
-            console.log('Message has reply_to from backend:', msg.id, msg.reply_to);
-            return msg;
-          }
-          
-          // If message has reply_to_id but no reply_to object, try to find it in the messages list
-          if (msg.reply_to_id) {
-            console.log('Message has reply_to_id but no reply_to object, searching in messages list:', msg.id, msg.reply_to_id);
-            const repliedMessage = messagesData.find((m: any) => m.id === msg.reply_to_id);
-            if (repliedMessage) {
-              // Construct reply_to object from the found message
-              msg.reply_to = {
-                id: repliedMessage.id,
-                message: repliedMessage.message,
-                sender: repliedMessage.sender || {
-                  id: repliedMessage.sender_id,
-                  name: repliedMessage.sender?.name || 'Unknown User'
-                },
-                attachments: repliedMessage.attachments || []
-              };
-              console.log('Constructed reply_to from local messages:', msg.id, msg.reply_to);
-            } else {
-              console.warn('Could not find replied message in current batch:', msg.id, 'replying to:', msg.reply_to_id);
-            }
-          }
-          
-          return msg;
-        });
-        
-        // Sort messages by created_at in ascending order (oldest first)
-        const sortedMessages = processedMessages.sort((a: Message, b: Message) => 
-          new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
-        );
       
-      // Deduplicate messages before setting state
-      const uniqueMessages = deduplicateMessages(sortedMessages);
+      // Handle Laravel pagination format
+      const messagesData = res.data.messages?.data || res.data.messages || [];
+      const pagination = res.data.messages || {};
+      
+      // Check if there are more messages using Laravel pagination
+      const hasMore = pagination.current_page < pagination.last_page || 
+                     pagination.current_page < pagination.lastPage ||
+                     (pagination.current_page && pagination.last_page && pagination.current_page < pagination.last_page) ||
+                     (messagesData.length >= 10);
+      
+      setHasMoreMessages(hasMore);
+      
+      // Process messages to ensure reply_to data is properly structured
+      const processedMessages = messagesData.map((msg: any) => {
+        if (msg.reply_to) {
+          return msg;
+        }
         
-        // Find the newest message index for initial scroll
-        const newestMessageId = pagination.newest_message_id;
-        
-        // If we have newest_message_id, find its index after sorting
-        if (newestMessageId) {
-        const newestIndex = uniqueMessages.findIndex((msg: Message) => msg.id === newestMessageId);
-          if (newestIndex >= 0) {
-            console.log('Found newest message at index:', newestIndex, 'ID:', newestMessageId);
-          } else {
-            console.log('Newest message ID not found in sorted messages, using last index');
+        if (msg.reply_to_id) {
+          const repliedMessage = messagesData.find((m: any) => m.id === msg.reply_to_id);
+          if (repliedMessage) {
+            msg.reply_to = {
+              id: repliedMessage.id,
+              message: repliedMessage.message,
+              sender: repliedMessage.sender || {
+                id: repliedMessage.sender_id,
+                name: repliedMessage.sender?.name || 'Unknown User'
+              },
+              attachments: repliedMessage.attachments || []
+            };
           }
         }
         
+        return msg;
+      });
+      
+      // Sort messages by created_at in ascending order (oldest first)
+      const sortedMessages = processedMessages.sort((a: Message, b: Message) => 
+        new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
+      );
+      
+      // Deduplicate messages
+      const uniqueMessages = deduplicateMessages(sortedMessages);
+      
+      // Mark API as successful
+      apiSuccess = true;
+      apiMessages = uniqueMessages.map(msg => ({
+        ...msg,
+        sync_status: msg.sync_status || 'synced' as const,
+      }));
+      
       // Save messages to database
       if (dbInitialized) {
         try {
@@ -711,247 +640,57 @@ export default function UserChatScreen() {
               }))
             );
           } catch (cleanupError) {
-            // Silently fail - cleanup is not critical
             if (__DEV__) {
               console.warn('[UserChat] Error cleaning up duplicates after save:', cleanupError);
             }
-          }
-          
-          if (__DEV__) {
-            console.log(`[UserChat] Saved ${messagesToSave.length} messages to database from API sync`);
           }
         } catch (dbError) {
           console.error('[UserChat] Error saving messages to database:', dbError);
         }
       }
       
-      // Only update UI if we didn't already load from DB (to avoid flicker)
-      if (!dbInitialized || messages.length === 0) {
-        // Ensure all messages have sync_status (default to 'synced' for API messages)
-        const messagesWithStatus = uniqueMessages.map(msg => ({
-          ...msg,
-          sync_status: msg.sync_status || 'synced' as const,
-        }));
-        setMessages(messagesWithStatus);
-        messagesLengthRef.current = messagesWithStatus.length;
-        
-        // Initially show only last N messages (latest at bottom)
-        if (isInitialLoadRef.current && messagesWithStatus.length > INITIAL_VISIBLE_MESSAGES) {
-          const startIndex = messagesWithStatus.length - INITIAL_VISIBLE_MESSAGES;
-          setVisibleMessagesStartIndex(startIndex);
-        } else if (visibleMessagesStartIndex === null) {
-          // If not initial load and no start index set, show all
-          setVisibleMessagesStartIndex(null);
-        }
-      } else {
-        // Reload from DB to get merged data (includes sync_status)
-        // CRITICAL FIX: Check if DB messages are identical to current state before merging
-        // This prevents duplicates when fetchMessages reloads the same data
-        const mergedMessages = await loadMessagesFromDb(MESSAGES_PER_PAGE, 0);
-        
-        if (mergedMessages.length > 0) {
-          const sorted = mergedMessages.sort((a, b) => 
-            new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
-          );
-          
-          // CRITICAL FIX: Check if DB messages are identical to current state before merging
-          setMessages(prev => {
-            // Create Sets for fast comparison
-            const prevIds = new Set(prev.map(m => m.id).filter(id => id != null && typeof id === 'number' && id < 1000000000000));
-            const dbIds = new Set(sorted.map(m => m.id).filter(id => id != null && typeof id === 'number' && id < 1000000000000));
-            
-            // Check if DB has the same messages as prev (by ID count and content)
-            const prevIdsArray = Array.from(prevIds);
-            const dbIdsArray = Array.from(dbIds);
-            const sameIds = prevIdsArray.length === dbIdsArray.length && 
-                            prevIdsArray.length > 0 &&
-                            prevIdsArray.every(id => dbIds.has(id));
-            
-            // If DB messages are identical to prev state, just return prev (no merge needed)
-            if (sameIds && prev.length === sorted.length) {
-              // Double-check by comparing a few key messages to ensure they're truly identical
-              const sampleSize = Math.min(5, sorted.length);
-              const sampleMatch = sorted.slice(0, sampleSize).every(dbMsg => {
-                const prevMsg = prev.find(p => p.id === dbMsg.id);
-                return prevMsg && 
-                       (prevMsg.message || '') === (dbMsg.message || '') &&
-                       prevMsg.sender_id === dbMsg.sender_id;
-              });
-              
-              if (sampleMatch) {
-                // DB messages are identical to prev state - no merge needed
-                // Just preserve any pending messages that might not be in DB yet
-                const pendingMessages = prev.filter(msg => 
-                  msg.sync_status === 'pending' && 
-                  typeof msg.id === 'number' && 
-                  msg.id > 1000000000000 &&
-                  !dbIds.has(msg.id)
-                );
-                
-                if (pendingMessages.length > 0) {
-                  // We have pending messages not in DB - merge them
-                  const allMessages = [...sorted, ...pendingMessages].sort((a, b) => 
-                    new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
-                  );
-                  const deduplicated = deduplicateMessages(allMessages);
-                  messagesLengthRef.current = deduplicated.length;
-                  return deduplicated;
-                }
-                
-                // No pending messages, return prev as-is (no duplicates)
-                return prev;
-              }
-            }
-            
-            // DB messages are different from prev - perform merge with deduplication
-            // Create a Set of server_ids from DB messages for fast lookup
-            const dbServerIds = new Set(sorted.map(msg => msg.id).filter(id => id != null));
-            
-            // Filter out messages from prev that are already in DB by server_id
-            const prevMessagesNotInDb = prev.filter(msg => {
-              // If message has a server_id, check if it's already in DB
-              if (msg.id && typeof msg.id === 'number' && msg.id < 1000000000000) {
-                // This is a synced message - exclude it if it's already in DB
-                return !dbServerIds.has(msg.id);
-              }
-              
-              // If message has tempLocalId (pending), check if it matches a DB message
-              if (msg.sync_status === 'pending' && 
-                  typeof msg.id === 'number' && 
-                  msg.id > 1000000000000) {
-                // Check if this pending message matches a DB message by content+sender
-                const matchesDb = sorted.some(dbMsg => {
-                  const timeDiff = Math.abs(
-                    new Date(dbMsg.created_at).getTime() - new Date(msg.created_at).getTime()
-                  );
-                  const messageMatch = (dbMsg.message || '') === (msg.message || '');
-                  const senderMatch = dbMsg.sender_id === msg.sender_id;
-                  
-                  return messageMatch && senderMatch && timeDiff < 10000; // 10 second window
-                });
-                
-                return !matchesDb; // Only keep if it doesn't match a DB message
-              }
-              
-              // Keep other pending messages
-              return msg.sync_status === 'pending';
-            });
-            
-            // Combine: DB messages (source of truth) + prev messages not in DB
-            const allMessages = [...sorted, ...prevMessagesNotInDb];
-            const sortedAll = allMessages.sort((a, b) => 
-              new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
-            );
-            
-            // CRITICAL: Deduplicate by server_id first, then by content+timestamp
-            const deduplicated = deduplicateMessages(sortedAll);
-            messagesLengthRef.current = deduplicated.length;
-            return deduplicated;
-          });
-        } else {
-          // No DB messages, but preserve pending messages
-          setMessages(prev => {
-            const pendingMessages = prev.filter(msg => 
-              msg.sync_status === 'pending' || 
-              (msg.sync_status !== 'synced' && typeof msg.id === 'number' && msg.id > 1000000000000)
-            );
-            if (pendingMessages.length > 0) {
-              messagesLengthRef.current = pendingMessages.length;
-              return pendingMessages;
-            }
-            return prev;
-          });
-        }
-      }
+      // Set user info
+      setUserInfo(res.data.selectedConversation);
       
-      // Set latest message ID for tracking
-      setMessages(current => {
-        if (current.length > 0) {
-          const latestMsg = current[current.length - 1];
-          latestMessageIdRef.current = latestMsg.id;
-        }
-        return current; // Don't modify state, just use it for side effects
-      });
-      
-        setUserInfo(res.data.selectedConversation);
+      // Calculate online status
+      if (res.data.selectedConversation) {
+        const conversation = res.data.selectedConversation;
+        const lastSeenTimestamp = conversation.user?.last_seen_at || 
+                                  conversation.last_seen_at || 
+                                  conversation.last_seen || 
+                                  conversation.lastSeen;
         
-        // Set loading to false - scroll will happen after content is rendered
-      if (showLoading) {
-        setLoading(false);
-      }
-        
-      // Only reset scroll flag if this is initial load or user is at bottom
-      // This prevents unwanted scrolls when refreshing while user is viewing older messages
-      if (isInitialLoadRef.current || isAtBottomRef.current) {
-        setHasScrolledToBottom(false);
-      }
-        
-        // Mark messages as read when user opens conversation
-        // Use the new route: PUT /api/messages/mark-read/{userId}
-        if (ENABLE_MARK_AS_READ) {
+        if (lastSeenTimestamp) {
           try {
-            await messagesAPI.markMessagesAsRead(Number(id));
-            // Update unread count to 0 for this conversation - this will update badge
-            updateUnreadCount(Number(id), 0);
-          } catch (error: any) {
-            // Handle errors gracefully - don't show to user
-            const statusCode = error?.response?.status;
-            
-            // 429 = Too Many Requests (rate limit) - expected, handled gracefully
-            // 422 = Validation error - expected in some cases
-            // 404 = Not found - endpoint might not exist yet
-            // Only log unexpected errors in development
-            if (statusCode !== 429 && statusCode !== 422 && statusCode !== 404) {
-              if (__DEV__) {
-                console.log('markMessagesAsRead failed:', statusCode || error?.message || error);
-              }
-            }
-            // Silently ignore rate limit and validation errors
-          }
-        }
-        
-        // Calculate online status from last_seen_at from user data
-        // last_seen_at is on the User model, so check in user data within selectedConversation
-        if (res.data.selectedConversation) {
-          const conversation = res.data.selectedConversation;
-          // Debug: Log what data we're receiving
-          console.log('Conversation data:', {
-            id: conversation.id,
-            name: conversation.name,
-            user: conversation.user,
-            last_seen_at: conversation.user?.last_seen_at || conversation.last_seen_at,
-          });
-          
-          // Get last_seen_at from user data (user.last_seen_at) or fallback to conversation level
-          const lastSeenTimestamp = conversation.user?.last_seen_at || 
-                                    conversation.last_seen_at || 
-                                    conversation.last_seen || 
-                                    conversation.lastSeen;
-          
-          if (lastSeenTimestamp) {
-            try {
-              const lastSeenDate = new Date(lastSeenTimestamp);
-              const now = new Date();
-              const diffInMs = now.getTime() - lastSeenDate.getTime();
-              const diffInMinutes = diffInMs / (1000 * 60);
-              
-              // Consider user online if active within last 5 minutes
-              const isUserOnline = !isNaN(lastSeenDate.getTime()) && diffInMinutes >= 0 && diffInMinutes <= 5;
-              setIsOnline(isUserOnline);
-              
-              console.log('Calculated online status:', isUserOnline, 'Last seen:', diffInMinutes.toFixed(2), 'minutes ago');
-            } catch (error) {
-              console.error('Error calculating online status:', error);
-              setIsOnline(false);
-            }
-          } else {
-            // No last_seen_at data available
-            console.warn('No last_seen_at data found in conversation response');
+            const lastSeenDate = new Date(lastSeenTimestamp);
+            const now = new Date();
+            const diffInMs = now.getTime() - lastSeenDate.getTime();
+            const diffInMinutes = diffInMs / (1000 * 60);
+            const isUserOnline = !isNaN(lastSeenDate.getTime()) && diffInMinutes >= 0 && diffInMinutes <= 5;
+            setIsOnline(isUserOnline);
+          } catch (error) {
+            console.error('Error calculating online status:', error);
             setIsOnline(false);
           }
+        } else {
+          setIsOnline(false);
         }
-        
-        // Scroll will be handled by useEffect and onContentSizeChange after images render
+      }
+      
+      // Mark messages as read
+      if (ENABLE_MARK_AS_READ) {
+        try {
+          await messagesAPI.markMessagesAsRead(Number(id));
+          updateUnreadCount(Number(id), 0);
+        } catch (error: any) {
+          const statusCode = error?.response?.status;
+          if (statusCode !== 429 && statusCode !== 422 && statusCode !== 404) {
+            if (__DEV__) {
+              console.log('markMessagesAsRead failed:', statusCode || error?.message || error);
+            }
+          }
+        }
+      }
       
       // Successfully fetched - reset retry attempts
       retryAttemptRef.current = 0;
@@ -960,63 +699,112 @@ export default function UserChatScreen() {
         retryTimeoutRef.current = null;
       }
     } catch (error: any) {
+      apiError = error;
       console.error('[UserChat] API fetch failed:', error);
+    }
+    
+    // STEP 2: Handle API result or fallback to SQLite
+    if (apiSuccess) {
+      // ✅ API succeeded - use API data (even if empty, it's the truth)
+      setMessages(apiMessages);
+      messagesLengthRef.current = apiMessages.length;
       
-      // STEP 3: If API fails and we have cache, keep showing cache
-      // Cache is already displayed in STEP 1, so we just need to ensure loading is off
-      const hasCachedMessages = messagesLengthRef.current > 0;
+      if (apiMessages.length > 0) {
+        const latestMsg = apiMessages[apiMessages.length - 1];
+        latestMessageIdRef.current = latestMsg.id;
+      }
+      
+      // Initially show only last N messages (latest at bottom)
+      if (isInitialLoadRef.current && apiMessages.length > INITIAL_VISIBLE_MESSAGES) {
+        const startIndex = apiMessages.length - INITIAL_VISIBLE_MESSAGES;
+        setVisibleMessagesStartIndex(startIndex);
+      } else if (visibleMessagesStartIndex === null) {
+        setVisibleMessagesStartIndex(null);
+      }
+      
+      setLoadedMessagesCount(apiMessages.length);
       
       if (showLoading) {
         setLoading(false);
       }
       
-      // If we have cached messages, keep them displayed (already shown in STEP 1)
-      if (!hasCachedMessages) {
-        // No cache and API failed - try loading from cache one more time as fallback
-        if (dbInitialized) {
-          try {
-            const fallbackMessages = await loadMessagesFromDb(MESSAGES_PER_PAGE, 0);
-            if (fallbackMessages.length > 0) {
-              const sortedMessages = fallbackMessages.sort((a, b) => 
-                new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
-              );
-              const uniqueMessages = deduplicateMessages(sortedMessages);
-              setMessages(uniqueMessages);
-              setLoadedMessagesCount(uniqueMessages.length);
-              
-              if (uniqueMessages.length > 0) {
-                const latestMsg = uniqueMessages[uniqueMessages.length - 1];
-                latestMessageIdRef.current = latestMsg.id;
-              }
-            } else {
-              // No cache available - show empty state
-              setMessages([]);
+      if (isInitialLoadRef.current || isAtBottomRef.current) {
+        setHasScrolledToBottom(false);
+      }
+    } else {
+      // ❌ API failed - fallback to SQLite
+      if (dbInitialized) {
+        try {
+          const sqliteMessages = await loadMessagesFromDb(MESSAGES_PER_PAGE, 0);
+          
+          if (sqliteMessages.length > 0) {
+            // ✅ SQLite has data - use it
+            const sortedMessages = sqliteMessages.sort((a, b) => 
+              new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
+            );
+            const uniqueMessages = deduplicateMessages(sortedMessages);
+            setMessages(uniqueMessages);
+            messagesLengthRef.current = uniqueMessages.length;
+            setLoadedMessagesCount(uniqueMessages.length);
+            
+            if (uniqueMessages.length > 0) {
+              const latestMsg = uniqueMessages[uniqueMessages.length - 1];
+              latestMessageIdRef.current = latestMsg.id;
             }
-          } catch (cacheError) {
-            console.error('[UserChat] Error loading from cache fallback:', cacheError);
+            
+            if (isInitialLoadRef.current && uniqueMessages.length > INITIAL_VISIBLE_MESSAGES) {
+              const startIndex = uniqueMessages.length - INITIAL_VISIBLE_MESSAGES;
+              setVisibleMessagesStartIndex(startIndex);
+            } else if (visibleMessagesStartIndex === null) {
+              setVisibleMessagesStartIndex(null);
+            }
+            
+            if (showLoading) {
+              setLoading(false);
+            }
+          } else {
+            // ❌ Both API and SQLite are empty - show empty state
             setMessages([]);
+            messagesLengthRef.current = 0;
+            setLoadedMessagesCount(0);
+            
+            if (showLoading) {
+              setLoading(false);
+            }
           }
-        } else {
-          // No database - show empty state
+        } catch (sqliteError) {
+          console.error('[UserChat] Error loading from SQLite fallback:', sqliteError);
+          // ❌ Both API and SQLite failed - show empty state
           setMessages([]);
+          messagesLengthRef.current = 0;
+          
+          if (showLoading) {
+            setLoading(false);
+          }
+        }
+      } else {
+        // ❌ API failed and no database - show empty state
+        setMessages([]);
+        messagesLengthRef.current = 0;
+        
+        if (showLoading) {
+          setLoading(false);
         }
       }
       
       // Check if this is a network-related error that we should retry
       const isNetworkError = 
-        !error.response || // No response (network error)
-        error.code === 'ECONNABORTED' || // Timeout
-        error.message?.includes('Network Error') ||
-        error.message?.includes('timeout') ||
-        error.response?.status >= 500; // Server errors (500, 502, 503, etc.)
+        !apiError?.response ||
+        apiError?.code === 'ECONNABORTED' ||
+        apiError?.message?.includes('Network Error') ||
+        apiError?.message?.includes('timeout') ||
+        apiError?.response?.status >= 500;
       
-      // Only retry network errors, not auth errors (401) or client errors (400, 404)
       const shouldRetry = isNetworkError && 
                          retryAttemptRef.current < MAX_RETRY_ATTEMPTS &&
-                         !showLoading; // Don't retry if user is waiting for initial load
+                         !showLoading;
       
       if (shouldRetry) {
-        // Calculate exponential backoff delay: 1s, 2s, 4s, 8s, 16s
         const delay = INITIAL_RETRY_DELAY * Math.pow(2, retryAttemptRef.current);
         retryAttemptRef.current += 1;
         
@@ -1024,26 +812,14 @@ export default function UserChatScreen() {
           console.log(`[UserChat] Retrying fetchMessages (attempt ${retryAttemptRef.current}/${MAX_RETRY_ATTEMPTS}) in ${delay}ms`);
         }
         
-        // Retry in background without showing loading spinner
         retryTimeoutRef.current = setTimeout(() => {
-          fetchMessages(false); // Don't show loading spinner for retries
+          fetchMessages(false);
         }, delay);
       } else {
-        // Max retries reached or non-retryable error
         if (retryAttemptRef.current >= MAX_RETRY_ATTEMPTS) {
           if (__DEV__) {
             console.warn('[UserChat] Max retry attempts reached. Stopping background retries.');
           }
-        }
-        
-        // Log error for debugging (only in dev mode)
-        if (__DEV__) {
-          console.error('[UserChat] Failed to fetch messages:', {
-            error: error.message,
-            status: error.response?.status,
-            retryAttempts: retryAttemptRef.current,
-            hasCachedMessages
-          });
         }
       }
     }
@@ -1858,12 +1634,25 @@ export default function UserChatScreen() {
             attachments: localMessage.attachments,
           }]);
           
-          if (__DEV__) {
-            console.log('[UserChat] Saved message to SQLite with pending status:', tempLocalId);
+          if (__DEV__ || process.env.EXPO_PUBLIC_DEBUG_API === 'true') {
+            console.log('[UserChat] Saved message to SQLite with pending status:', {
+              tempLocalId,
+              message: messageText?.substring(0, 50),
+              conversationId: Number(id),
+              timestamp: now,
+            });
           }
-        } catch (dbError) {
-          console.error('[UserChat] Error saving to SQLite:', dbError);
+        } catch (dbError: any) {
+          // ✅ CRITICAL: Log detailed error information for debugging
+          console.error('[UserChat] Error saving to SQLite:', {
+            error: dbError?.message || String(dbError),
+            tempLocalId,
+            message: messageText?.substring(0, 50),
+            conversationId: Number(id),
+            stack: dbError?.stack,
+          });
           // Continue anyway - we'll still try to send to API
+          // But the message won't persist if DB save fails
         }
       }
       
@@ -1990,17 +1779,17 @@ export default function UserChatScreen() {
           // Send to API
       const res = await messagesAPI.sendMessage(formData);
       
-          // CRITICAL: Log response structure for debugging in production
-          if (__DEV__ || process.env.EXPO_PUBLIC_DEBUG_API === 'true') {
-            console.log('[UserChat] API Response:', {
-              status: res.status,
-              hasData: !!res.data,
-              dataKeys: res.data ? Object.keys(res.data) : [],
-              dataId: res.data?.id,
-              dataCreatedAt: res.data?.created_at,
-              fullResponse: JSON.stringify(res.data, null, 2).substring(0, 500),
-            });
-          }
+          // CRITICAL: Enhanced logging - ALWAYS log full response structure for debugging
+          console.log('[UserChat] FULL API Response Structure:', {
+            status: res.status,
+            statusText: res.statusText,
+            hasData: !!res.data,
+            dataType: typeof res.data,
+            dataIsArray: Array.isArray(res.data),
+            dataKeys: res.data ? Object.keys(res.data) : [],
+            nestedDataKeys: res.data?.data ? Object.keys(res.data.data) : [],
+            fullData: JSON.stringify(res.data, null, 2),
+          });
           
           // STEP 4: Update SQLite with server response (change status to synced, update server_id and timestamp)
           // Handle different response structures
@@ -2012,17 +1801,42 @@ export default function UserChatScreen() {
             if (res.data.id) {
               messageId = res.data.id;
               serverCreatedAt = res.data.created_at;
+              console.log('[UserChat] Found message ID in res.data.id:', messageId);
             }
             // Alternative: res.data.data.id (nested)
             else if (res.data.data && res.data.data.id) {
               messageId = res.data.data.id;
               serverCreatedAt = res.data.data.created_at;
+              console.log('[UserChat] Found message ID in res.data.data.id:', messageId);
             }
             // Alternative: res.data.message?.id
             else if (res.data.message && res.data.message.id) {
               messageId = res.data.message.id;
               serverCreatedAt = res.data.message.created_at;
+              console.log('[UserChat] Found message ID in res.data.message.id:', messageId);
             }
+            // Additional check: res.data.message_id
+            else if (res.data.message_id) {
+              messageId = res.data.message_id;
+              serverCreatedAt = res.data.created_at || res.data.message_created_at;
+              console.log('[UserChat] Found message ID in res.data.message_id:', messageId);
+            }
+            // Additional check: res.data.result?.id
+            else if (res.data.result && res.data.result.id) {
+              messageId = res.data.result.id;
+              serverCreatedAt = res.data.result.created_at;
+              console.log('[UserChat] Found message ID in res.data.result.id:', messageId);
+            }
+            // Additional check: res.data is the message object directly
+            else if (typeof res.data === 'object' && res.data.id && (res.data.message !== undefined || res.data.text !== undefined)) {
+              messageId = res.data.id;
+              serverCreatedAt = res.data.created_at;
+              console.log('[UserChat] Found message ID in res.data (direct object):', messageId);
+            }
+          }
+          
+          if (!messageId && res.data) {
+            console.warn('[UserChat] Could not find message ID in response. Full response:', JSON.stringify(res.data, null, 2));
           }
           
           if (messageId && dbInitialized) {
@@ -2069,6 +1883,94 @@ export default function UserChatScreen() {
               }
             } catch (updateError) {
               console.error('[UserChat] Error updating message status:', updateError);
+            }
+          } else if (res.status >= 200 && res.status < 300) {
+            // ✅ CRITICAL FIX: API was successful but no message ID returned
+            // Try to verify by fetching recent messages
+            console.warn('[UserChat] API response successful but no message ID found. Attempting verification...', {
+              status: res.status,
+              hasData: !!res.data,
+              dataKeys: res.data ? Object.keys(res.data) : [],
+              tempLocalId: tempLocalId,
+              messageText: messageText.substring(0, 50), // First 50 chars for matching
+            });
+            
+            // Verification: Try to find the message by fetching recent messages
+            try {
+              // Wait a moment for backend to process
+              await new Promise(resolve => setTimeout(resolve, 1500));
+              
+              // Fetch recent messages to see if our message is there
+              const verifyRes = await messagesAPI.getByUser(Number(id), 1, 10);
+              const messagesData = verifyRes.data.messages?.data || verifyRes.data.messages || [];
+              
+              // Try to find our message by content and timestamp (within 30 seconds)
+              const now = new Date().getTime();
+              const matchingMessage = messagesData.find((msg: any) => {
+                const msgTime = new Date(msg.created_at).getTime();
+                const timeDiff = Math.abs(now - msgTime);
+                const contentMatch = msg.message === messageText || 
+                                   (messageText && msg.message && msg.message.includes(messageText.substring(0, 20)));
+                
+                return contentMatch && timeDiff < 30000; // Within 30 seconds
+              });
+              
+              if (matchingMessage?.id) {
+                console.log('[UserChat] ✅ Verification successful! Found message ID:', matchingMessage.id);
+                messageId = matchingMessage.id;
+                serverCreatedAt = matchingMessage.created_at;
+                
+                // Update with the found ID
+                if (dbInitialized) {
+                  try {
+                    await updateMessageStatus(tempLocalId, messageId, 'synced', serverCreatedAt);
+                    
+                    // Update UI message with server ID
+                    setMessages(prev => {
+                      const existingIds = new Set(prev.map(m => m.id));
+                      const serverIdExists = existingIds.has(messageId);
+                      
+                      if (serverIdExists) {
+                        const filtered = prev.filter(msg => msg.id !== tempLocalId);
+                        return deduplicateMessages(filtered);
+                      } else {
+                        const updated = prev.map(msg => 
+                          msg.id === tempLocalId 
+                            ? { 
+                                ...msg, 
+                                id: messageId, 
+                                sync_status: 'synced',
+                                created_at: serverCreatedAt || msg.created_at
+                              }
+                            : msg
+                        );
+                        return deduplicateMessages(updated);
+                      }
+                    });
+                    
+                    latestMessageIdRef.current = messageId;
+                    console.log('[UserChat] ✅ Message verified and synced:', tempLocalId, '->', messageId);
+                  } catch (verifyUpdateError) {
+                    console.error('[UserChat] Error updating verified message:', verifyUpdateError);
+                  }
+                }
+              } else {
+                console.warn('[UserChat] ❌ Verification failed - message not found in recent messages. Keeping as pending.');
+                // Ensure UI shows pending status (not synced) - message stays pending in DB
+                setMessages(prev => prev.map(msg => 
+                  msg.id === tempLocalId 
+                    ? { ...msg, sync_status: 'pending' }  // Explicitly set to pending
+                    : msg
+                ));
+              }
+            } catch (verifyError) {
+              console.error('[UserChat] Verification query failed:', verifyError);
+              // Ensure UI shows pending status (not synced) - message stays pending in DB
+              setMessages(prev => prev.map(msg => 
+                msg.id === tempLocalId 
+                  ? { ...msg, sync_status: 'pending' }  // Explicitly set to pending
+                  : msg
+              ));
             }
           }
           
@@ -2644,7 +2546,7 @@ export default function UserChatScreen() {
             timestamp={timestamp}
             textPart={voiceMessageData.textPart}
             readAt={item.read_at}
-              syncStatus={item.sync_status || 'synced'}
+              syncStatus={item.sync_status || 'pending'}
           />
         </TouchableOpacity>
         </View>
@@ -2789,7 +2691,7 @@ export default function UserChatScreen() {
                   {isMine && (
                     <MessageStatus 
                       readAt={item.read_at} 
-                      syncStatus={item.sync_status || 'synced'}
+                      syncStatus={item.sync_status || 'pending'}
                       isDark={isDark}
                       size={12}
                     />
@@ -2865,7 +2767,7 @@ export default function UserChatScreen() {
                   {isMine && (
                     <MessageStatus 
                       readAt={item.read_at} 
-                      syncStatus={item.sync_status || 'synced'}
+                      syncStatus={item.sync_status || 'pending'}
                       isDark={isDark}
                       size={12}
                     />

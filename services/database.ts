@@ -1990,8 +1990,58 @@ export async function fixDuplicateMessagesWithWrongTimestamps(
         }
       }
 
-      // Handle messages without server_id that might be duplicates
-      // Group by content and sender (within 1 minute timestamp window)
+      // ✅ CRITICAL FIX: Handle messages without server_id that might be duplicates
+      // First, try to match pending messages with synced messages from API
+      // Create a map of API messages by content+sender for matching
+      const apiMessagesByContent = new Map<string, { id: number; created_at: string }>();
+      for (const apiMsg of apiMessages) {
+        const key = `${apiMsg.message || ''}_${apiMsg.sender_id}`;
+        // Store the API message with its server_id and timestamp
+        if (!apiMessagesByContent.has(key)) {
+          apiMessagesByContent.set(key, { id: apiMsg.id, created_at: apiMsg.created_at });
+        }
+      }
+
+      // Try to match pending messages with synced messages from API
+      for (const pendingMsg of messagesWithoutServerId) {
+        const key = `${pendingMsg.message || ''}_${pendingMsg.sender_id}`;
+        const matchingApiMsg = apiMessagesByContent.get(key);
+        
+        if (matchingApiMsg) {
+          // Found a match! Check if timestamp is close (within 1 minute)
+          const pendingTime = new Date(pendingMsg.created_at).getTime();
+          const apiTime = new Date(matchingApiMsg.created_at).getTime();
+          const timeDiff = Math.abs(pendingTime - apiTime);
+          
+          if (timeDiff < 60000) { // Within 1 minute - likely the same message
+            // Update pending message with server_id instead of deleting it
+            await retryWithBackoff(async () => {
+              await database.runAsync(
+                `UPDATE messages SET
+                  server_id = ?,
+                  created_at = ?,
+                  sync_status = 'synced',
+                  updated_at = datetime('now')
+                WHERE id = ?`,
+                [matchingApiMsg.id, matchingApiMsg.created_at, pendingMsg.id]
+              );
+            });
+            fixed++;
+            // Remove from messagesWithoutServerId so it's not processed again
+            const index = messagesWithoutServerId.indexOf(pendingMsg);
+            if (index > -1) {
+              messagesWithoutServerId.splice(index, 1);
+            }
+          }
+        }
+      }
+
+      // Now handle remaining messages without server_id that might be duplicates
+      // ✅ CRITICAL FIX: Only delete pending messages if:
+      // 1. They're duplicates of each other (same content+sender within 1 minute)
+      // 2. AND at least one of them matches a synced message from API (already handled above)
+      // 3. OR they're true duplicates (exact same content+sender+timestamp)
+      // NEVER delete pending messages that don't have a matching synced message
       const contentGroups = new Map<string, DatabaseMessage[]>();
       for (const msg of messagesWithoutServerId) {
         const key = `${msg.message || ''}_${msg.sender_id}`;
@@ -2001,9 +2051,9 @@ export async function fixDuplicateMessagesWithWrongTimestamps(
         contentGroups.get(key)!.push(msg);
       }
 
-      // For each content group, if multiple messages exist with timestamps within 1 minute,
-      // keep only one (the most recent one with sync_status = 'synced' if any, otherwise the first)
-      for (const [_, group] of contentGroups.entries()) {
+      // For each content group, only delete if there are true duplicates
+      // AND we're confident they're not legitimate pending messages waiting to sync
+      for (const [contentKey, group] of contentGroups.entries()) {
         if (group.length > 1) {
           // Sort by created_at
           group.sort((a, b) => 
@@ -2016,14 +2066,32 @@ export async function fixDuplicateMessagesWithWrongTimestamps(
             Math.abs(new Date(msg.created_at).getTime() - firstTime) < 60000
           );
 
-          if (allWithinMinute) {
+          // ✅ CRITICAL FIX: Only delete if:
+          // 1. All messages are within 1 minute (likely duplicates)
+          // 2. AND there's a matching synced message from API (already matched above)
+          // 3. OR they're exact duplicates (same timestamp within 1 second)
+          const hasMatchingApiMessage = apiMessagesByContent.has(contentKey);
+          const areExactDuplicates = group.every(msg => 
+            Math.abs(new Date(msg.created_at).getTime() - firstTime) < 1000
+          );
+
+          if (allWithinMinute && (hasMatchingApiMessage || areExactDuplicates)) {
             // Prefer synced messages, otherwise keep the first one
             const syncedMessage = group.find(msg => msg.sync_status === 'synced');
             const keepMsg = syncedMessage || group[0];
             
-            // Delete others
+            // Delete others (only if we have a matching API message or they're exact duplicates)
             const toDelete = group.filter(msg => msg.id !== keepMsg.id);
             for (const msg of toDelete) {
+              // ✅ PROTECT: Never delete pending messages sent by current user unless they're exact duplicates
+              // This protects user's sent messages that might be waiting to sync
+              if (msg.sync_status === 'pending' && !areExactDuplicates && !hasMatchingApiMessage) {
+                if (__DEV__) {
+                  console.log(`[Database] Protecting pending message from deletion: ${msg.id} (${msg.message})`);
+                }
+                continue; // Skip deletion - protect pending message
+              }
+              
               await retryWithBackoff(async () => {
                 await database.runAsync(
                   `DELETE FROM attachments WHERE message_id = ?`,

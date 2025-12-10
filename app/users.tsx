@@ -115,35 +115,15 @@ export default function UsersScreen() {
     return [];
   };
 
-  // ✅ HYBRID CACHE STRATEGY: Load users with triple fallback
+  // ✅ API-FIRST STRATEGY: Try API first, fallback to AsyncStorage/SQLite only if API fails
   const loadUsers = async () => {
-    // ✅ HYBRID CACHE STRATEGY:
-    // 1. Load AsyncStorage first (instant display)
-    // 2. Fetch API in background (update both caches)
-    // 3. On error, keep showing AsyncStorage (never clear)
-
-    // STEP 1: Load AsyncStorage immediately (fastest, instant display)
-    const asyncStorageUsers = await loadAsyncStorageUsers();
-    if (asyncStorageUsers.length > 0) {
-      setUsers(asyncStorageUsers);
-      setFilteredUsers(asyncStorageUsers);
-      setIsLoading(false); // Show data immediately, don't wait for API
-    } else {
-      // Try SQLite as fallback if AsyncStorage is empty
-      const sqliteUsers = await loadCachedUsers();
-      if (sqliteUsers.length > 0) {
-        setUsers(sqliteUsers);
-        setFilteredUsers(sqliteUsers);
-        // Save to AsyncStorage for next time
-        await saveAsyncStorageUsers(sqliteUsers);
-        setIsLoading(false);
-      } else {
-        // No cache available - show loading spinner
-        setIsLoading(true);
-      }
-    }
-
-    // STEP 2: Fetch from API in background (update both caches)
+    // Only show empty state if API returns empty AND all fallbacks are empty AND requests completed successfully
+    
+    // STEP 1: Try API first (source of truth)
+    let apiSuccess = false;
+    let apiUsers: User[] = [];
+    let apiError: any = null;
+    
     try {
       const response = await usersAPI.getAll();
       let usersData = response.data;
@@ -153,9 +133,7 @@ export default function UsersScreen() {
           usersData = JSON.parse(response.data);
         } catch (parseError) {
           console.error('Failed to parse users data:', parseError);
-          // Don't clear state - keep showing cached data
-          setIsLoading(false);
-          return;
+          throw parseError;
         }
       }
       
@@ -165,32 +143,11 @@ export default function UsersScreen() {
           item.id !== user?.id
         );
         
-        // ✅ HYBRID CACHE: If API returns empty, try all fallbacks
-        if (userList.length === 0) {
-          // Try AsyncStorage first
-          if (asyncStorageUsers.length > 0) {
-            setUsers(asyncStorageUsers);
-            setFilteredUsers(asyncStorageUsers);
-            setIsLoading(false);
-            return;
-          }
-          // Try SQLite
-          const sqliteUsers = await loadCachedUsers();
-          if (sqliteUsers.length > 0) {
-            setUsers(sqliteUsers);
-            setFilteredUsers(sqliteUsers);
-            await saveAsyncStorageUsers(sqliteUsers);
-            setIsLoading(false);
-            return;
-          }
-        }
+        // Mark API as successful
+        apiSuccess = true;
+        apiUsers = userList;
         
-        // Update UI with fresh API data
-        setUsers(userList);
-        setFilteredUsers(userList);
-        
-        // ✅ HYBRID CACHE: Save to both AsyncStorage (fast) and SQLite (persistent)
-        // Save to AsyncStorage first (fastest)
+        // Save to both AsyncStorage (fast) and SQLite (persistent)
         await saveAsyncStorageUsers(userList);
         
         // Save to SQLite in background (persistent)
@@ -211,23 +168,30 @@ export default function UsersScreen() {
             }
           } catch (dbError) {
             console.error('[Users] Error saving to database:', dbError);
-            // Continue even if SQLite fails - AsyncStorage is already saved
           }
         }
       } else {
         console.error('Response data is not an array:', usersData);
-        // Don't clear state - keep showing cached data
-        setIsLoading(false);
-        return;
+        throw new Error('Response data is not an array');
       }
     } catch (error: any) {
+      apiError = error;
       console.error('Failed to load users from API:', error);
-      
-      // ✅ HYBRID CACHE: On API error, try all fallbacks but NEVER clear existing data
-      // Priority: AsyncStorage → SQLite → Keep existing state
-      
-      // If we already have data from AsyncStorage, keep it (don't clear)
-      if (users.length > 0) {
+    }
+    
+    // STEP 2: Handle API result or fallback to AsyncStorage/SQLite
+    if (apiSuccess) {
+      // ✅ API succeeded - use API data (even if empty, it's the truth)
+      setUsers(apiUsers);
+      setFilteredUsers(apiUsers);
+      setIsLoading(false);
+    } else {
+      // ❌ API failed - fallback to AsyncStorage → SQLite
+      // Try AsyncStorage first
+      const asyncStorageUsers = await loadAsyncStorageUsers();
+      if (asyncStorageUsers.length > 0) {
+        setUsers(asyncStorageUsers);
+        setFilteredUsers(asyncStorageUsers);
         setIsLoading(false);
         return;
       }
@@ -237,29 +201,14 @@ export default function UsersScreen() {
       if (sqliteUsers.length > 0) {
         setUsers(sqliteUsers);
         setFilteredUsers(sqliteUsers);
-        // Also save to AsyncStorage for next time
         await saveAsyncStorageUsers(sqliteUsers);
         setIsLoading(false);
         return;
       }
       
-      // Try AsyncStorage one more time (in case it wasn't loaded initially)
-      const asyncStorageUsers = await loadAsyncStorageUsers();
-      if (asyncStorageUsers.length > 0) {
-        setUsers(asyncStorageUsers);
-        setFilteredUsers(asyncStorageUsers);
-        setIsLoading(false);
-        return;
-      }
-      
-      // ✅ CRITICAL: Only show empty state if ALL three sources are empty
-      // Never clear state on error - preserve existing data
-      if (users.length === 0) {
-        // All caches empty - this is truly empty, not an app failure
-        setUsers([]);
-        setFilteredUsers([]);
-      }
-    } finally {
+      // ❌ Both API and fallbacks are empty - show empty state
+      setUsers([]);
+      setFilteredUsers([]);
       setIsLoading(false);
     }
   };
