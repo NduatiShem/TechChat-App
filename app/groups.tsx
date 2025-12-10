@@ -21,7 +21,10 @@ import {
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import NetInfo from '@react-native-community/netinfo';
-// Removed AsyncStorage import - groups now stored in SQLite only
+import AsyncStorage from '@react-native-async-storage/async-storage';
+
+// Hybrid Cache Strategy: AsyncStorage (fast) + SQLite (persistent) + API (source of truth)
+const GROUPS_CACHE_KEY = '@techchat_groups';
 
 interface Group {
   id: number;
@@ -46,8 +49,6 @@ interface Group {
 export const options = {
   title: "Groups",
 };
-
-// Removed GROUPS_CACHE_KEY - groups now stored in SQLite only
 
 export default function GroupsScreen() {
   const [groups, setGroups] = useState<Group[]>([]);
@@ -85,7 +86,32 @@ export default function GroupsScreen() {
     };
   }, []);
 
-  // Load groups from SQLite (local-first)
+  // ✅ HYBRID CACHE: Load from AsyncStorage (fastest, instant display)
+  const loadAsyncStorageGroups = async (): Promise<Group[]> => {
+    try {
+      const cachedData = await AsyncStorage.getItem(GROUPS_CACHE_KEY);
+      if (!cachedData) return [];
+      
+      const groups = JSON.parse(cachedData);
+      if (!Array.isArray(groups)) return [];
+      
+      return groups;
+    } catch (error) {
+      console.error('[Groups] Error loading from AsyncStorage:', error);
+      return [];
+    }
+  };
+
+  // ✅ HYBRID CACHE: Save to AsyncStorage (fast cache layer)
+  const saveAsyncStorageGroups = async (groups: Group[]): Promise<void> => {
+    try {
+      await AsyncStorage.setItem(GROUPS_CACHE_KEY, JSON.stringify(groups));
+    } catch (error) {
+      console.error('[Groups] Error saving to AsyncStorage:', error);
+    }
+  };
+
+  // Load groups from SQLite (persistent storage)
   const loadCachedGroups = async (): Promise<Group[]> => {
     try {
       if (!dbInitialized) return [];
@@ -112,17 +138,35 @@ export default function GroupsScreen() {
   };
 
   const loadGroups = async (forceRefresh = false) => {
-    // If offline, load from SQLite only
-    if (!isOnline && !forceRefresh) {
-      const cachedGroups = await loadCachedGroups();
-      if (cachedGroups.length > 0) {
-        setGroups(cachedGroups);
-        setFilteredGroups(cachedGroups);
-        setIsLoading(false);
-        return;
-      }
+    // ✅ HYBRID CACHE STRATEGY:
+    // 1. Load AsyncStorage first (instant display)
+    // 2. Fetch API in background (update both caches)
+    // 3. On error, keep showing AsyncStorage (never clear)
+
+    // STEP 1: Load AsyncStorage immediately (fastest, instant display)
+    const asyncStorageGroups = await loadAsyncStorageGroups();
+    if (asyncStorageGroups.length > 0) {
+      setGroups(asyncStorageGroups);
+      setFilteredGroups(asyncStorageGroups);
+      setIsLoading(false); // Show data immediately, don't wait for API
     }
 
+    // If offline and not forcing refresh, use cached data only
+    if (!isOnline && !forceRefresh) {
+      // Try SQLite as fallback if AsyncStorage is empty
+      if (asyncStorageGroups.length === 0) {
+        const sqliteGroups = await loadCachedGroups();
+        if (sqliteGroups.length > 0) {
+          setGroups(sqliteGroups);
+          setFilteredGroups(sqliteGroups);
+          // Also save to AsyncStorage for next time
+          await saveAsyncStorageGroups(sqliteGroups);
+        }
+      }
+      return;
+    }
+
+    // STEP 2: Fetch from API in background (update both caches)
     try {
       const response = await groupsAPI.getAll();
       const groupsData = response.data;
@@ -130,13 +174,21 @@ export default function GroupsScreen() {
       // Ensure groupsData is always an array
       const safeGroupsData = Array.isArray(groupsData) ? groupsData : [];
       
-      // ✅ FIX: If API returns empty but we have cached data, use cached data
+      // ✅ HYBRID CACHE: If API returns empty, try all fallbacks
       if (safeGroupsData.length === 0) {
-        const cachedGroups = await loadCachedGroups();
-        if (cachedGroups.length > 0) {
-          // Use cached data even if API returned empty (SQLite might have data)
-          setGroups(cachedGroups);
-          setFilteredGroups(cachedGroups);
+        // Try AsyncStorage first
+        if (asyncStorageGroups.length > 0) {
+          setGroups(asyncStorageGroups);
+          setFilteredGroups(asyncStorageGroups);
+          setIsLoading(false);
+          return;
+        }
+        // Try SQLite
+        const sqliteGroups = await loadCachedGroups();
+        if (sqliteGroups.length > 0) {
+          setGroups(sqliteGroups);
+          setFilteredGroups(sqliteGroups);
+          await saveAsyncStorageGroups(sqliteGroups);
           setIsLoading(false);
           return;
         }
@@ -154,6 +206,10 @@ export default function GroupsScreen() {
       
       setGroups(safeGroupsData);
       setFilteredGroups(safeGroupsData);
+      
+      // ✅ HYBRID CACHE: Save to both AsyncStorage (fast) and SQLite (persistent)
+      // Save to AsyncStorage first (fastest)
+      await saveAsyncStorageGroups(safeGroupsData);
       
       // Save groups to SQLite for offline access
       if (dbInitialized) {
@@ -174,16 +230,45 @@ export default function GroupsScreen() {
           await saveDbGroups(groupsToSave);
         } catch (dbError) {
           console.error('[Groups] Error saving to database:', dbError);
+          // Continue even if SQLite fails - AsyncStorage is already saved
         }
       }
-    } catch {
-      // ✅ FIX: Always try SQLite fallback on API failure
-      const cachedGroups = await loadCachedGroups();
-      if (cachedGroups.length > 0) {
-        setGroups(cachedGroups);
-        setFilteredGroups(cachedGroups);
-      } else {
-        // Only set empty if both API and SQLite are empty
+    } catch (error: any) {
+      console.error('Failed to load groups from API:', error);
+      
+      // ✅ HYBRID CACHE: On API error, try all fallbacks but NEVER clear existing data
+      // Priority: AsyncStorage → SQLite → Keep existing state
+      
+      // If we already have data from AsyncStorage, keep it (don't clear)
+      if (groups.length > 0) {
+        setIsLoading(false);
+        return;
+      }
+      
+      // Try SQLite fallback
+      const sqliteGroups = await loadCachedGroups();
+      if (sqliteGroups.length > 0) {
+        setGroups(sqliteGroups);
+        setFilteredGroups(sqliteGroups);
+        // Also save to AsyncStorage for next time
+        await saveAsyncStorageGroups(sqliteGroups);
+        setIsLoading(false);
+        return;
+      }
+      
+      // Try AsyncStorage one more time (in case it wasn't loaded initially)
+      const asyncStorageGroups = await loadAsyncStorageGroups();
+      if (asyncStorageGroups.length > 0) {
+        setGroups(asyncStorageGroups);
+        setFilteredGroups(asyncStorageGroups);
+        setIsLoading(false);
+        return;
+      }
+      
+      // ✅ CRITICAL: Only show empty state if ALL three sources are empty
+      // Never clear state on error - preserve existing data
+      if (groups.length === 0) {
+        // All caches empty - this is truly empty, not an app failure
         setGroups([]);
         setFilteredGroups([]);
       }
@@ -238,14 +323,44 @@ export default function GroupsScreen() {
   useEffect(() => {
     // Only load groups if user is authenticated and database is initialized
     if (user && dbInitialized) {
-      // First try to load from SQLite for instant display
-      loadCachedGroups().then(cached => {
-        if (cached.length > 0) {
-          setGroups(cached);
-          setFilteredGroups(cached);
+      const loadData = async () => {
+        try {
+          // ✅ HYBRID CACHE: Load AsyncStorage first (instant display)
+          const asyncStorageGroups = await loadAsyncStorageGroups();
+          if (asyncStorageGroups.length > 0) {
+            setGroups(asyncStorageGroups);
+            setFilteredGroups(asyncStorageGroups);
+            setIsLoading(false); // Show data immediately
+          } else {
+            // Try SQLite as fallback
+            const sqliteGroups = await loadCachedGroups();
+            if (sqliteGroups.length > 0) {
+              setGroups(sqliteGroups);
+              setFilteredGroups(sqliteGroups);
+              // Save to AsyncStorage for next time
+              await saveAsyncStorageGroups(sqliteGroups);
+              setIsLoading(false);
+            } else {
+              // No cache available - show loading spinner
+              setIsLoading(true);
+            }
+          }
+          
+          // STEP 2: Fetch from API in background (always) - updates both caches
+          try {
+            await loadGroups(); // This fetches from API and saves to both caches
+          } catch (apiError) {
+            console.error('[Groups] API fetch failed:', apiError);
+            // Don't clear state - keep showing cached data
+            setIsLoading(false);
+          }
+        } catch (error) {
+          console.error('[Groups] Error in loadData:', error);
           setIsLoading(false);
         }
-      });
+      };
+      
+      loadData();
       
       // Then load from API (will update SQLite if successful)
       loadGroups();
@@ -254,14 +369,35 @@ export default function GroupsScreen() {
   }, [user]); // loadGroups is stable, no need to include
 
   // Refresh groups when screen comes into focus
+  // Reload groups when screen comes into focus
   useFocusEffect(
     React.useCallback(() => {
-      // Only reload if user is authenticated
-      if (user) {
-        loadGroups();
+      // Only reload if user is authenticated and database is initialized
+      if (user && dbInitialized) {
+        // ✅ HYBRID CACHE: Show AsyncStorage instantly, then fetch fresh from API
+        const refreshData = async () => {
+          // Show AsyncStorage data instantly (if available)
+          const asyncStorageGroups = await loadAsyncStorageGroups();
+          if (asyncStorageGroups.length > 0) {
+            setGroups(asyncStorageGroups);
+            setFilteredGroups(asyncStorageGroups);
+          }
+          
+          // Fetch fresh data from API in background (updates both caches)
+          try {
+            await loadGroups(); // This fetches from API and updates both caches
+          } catch (error) {
+            // If API fails, cached data is already displayed
+            if (__DEV__) {
+              console.error('[Groups] Background refresh failed:', error);
+            }
+          }
+        };
+        
+        refreshData();
       }
       // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [user]) // loadGroups is stable, no need to include
+    }, [user, dbInitialized]) // loadGroups is stable, no need to include
   );
 
   const formatDate = (dateString: string | null | undefined): string => {

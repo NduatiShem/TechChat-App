@@ -1689,9 +1689,10 @@ export async function getPendingMessages(): Promise<DatabaseMessage[]> {
     
     // CRITICAL FIX: Add try-catch around the actual query to handle NullPointerException
     try {
+      // ✅ FIX: Also get failed messages (they should be retried)
       const messages = await database.getAllAsync<DatabaseMessage>(
         `SELECT * FROM messages 
-         WHERE sync_status = 'pending' 
+         WHERE (sync_status = 'pending' OR sync_status = 'failed')
          AND server_id IS NULL
          ORDER BY created_at ASC`
       );

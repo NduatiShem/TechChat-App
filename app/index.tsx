@@ -54,7 +54,8 @@ interface Conversation {
   };
 }
 
-// Removed CONVERSATIONS_CACHE_KEY - using SQLite only
+// Hybrid Cache Strategy: AsyncStorage (fast) + SQLite (persistent) + API (source of truth)
+const CONVERSATIONS_CACHE_KEY = '@techchat_conversations';
 
 export default function ConversationsScreen() {
   const [conversations, setConversations] = useState<Conversation[]>([]);
@@ -110,7 +111,34 @@ export default function ConversationsScreen() {
     return Array.from(seen.values());
   }, []);
 
-  // Load conversations from SQLite (local-first) - only individual conversations for messages tab
+  // ✅ HYBRID CACHE: Load from AsyncStorage (fastest, instant display)
+  const loadAsyncStorageConversations = async (): Promise<Conversation[]> => {
+    try {
+      const cachedData = await AsyncStorage.getItem(CONVERSATIONS_CACHE_KEY);
+      if (!cachedData) return [];
+      
+      const conversations = JSON.parse(cachedData);
+      if (!Array.isArray(conversations)) return [];
+      
+      // Filter out groups (messages tab is for individual conversations only)
+      const individualConversations = conversations.filter(conv => !conv.is_group);
+      return deduplicateConversations(individualConversations);
+    } catch (error) {
+      console.error('[Conversations] Error loading from AsyncStorage:', error);
+      return [];
+    }
+  };
+
+  // ✅ HYBRID CACHE: Save to AsyncStorage (fast cache layer)
+  const saveAsyncStorageConversations = async (convs: Conversation[]): Promise<void> => {
+    try {
+      await AsyncStorage.setItem(CONVERSATIONS_CACHE_KEY, JSON.stringify(convs));
+    } catch (error) {
+      console.error('[Conversations] Error saving to AsyncStorage:', error);
+    }
+  };
+
+  // Load conversations from SQLite (persistent storage) - only individual conversations for messages tab
   const loadCachedConversations = async (): Promise<Conversation[]> => {
     try {
       if (!dbInitialized) return [];
@@ -146,18 +174,36 @@ export default function ConversationsScreen() {
   };
 
   const loadConversations = async (forceRefresh = false) => {
-    // If offline, load from cache only
-    if (!isOnline && !forceRefresh) {
-      const cachedConversations = await loadCachedConversations();
-      if (cachedConversations.length > 0) {
-        const deduplicated = deduplicateConversations(cachedConversations);
-        setConversations(deduplicated);
-        setFilteredConversations(deduplicated);
-        setIsLoading(false);
-        return;
-      }
+    // ✅ HYBRID CACHE STRATEGY:
+    // 1. Load AsyncStorage first (instant display)
+    // 2. Fetch API in background (update both caches)
+    // 3. On error, keep showing AsyncStorage (never clear)
+
+    // STEP 1: Load AsyncStorage immediately (fastest, instant display)
+    const asyncStorageConversations = await loadAsyncStorageConversations();
+    if (asyncStorageConversations.length > 0) {
+      setConversations(asyncStorageConversations);
+      setFilteredConversations(asyncStorageConversations);
+      setIsLoading(false); // Show data immediately, don't wait for API
     }
 
+    // If offline and not forcing refresh, use cached data only
+    if (!isOnline && !forceRefresh) {
+      // Try SQLite as fallback if AsyncStorage is empty
+      if (asyncStorageConversations.length === 0) {
+        const sqliteConversations = await loadCachedConversations();
+        if (sqliteConversations.length > 0) {
+          const deduplicated = deduplicateConversations(sqliteConversations);
+          setConversations(deduplicated);
+          setFilteredConversations(deduplicated);
+          // Also save to AsyncStorage for next time
+          await saveAsyncStorageConversations(deduplicated);
+        }
+      }
+      return;
+    }
+
+    // STEP 2: Fetch from API in background (update both caches)
     try {
       const response = await conversationsAPI.getAll();
       let conversationsData = response.data;
@@ -254,7 +300,11 @@ export default function ConversationsScreen() {
       setConversations(deduplicated);
       setFilteredConversations(deduplicated);
       
-      // Save to SQLite database
+      // ✅ HYBRID CACHE: Save to both AsyncStorage (fast) and SQLite (persistent)
+      // Save to AsyncStorage first (fastest)
+      await saveAsyncStorageConversations(deduplicated);
+      
+      // Save to SQLite database (persistent)
       try {
         const conversationsToSave = uniqueConversations.map(conv => ({
           conversation_id: conv.conversation_id || conv.id,
@@ -275,34 +325,49 @@ export default function ConversationsScreen() {
         await saveDbConversations(conversationsToSave);
       } catch (dbError) {
         console.error('[Conversations] Error saving to database:', dbError);
-        // No fallback - SQLite is the only storage
+        // Continue even if SQLite fails - AsyncStorage is already saved
       }
     } catch (error: any) {
-      console.error('Failed to load conversations:', error);
+      console.error('Failed to load conversations from API:', error);
       
-      // ✅ FIX: Always try SQLite fallback, not just on network errors
-      const cachedConversations = await loadCachedConversations();
-      if (cachedConversations.length > 0) {
-        const deduplicated = deduplicateConversations(cachedConversations);
-        setConversations(deduplicated);
-        setFilteredConversations(deduplicated);
+      // ✅ HYBRID CACHE: On API error, try all fallbacks but NEVER clear existing data
+      // Priority: AsyncStorage → SQLite → Keep existing state
+      
+      // If we already have data from AsyncStorage, keep it (don't clear)
+      if (conversations.length > 0) {
         setIsLoading(false);
         return;
       }
-      // Don't clear conversations on error - preserve existing data
-      // Only clear if we have no existing conversations (initial load)
-      if (conversations.length === 0) {
-        // Try loading from cache one more time
-        const cachedConversations = await loadCachedConversations();
-        if (cachedConversations.length > 0) {
-          const deduplicated = deduplicateConversations(cachedConversations);
-          setConversations(deduplicated);
-          setFilteredConversations(deduplicated);
-        } else {
-          setConversations([]);
-          setFilteredConversations([]);
-        }
+      
+      // Try SQLite fallback
+      const sqliteConversations = await loadCachedConversations();
+      if (sqliteConversations.length > 0) {
+        const deduplicated = deduplicateConversations(sqliteConversations);
+        setConversations(deduplicated);
+        setFilteredConversations(deduplicated);
+        // Also save to AsyncStorage for next time
+        await saveAsyncStorageConversations(deduplicated);
+        setIsLoading(false);
+        return;
       }
+      
+      // Try AsyncStorage one more time (in case it wasn't loaded initially)
+      const asyncStorageConversations = await loadAsyncStorageConversations();
+      if (asyncStorageConversations.length > 0) {
+        setConversations(asyncStorageConversations);
+        setFilteredConversations(asyncStorageConversations);
+        setIsLoading(false);
+        return;
+      }
+      
+      // ✅ CRITICAL: Only show empty state if ALL three sources are empty
+      // Never clear state on error - preserve existing data
+      if (conversations.length === 0) {
+        // All caches empty - this is truly empty, not an app failure
+        setConversations([]);
+        setFilteredConversations([]);
+      }
+      
       // Log error details for debugging
       if (error?.response) {
         console.error('API Error Response:', {
@@ -365,33 +430,35 @@ export default function ConversationsScreen() {
     if (user && dbInitialized) {
       const loadData = async () => {
         try {
-          // STEP 1: Show cached data instantly (if available) - NO loading spinner
-          const cachedConversations = await loadCachedConversations();
-          if (cachedConversations.length > 0) {
-            const deduplicated = deduplicateConversations(cachedConversations);
-            setConversations(deduplicated);
-            setFilteredConversations(deduplicated);
-            // Don't set loading to false yet - we'll fetch fresh data
+          // ✅ HYBRID CACHE: Load AsyncStorage first (instant display)
+          const asyncStorageConversations = await loadAsyncStorageConversations();
+          if (asyncStorageConversations.length > 0) {
+            setConversations(asyncStorageConversations);
+            setFilteredConversations(asyncStorageConversations);
+            setIsLoading(false); // Show data immediately
           } else {
-            // No cache available - show loading spinner
-            setIsLoading(true);
-          }
-          
-          // STEP 2: Fetch from API in parallel (always) - API is source of truth
-          try {
-            await loadConversations(); // This fetches from API and saves to SQLite
-          } catch (apiError) {
-            console.error('[Conversations] API fetch failed:', apiError);
-            
-            // STEP 3: If API fails and we have cache, keep showing cache
-            if (cachedConversations.length > 0) {
-              // Cache already displayed above, just ensure loading is off
+            // Try SQLite as fallback
+            const sqliteConversations = await loadCachedConversations();
+            if (sqliteConversations.length > 0) {
+              const deduplicated = deduplicateConversations(sqliteConversations);
+              setConversations(deduplicated);
+              setFilteredConversations(deduplicated);
+              // Save to AsyncStorage for next time
+              await saveAsyncStorageConversations(deduplicated);
               setIsLoading(false);
             } else {
-              // No cache and API failed - show error state
-              setIsLoading(false);
-              // Keep empty state (already set above)
+              // No cache available - show loading spinner
+              setIsLoading(true);
             }
+          }
+          
+          // STEP 2: Fetch from API in background (always) - updates both caches
+          try {
+            await loadConversations(); // This fetches from API and saves to both caches
+          } catch (apiError) {
+            console.error('[Conversations] API fetch failed:', apiError);
+            // Don't clear state - keep showing cached data
+            setIsLoading(false);
           }
         } catch (error) {
           console.error('[Conversations] Error in loadData:', error);
@@ -413,19 +480,18 @@ export default function ConversationsScreen() {
     useCallback(() => {
       // Only reload if user is authenticated and database is initialized
       if (user && dbInitialized) {
-        // OPTIMIZED: Show cached data instantly, then fetch fresh from API
+        // ✅ HYBRID CACHE: Show AsyncStorage instantly, then fetch fresh from API
         const refreshData = async () => {
-          // Show cached data instantly (if available)
-          const cachedConversations = await loadCachedConversations();
-          if (cachedConversations.length > 0) {
-            const deduplicated = deduplicateConversations(cachedConversations);
-            setConversations(deduplicated);
-            setFilteredConversations(deduplicated);
+          // Show AsyncStorage data instantly (if available)
+          const asyncStorageConversations = await loadAsyncStorageConversations();
+          if (asyncStorageConversations.length > 0) {
+            setConversations(asyncStorageConversations);
+            setFilteredConversations(asyncStorageConversations);
           }
           
-          // Fetch fresh data from API (always)
+          // Fetch fresh data from API in background (updates both caches)
           try {
-            await loadConversations(); // This fetches from API and updates SQLite
+            await loadConversations(); // This fetches from API and updates both caches
           } catch (error) {
             // If API fails, cached data is already displayed
             if (__DEV__) {

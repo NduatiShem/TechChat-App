@@ -1711,7 +1711,7 @@ export default function UserChatScreen() {
       // BACKGROUND SYNC: Save to SQLite for offline access
       if (dbInitialized) {
         try {
-          await syncOlderMessages(Number(id), 'individual', nextPage, MESSAGES_PER_PAGE);
+          await syncOlderMessages(Number(id), 'individual', nextPage, MESSAGES_PER_PAGE, user?.id || 0);
         } catch (syncError) {
           // Silently fail - SQLite sync is not critical
           if (__DEV__) {
