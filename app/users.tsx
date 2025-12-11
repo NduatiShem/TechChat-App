@@ -216,44 +216,47 @@ export default function UsersScreen() {
   useEffect(() => {
     // Only load users if database is initialized
     if (dbInitialized) {
-      const loadData = async () => {
-        try {
-          // ✅ HYBRID CACHE: Load AsyncStorage first (instant display)
-          const asyncStorageUsers = await loadAsyncStorageUsers();
-          if (asyncStorageUsers.length > 0) {
-            setUsers(asyncStorageUsers);
-            setFilteredUsers(asyncStorageUsers);
-            setIsLoading(false); // Show data immediately
-          } else {
-            // Try SQLite as fallback
-            const sqliteUsers = await loadCachedUsers();
-            if (sqliteUsers.length > 0) {
-              setUsers(sqliteUsers);
-              setFilteredUsers(sqliteUsers);
-              // Save to AsyncStorage for next time
-              await saveAsyncStorageUsers(sqliteUsers);
-              setIsLoading(false);
-            } else {
-              // No cache available - show loading spinner
-              setIsLoading(true);
-            }
-          }
-          
-          // STEP 2: Fetch from API in background (always) - updates both caches
+      // ✅ STAGGERED LOADING: Delay to prevent concurrent database access
+      setTimeout(() => {
+        const loadData = async () => {
           try {
-            await loadUsers(); // This fetches from API and saves to both caches
-          } catch (apiError) {
-            console.error('[Users] API fetch failed:', apiError);
-            // Don't clear state - keep showing cached data
+            // ✅ HYBRID CACHE: Load AsyncStorage first (instant display)
+            const asyncStorageUsers = await loadAsyncStorageUsers();
+            if (asyncStorageUsers.length > 0) {
+              setUsers(asyncStorageUsers);
+              setFilteredUsers(asyncStorageUsers);
+              setIsLoading(false); // Show data immediately
+            } else {
+              // Try SQLite as fallback
+              const sqliteUsers = await loadCachedUsers();
+              if (sqliteUsers.length > 0) {
+                setUsers(sqliteUsers);
+                setFilteredUsers(sqliteUsers);
+                // Save to AsyncStorage for next time
+                await saveAsyncStorageUsers(sqliteUsers);
+                setIsLoading(false);
+              } else {
+                // No cache available - show loading spinner
+                setIsLoading(true);
+              }
+            }
+            
+            // STEP 2: Fetch from API in background (always) - updates both caches
+            try {
+              await loadUsers(); // This fetches from API and saves to both caches
+            } catch (apiError) {
+              console.error('[Users] API fetch failed:', apiError);
+              // Don't clear state - keep showing cached data
+              setIsLoading(false);
+            }
+          } catch (error) {
+            console.error('[Users] Error in loadData:', error);
             setIsLoading(false);
           }
-        } catch (error) {
-          console.error('[Users] Error in loadData:', error);
-          setIsLoading(false);
-        }
-      };
-      
-      loadData();
+        };
+        
+        loadData();
+      }, 500); // 500ms delay for users (staggered from conversations and groups)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [dbInitialized]); // Load when database is initialized

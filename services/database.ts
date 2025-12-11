@@ -57,7 +57,7 @@ class DatabaseWriteQueue {
 }
 
 // Global write queue instance
-const writeQueue = new DatabaseWriteQueue();
+export const writeQueue = new DatabaseWriteQueue();
 
 // Helper function to check if error is a database locked error
 function isDatabaseLockedError(error: any): boolean {
@@ -77,7 +77,7 @@ function isDatabaseLockedError(error: any): boolean {
 }
 
 // Retry helper with exponential backoff
-async function retryWithBackoff<T>(
+export async function retryWithBackoff<T>(
   operation: () => Promise<T>,
   maxRetries: number = 5,
   initialDelay: number = 50
@@ -115,7 +115,7 @@ async function retryWithBackoff<T>(
 }
 
 // CRITICAL FIX: Database health check function
-async function validateDatabase(database: SQLite.SQLiteDatabase | null): Promise<boolean> {
+export async function validateDatabase(database: SQLite.SQLiteDatabase | null): Promise<boolean> {
   if (!database) {
     return false;
   }
@@ -280,103 +280,123 @@ export async function getMessages(
       return [];
     }
     
-    // CRITICAL FIX: Wrap query in try-catch to handle NullPointerException
-    let messages: DatabaseMessage[] = [];
-    try {
-      messages = await database.getAllAsync<DatabaseMessage>(
-        `SELECT * FROM messages 
-         WHERE conversation_id = ? AND conversation_type = ?
-         ORDER BY created_at DESC
-         LIMIT ? OFFSET ?`,
-        [conversationId, conversationType, limit, offset]
-      );
-    } catch (queryError: any) {
-      // Check if it's a NullPointerException or database not ready error
-      if (queryError?.message?.includes('NullPointerException') || 
-          queryError?.message?.includes('prepareAsync')) {
-        console.error('[Database] Database not ready for query (NullPointerException):', queryError);
-        return [];
-      }
-      throw queryError; // Re-throw other errors
-    }
-
-    const reversedMessages = messages.reverse();
-
-    const messagesWithDetails = await Promise.all(
-      reversedMessages.map(async (msg): Promise<MessageWithAttachments | null> => {
-        // CRITICAL FIX: Remove non-null assertion, add null check
-        if (!database) return null;
-        
-        let attachments: DatabaseAttachment[] = [];
-        try {
-          attachments = await database.getAllAsync<DatabaseAttachment>(
-            `SELECT * FROM attachments WHERE message_id = ?`,
-            [msg.id]
-          );
-        } catch (attachError: any) {
-          if (attachError?.message?.includes('NullPointerException')) {
-            console.error('[Database] Error loading attachments (NullPointerException):', attachError);
-            attachments = [];
-          } else {
-            throw attachError;
+    // ✅ CRITICAL FIX: Put all read operations through queue to prevent concurrent access
+    const dbRef = database;
+    return await retryWithBackoff(async () => {
+      return await writeQueue.enqueue(async () => {
+        // Re-validate database inside callback
+        let dbToUse: SQLite.SQLiteDatabase | null = dbRef;
+        if (!dbToUse) {
+          dbToUse = await getDb();
+          if (!dbToUse) {
+            return [];
           }
         }
+        
+        // Validate database is still valid
+        const isValid = await validateDatabase(dbToUse);
+        if (!isValid || !dbToUse) {
+          return [];
+        }
+        
+        const validDb = dbToUse;
+        
+        // CRITICAL FIX: Wrap query in try-catch to handle NullPointerException
+        let messages: DatabaseMessage[] = [];
+        try {
+          messages = await validDb.getAllAsync<DatabaseMessage>(
+            `SELECT * FROM messages 
+             WHERE conversation_id = ? AND conversation_type = ?
+             ORDER BY created_at DESC
+             LIMIT ? OFFSET ?`,
+            [conversationId, conversationType, limit, offset]
+          );
+        } catch (queryError: any) {
+          // Check if it's a NullPointerException or database not ready error
+          if (queryError?.message?.includes('NullPointerException') || 
+              queryError?.message?.includes('prepareAsync')) {
+            console.error('[Database] Database not ready for query (NullPointerException):', queryError);
+            return [];
+          }
+          throw queryError; // Re-throw other errors
+        }
 
-        let replyTo = undefined;
-        if (msg.reply_to_id && database) {
-          try {
-            const replyMsg = await database.getFirstAsync<DatabaseMessage>(
-              `SELECT * FROM messages WHERE id = ?`,
-              [msg.reply_to_id]
-            );
-            if (replyMsg && database) {
-              let replyAttachments: DatabaseAttachment[] = [];
+        const reversedMessages = messages.reverse();
+
+        const messagesWithDetails = await Promise.all(
+          reversedMessages.map(async (msg): Promise<MessageWithAttachments | null> => {
+            let attachments: DatabaseAttachment[] = [];
+            try {
+              attachments = await validDb.getAllAsync<DatabaseAttachment>(
+                `SELECT * FROM attachments WHERE message_id = ?`,
+                [msg.id]
+              );
+            } catch (attachError: any) {
+              if (attachError?.message?.includes('NullPointerException')) {
+                console.error('[Database] Error loading attachments (NullPointerException):', attachError);
+                attachments = [];
+              } else {
+                throw attachError;
+              }
+            }
+
+            let replyTo = undefined;
+            if (msg.reply_to_id) {
               try {
-                replyAttachments = await database.getAllAsync<DatabaseAttachment>(
-                  `SELECT * FROM attachments WHERE message_id = ?`,
-                  [replyMsg.id]
+                const replyMsg = await validDb.getFirstAsync<DatabaseMessage>(
+                  `SELECT * FROM messages WHERE id = ?`,
+                  [msg.reply_to_id]
                 );
-              } catch (replyAttachError: any) {
-                if (replyAttachError?.message?.includes('NullPointerException')) {
-                  console.error('[Database] Error loading reply attachments (NullPointerException):', replyAttachError);
-                  replyAttachments = [];
+                if (replyMsg) {
+                  let replyAttachments: DatabaseAttachment[] = [];
+                  try {
+                    replyAttachments = await validDb.getAllAsync<DatabaseAttachment>(
+                      `SELECT * FROM attachments WHERE message_id = ?`,
+                      [replyMsg.id]
+                    );
+                  } catch (replyAttachError: any) {
+                    if (replyAttachError?.message?.includes('NullPointerException')) {
+                      console.error('[Database] Error loading reply attachments (NullPointerException):', replyAttachError);
+                      replyAttachments = [];
+                    } else {
+                      throw replyAttachError;
+                    }
+                  }
+                  
+                  replyTo = {
+                    id: replyMsg.id,
+                    message: replyMsg.message,
+                    sender: {
+                      id: replyMsg.sender_id,
+                      name: 'Unknown User',
+                    },
+                    attachments: replyAttachments,
+                    created_at: replyMsg.created_at,
+                  };
+                }
+              } catch (replyError: any) {
+                if (replyError?.message?.includes('NullPointerException')) {
+                  console.error('[Database] Error loading reply message (NullPointerException):', replyError);
                 } else {
-                  throw replyAttachError;
+                  throw replyError;
                 }
               }
-              
-              replyTo = {
-                id: replyMsg.id,
-                message: replyMsg.message,
-                sender: {
-                  id: replyMsg.sender_id,
-                  name: 'Unknown User',
-                },
-                attachments: replyAttachments,
-                created_at: replyMsg.created_at,
-              };
             }
-          } catch (replyError: any) {
-            if (replyError?.message?.includes('NullPointerException')) {
-              console.error('[Database] Error loading reply message (NullPointerException):', replyError);
-            } else {
-              throw replyError;
-            }
-          }
-        }
 
-        return {
-          ...msg,
-          attachments: attachments.length > 0 ? attachments : undefined,
-          reply_to: replyTo,
-        };
-      })
-    );
+            return {
+              ...msg,
+              attachments: attachments.length > 0 ? attachments : undefined,
+              reply_to: replyTo,
+            };
+          })
+        );
 
-    // CRITICAL FIX: Filter out null values and ensure type safety
-    return messagesWithDetails.filter((msg): msg is MessageWithAttachments => {
-      return msg !== null;
-    }) as MessageWithAttachments[];
+        // CRITICAL FIX: Filter out null values and ensure type safety
+        return messagesWithDetails.filter((msg): msg is MessageWithAttachments => {
+          return msg !== null;
+        }) as MessageWithAttachments[];
+      });
+    });
   } catch (error) {
     console.error('[Database] Error getting messages:', error);
     return [];
@@ -415,16 +435,62 @@ export async function saveMessages(
   }
 
   try {
-    const database = await getDb();
+    // ✅ CRITICAL FIX: Get database with retry (like saveConversations)
+    let database = await getDb();
+    if (!database) {
+      // Wait a bit and retry
+      let retries = 0;
+      while (!database && retries < 5) {
+        await new Promise(resolve => setTimeout(resolve, 200));
+        database = await getDb();
+        retries++;
+      }
+    }
+    
     if (!database) {
       if (__DEV__) {
-        console.warn('[Database] Database not available, skipping save');
+        console.warn('[Database] Database not available after retries, skipping save');
       }
       return;
     }
     
+    // ✅ CRITICAL FIX: Validate database is still valid before enqueueing
+    const isValid = await validateDatabase(database);
+    if (!isValid) {
+      console.error('[Database] Database invalid (NullPointerException), reinitializing...');
+      db = null; // Reset database
+      database = await initDatabase(); // Try to reinitialize
+      if (!database) {
+        console.error('[Database] Failed to reinitialize, skipping save');
+        return;
+      }
+    }
+    
+    // ✅ CRITICAL FIX: Capture database reference for use in callback
+    const dbRef = database;
+    
     // Enqueue write operation to prevent concurrent writes
     await writeQueue.enqueue(async () => {
+      // ✅ CRITICAL FIX: Re-validate database inside callback
+      let dbToUse: SQLite.SQLiteDatabase | null = dbRef;
+      if (!dbToUse) {
+        dbToUse = await getDb();
+        if (!dbToUse) {
+          console.error('[Database] Database became null in writeQueue callback');
+          return;
+        }
+      }
+      
+      // ✅ CRITICAL FIX: Validate database is still valid
+      const isValid = await validateDatabase(dbToUse);
+      if (!isValid || !dbToUse) {
+        console.error('[Database] Database invalid in callback, skipping operation');
+        return;
+      }
+      
+      // TypeScript now knows dbToUse is not null
+      const validDb = dbToUse;
+      
       // Pre-fetch all existing messages OUTSIDE transaction to avoid read-write conflicts
       const existingMessagesMap = new Map<number | string, DatabaseMessage>();
       const existingAttachmentsMap = new Map<string, DatabaseAttachment>();
@@ -433,7 +499,7 @@ export async function saveMessages(
         for (const msg of messages) {
           if (msg.server_id) {
             try {
-              const existing = await database.getFirstAsync<DatabaseMessage>(
+              const existing = await validDb.getFirstAsync<DatabaseMessage>(
                 `SELECT * FROM messages WHERE server_id = ?`,
                 [msg.server_id]
               );
@@ -445,7 +511,7 @@ export async function saveMessages(
             }
           } else if (msg.id) {
             try {
-              const existing = await database.getFirstAsync<DatabaseMessage>(
+              const existing = await validDb.getFirstAsync<DatabaseMessage>(
                 `SELECT * FROM messages WHERE id = ?`,
                 [msg.id]
               );
@@ -474,9 +540,9 @@ export async function saveMessages(
           return;
         }
 
-        return await retryWithBackoff(async () => {
-          // Use pre-fetched data only - no reads inside transaction to avoid locks
-          let existingMessage: DatabaseMessage | null = null;
+        // ✅ CRITICAL FIX: Remove retryWithBackoff - queue serializes operations, so retries are not needed
+        // Use pre-fetched data only - no reads inside transaction to avoid locks
+        let existingMessage: DatabaseMessage | null = null;
           const key = msg.server_id ? `server_${msg.server_id}` : msg.id ? `id_${msg.id}` : null;
           if (key && existingMessagesMap.has(key)) {
             existingMessage = existingMessagesMap.get(key)!;
@@ -488,7 +554,7 @@ export async function saveMessages(
             try {
               // Check if there's a message with same content+sender in same conversation without server_id
               // This handles the case where message was saved locally, then synced from API
-              const potentialDuplicate = await database.getFirstAsync<DatabaseMessage>(
+              const potentialDuplicate = await validDb.getFirstAsync<DatabaseMessage>(
                 `SELECT * FROM messages 
                  WHERE conversation_id = ? 
                  AND conversation_type = ? 
@@ -519,7 +585,7 @@ export async function saveMessages(
             // If message has server_id, update created_at to match server timestamp
             // This prevents duplicates with different timestamps
             if (msg.server_id && msg.created_at) {
-              await database.runAsync(
+              await validDb.runAsync(
                 `UPDATE messages SET
                   message = ?,
                   created_at = ?,
@@ -539,7 +605,7 @@ export async function saveMessages(
               );
             } else {
               // Keep existing timestamp for local messages
-              await database.runAsync(
+              await validDb.runAsync(
                 `UPDATE messages SET
                   message = ?,
                   read_at = ?,
@@ -560,7 +626,7 @@ export async function saveMessages(
           } else {
             // INSERT new message (not in cache, assume new)
             // Try INSERT first, if it fails due to constraint, the retry will handle it as UPDATE
-            const result = await database.runAsync(
+            const result = await validDb.runAsync(
               `INSERT INTO messages (
                 server_id, conversation_id, conversation_type, sender_id, receiver_id, group_id,
                 message, created_at, read_at, edited_at, reply_to_id, sync_status
@@ -602,7 +668,7 @@ export async function saveMessages(
                 
                 if (!existingAttachment) {
                   try {
-                    const fetched = await database.getFirstAsync<DatabaseAttachment>(
+                    const fetched = await validDb.getFirstAsync<DatabaseAttachment>(
                       `SELECT * FROM attachments WHERE server_id = ? OR (message_id = ? AND url = ?)`,
                       [attachment.server_id ?? -1, messageId, attachment.url]
                     );
@@ -617,7 +683,7 @@ export async function saveMessages(
                 }
 
                 if (!existingAttachment) {
-                  await database.runAsync(
+                  await validDb.runAsync(
                     `INSERT INTO attachments (
                       server_id, message_id, name, mime, url, local_path, size, type, sync_status
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -646,18 +712,16 @@ export async function saveMessages(
               }
             }
           }
-        });
       };
 
-    // Try using transaction first with retry
-    try {
-      await retryWithBackoff(async () => {
-        await database.withTransactionAsync(async () => {
+      // ✅ CRITICAL FIX: Remove retryWithBackoff - queue serializes operations, so retries are not needed
+      // Try using transaction first
+      try {
+        await validDb.withTransactionAsync(async () => {
           for (const msg of messages) {
             await saveSingleMessage(msg);
           }
         });
-      });
       
       if (__DEV__) {
         console.log(`[Database] Saved ${messages.length} messages (transaction)`);
@@ -704,12 +768,11 @@ export async function markMessageAsRead(messageId: number): Promise<void> {
     
     // Enqueue write operation to prevent concurrent writes
     await writeQueue.enqueue(async () => {
-      await retryWithBackoff(async () => {
-        await database.runAsync(
-          `UPDATE messages SET read_at = datetime('now'), updated_at = datetime('now') WHERE id = ?`,
-          [messageId]
-        );
-      });
+      // ✅ CRITICAL FIX: Remove retryWithBackoff - queue serializes operations, so retries are not needed
+      await database.runAsync(
+        `UPDATE messages SET read_at = datetime('now'), updated_at = datetime('now') WHERE id = ?`,
+        [messageId]
+      );
     });
   } catch (error) {
     if (!isDatabaseLockedError(error)) {
@@ -726,13 +789,36 @@ export async function getUnreadCount(
   try {
     const database = await getDb();
     if (!database) return 0;
-    const result = await database.getFirstAsync<{ count: number }>(
-      `SELECT COUNT(*) as count FROM messages 
-       WHERE conversation_id = ? AND conversation_type = ? 
-       AND sender_id != ? AND read_at IS NULL`,
-      [conversationId, conversationType, currentUserId]
-    );
-    return result?.count ?? 0;
+    
+    // ✅ CRITICAL FIX: Put read operation through queue to prevent concurrent access
+    const dbRef = database;
+    return await retryWithBackoff(async () => {
+      return await writeQueue.enqueue(async () => {
+        // Re-validate database inside callback
+        let dbToUse: SQLite.SQLiteDatabase | null = dbRef;
+        if (!dbToUse) {
+          dbToUse = await getDb();
+          if (!dbToUse) {
+            return 0;
+          }
+        }
+        
+        // Validate database is still valid
+        const isValid = await validateDatabase(dbToUse);
+        if (!isValid || !dbToUse) {
+          return 0;
+        }
+        
+        const validDb = dbToUse;
+        const result = await validDb.getFirstAsync<{ count: number }>(
+          `SELECT COUNT(*) as count FROM messages 
+           WHERE conversation_id = ? AND conversation_type = ? 
+           AND sender_id != ? AND read_at IS NULL`,
+          [conversationId, conversationType, currentUserId]
+        );
+        return result?.count ?? 0;
+      });
+    });
   } catch (error) {
     console.error('[Database] Error getting unread count:', error);
     return 0;
@@ -744,10 +830,32 @@ export async function isDatabaseEmpty(): Promise<boolean> {
     const database = await getDb();
     if (!database) return true;
     
-    const result = await database.getFirstAsync<{ count: number }>(
-      `SELECT COUNT(*) as count FROM conversations`
-    );
-    return (result?.count ?? 0) === 0;
+    // ✅ CRITICAL FIX: Put read operation through queue to prevent concurrent access
+    const dbRef = database;
+    return await retryWithBackoff(async () => {
+      return await writeQueue.enqueue(async () => {
+        // Re-validate database inside callback
+        let dbToUse: SQLite.SQLiteDatabase | null = dbRef;
+        if (!dbToUse) {
+          dbToUse = await getDb();
+          if (!dbToUse) {
+            return true;
+          }
+        }
+        
+        // Validate database is still valid
+        const isValid = await validateDatabase(dbToUse);
+        if (!isValid || !dbToUse) {
+          return true;
+        }
+        
+        const validDb = dbToUse;
+        const result = await validDb.getFirstAsync<{ count: number }>(
+          `SELECT COUNT(*) as count FROM conversations`
+        );
+        return (result?.count ?? 0) === 0;
+      });
+    });
   } catch (error) {
     console.error('[Database] Error checking if empty:', error);
     return true; // Assume empty on error
@@ -802,11 +910,71 @@ export async function getGroups(): Promise<DatabaseGroup[]> {
       }
     }
     
-    const groups = await database.getAllAsync<DatabaseGroup>(
-      `SELECT * FROM groups ORDER BY updated_at DESC`
-    );
-    
-    return groups || [];
+    // ✅ CRITICAL FIX: Put read operation through queue to prevent concurrent access
+    const dbRef = database;
+    return await retryWithBackoff(async () => {
+      return await writeQueue.enqueue(async () => {
+        // Re-validate database inside callback
+        let dbToUse: SQLite.SQLiteDatabase | null = dbRef;
+        if (!dbToUse) {
+          dbToUse = await getDb();
+          if (!dbToUse) {
+            return [];
+          }
+        }
+        
+        // Validate database is still valid
+        const isValid = await validateDatabase(dbToUse);
+        if (!isValid || !dbToUse) {
+          return [];
+        }
+        
+        const validDb = dbToUse;
+        
+        // CRITICAL FIX: Ensure groups table exists (preventive measure)
+        try {
+          await validDb.getFirstAsync('SELECT 1 FROM groups LIMIT 1');
+        } catch (tableError: any) {
+          if (tableError?.message?.includes('no such table: groups')) {
+            console.warn('[Database] Groups table does not exist, creating it...');
+            try {
+              await validDb.execAsync(`
+                CREATE TABLE IF NOT EXISTS groups (
+                  id INTEGER PRIMARY KEY,
+                  name TEXT NOT NULL,
+                  description TEXT,
+                  owner_id INTEGER,
+                  avatar_url TEXT,
+                  member_count INTEGER DEFAULT 0,
+                  last_message TEXT,
+                  last_message_date TEXT,
+                  unread_count INTEGER NOT NULL DEFAULT 0,
+                  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                  last_synced_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+              `);
+              await validDb.execAsync(`
+                CREATE INDEX IF NOT EXISTS idx_groups_updated_at ON groups(updated_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_groups_owner_id ON groups(owner_id);
+              `);
+              console.log('[Database] Groups table created successfully');
+            } catch (createError) {
+              console.error('[Database] Failed to create groups table:', createError);
+              return [];
+            }
+          } else {
+            throw tableError;
+          }
+        }
+        
+        const groups = await validDb.getAllAsync<DatabaseGroup>(
+          `SELECT * FROM groups ORDER BY updated_at DESC`
+        );
+        
+        return groups || [];
+      });
+    });
   } catch (error) {
     console.error('[Database] Error getting groups:', error);
     return [];
@@ -926,11 +1094,11 @@ export async function saveGroups(
       // TypeScript now knows dbToUse is not null
       const validDb = dbToUse;
       
-      // Wrap transaction in try-catch to handle rollback errors with retry
+      // ✅ CRITICAL FIX: Remove retryWithBackoff - queue serializes operations, so retries are not needed
+      // If operation fails, it should fail fast and let next operation proceed
       try {
-        await retryWithBackoff(async () => {
-          await validDb.withTransactionAsync(async () => {
-            for (const group of groups) {
+        await validDb.withTransactionAsync(async () => {
+          for (const group of groups) {
               try {
                 // Check if group already exists
                 const existing = await validDb.getFirstAsync<{ id: number }>(
@@ -1000,7 +1168,6 @@ export async function saveGroups(
               }
             }
           });
-        });
       } catch (transactionError: any) {
         // Handle transaction errors, including rollback issues
         if (transactionError?.message?.includes('rollback') || 
@@ -1029,12 +1196,34 @@ export async function hasMessagesForConversation(
     const database = await getDb();
     if (!database) return false;
     
-    const result = await database.getFirstAsync<{ count: number }>(
-      `SELECT COUNT(*) as count FROM messages 
-       WHERE conversation_id = ? AND conversation_type = ?`,
-      [conversationId, conversationType]
-    );
-    return (result?.count ?? 0) > 0;
+    // ✅ CRITICAL FIX: Put read operation through queue to prevent concurrent access
+    const dbRef = database;
+    return await retryWithBackoff(async () => {
+      return await writeQueue.enqueue(async () => {
+        // Re-validate database inside callback
+        let dbToUse: SQLite.SQLiteDatabase | null = dbRef;
+        if (!dbToUse) {
+          dbToUse = await getDb();
+          if (!dbToUse) {
+            return false;
+          }
+        }
+        
+        // Validate database is still valid
+        const isValid = await validateDatabase(dbToUse);
+        if (!isValid || !dbToUse) {
+          return false;
+        }
+        
+        const validDb = dbToUse;
+        const result = await validDb.getFirstAsync<{ count: number }>(
+          `SELECT COUNT(*) as count FROM messages 
+           WHERE conversation_id = ? AND conversation_type = ?`,
+          [conversationId, conversationType]
+        );
+        return (result?.count ?? 0) > 0;
+      });
+    });
   } catch (error) {
     console.error('[Database] Error checking if conversation has messages:', error);
     return false;
@@ -1051,20 +1240,43 @@ export async function getConversations(conversationType?: 'individual' | 'group'
       return [];
     }
     
-    let query = `SELECT * FROM conversations`;
-    if (conversationType) {
-      query += ` WHERE conversation_type = ?`;
-      const conversations = await database.getAllAsync<DatabaseConversation>(
-        `${query} ORDER BY updated_at DESC`,
-        [conversationType]
-      );
-      return conversations;
-    } else {
-      const conversations = await database.getAllAsync<DatabaseConversation>(
-        `${query} ORDER BY updated_at DESC`
-      );
-      return conversations;
-    }
+    // ✅ CRITICAL FIX: Put read operation through queue to prevent concurrent access
+    const dbRef = database;
+    return await retryWithBackoff(async () => {
+      return await writeQueue.enqueue(async () => {
+        // Re-validate database inside callback
+        let dbToUse: SQLite.SQLiteDatabase | null = dbRef;
+        if (!dbToUse) {
+          dbToUse = await getDb();
+          if (!dbToUse) {
+            return [];
+          }
+        }
+        
+        // Validate database is still valid
+        const isValid = await validateDatabase(dbToUse);
+        if (!isValid || !dbToUse) {
+          return [];
+        }
+        
+        const validDb = dbToUse;
+        
+        let query = `SELECT * FROM conversations`;
+        if (conversationType) {
+          query += ` WHERE conversation_type = ?`;
+          const conversations = await validDb.getAllAsync<DatabaseConversation>(
+            `${query} ORDER BY updated_at DESC`,
+            [conversationType]
+          );
+          return conversations;
+        } else {
+          const conversations = await validDb.getAllAsync<DatabaseConversation>(
+            `${query} ORDER BY updated_at DESC`
+          );
+          return conversations;
+        }
+      });
+    });
   } catch (error) {
     console.error('[Database] Error getting conversations:', error);
     return [];
@@ -1146,11 +1358,11 @@ export async function saveConversations(
       // TypeScript now knows dbToUse is not null
       const validDb = dbToUse;
       
-      // Wrap transaction in try-catch to handle rollback errors with retry
+      // ✅ CRITICAL FIX: Remove retryWithBackoff - queue serializes operations, so retries are not needed
+      // If operation fails, it should fail fast and let next operation proceed
       try {
-        await retryWithBackoff(async () => {
-          await validDb.withTransactionAsync(async () => {
-            for (const conv of conversations) {
+        await validDb.withTransactionAsync(async () => {
+          for (const conv of conversations) {
               try {
                 const existing = await validDb.getFirstAsync<DatabaseConversation>(
                   `SELECT * FROM conversations 
@@ -1220,7 +1432,6 @@ export async function saveConversations(
               }
             }
           });
-        });
       } catch (transactionError: any) {
         // Handle transaction errors, including rollback issues
         if (transactionError?.message?.includes('rollback') || 
@@ -1230,10 +1441,9 @@ export async function saveConversations(
             console.warn('[Database] Transaction error, falling back to individual saves:', transactionError);
           }
           
-          // Fallback: Save conversations individually with retry
+          // Fallback: Save conversations individually (no retry - queue handles serialization)
           for (const conv of conversations) {
-          try {
-            await retryWithBackoff(async () => {
+            try {
               // CRITICAL FIX: Re-validate database in fallback
               let fallbackDb: SQLite.SQLiteDatabase | null = dbToUse;
               if (!fallbackDb) {
@@ -1309,17 +1519,16 @@ export async function saveConversations(
                   ]
                 );
               }
-            });
-          } catch (individualError) {
-            if (!isDatabaseLockedError(individualError)) {
-              console.error(`[Database] Error saving individual conversation ${conv.conversation_id}:`, individualError);
+            } catch (individualError) {
+              if (!isDatabaseLockedError(individualError)) {
+                console.error(`[Database] Error saving individual conversation ${conv.conversation_id}:`, individualError);
+              }
             }
           }
+        } else {
+          // Re-throw if it's not a transaction/rollback/locked error
+          throw transactionError;
         }
-      } else {
-        // Re-throw if it's not a transaction/rollback/locked error
-        throw transactionError;
-      }
       }
     });
 
@@ -1338,12 +1547,35 @@ export async function getSyncState(
   try {
     const database = await getDb();
     if (!database) return null;
-    const state = await database.getFirstAsync<SyncState>(
-      `SELECT * FROM sync_state 
-       WHERE conversation_id = ? AND conversation_type = ?`,
-      [conversationId, conversationType]
-    );
-    return state ?? null;
+    
+    // ✅ CRITICAL FIX: Put read operation through queue to prevent concurrent access
+    const dbRef = database;
+    return await retryWithBackoff(async () => {
+      return await writeQueue.enqueue(async () => {
+        // Re-validate database inside callback
+        let dbToUse: SQLite.SQLiteDatabase | null = dbRef;
+        if (!dbToUse) {
+          dbToUse = await getDb();
+          if (!dbToUse) {
+            return null;
+          }
+        }
+        
+        // Validate database is still valid
+        const isValid = await validateDatabase(dbToUse);
+        if (!isValid || !dbToUse) {
+          return null;
+        }
+        
+        const validDb = dbToUse;
+        const state = await validDb.getFirstAsync<SyncState>(
+          `SELECT * FROM sync_state 
+           WHERE conversation_id = ? AND conversation_type = ?`,
+          [conversationId, conversationType]
+        );
+        return state ?? null;
+      });
+    });
   } catch (error) {
     console.error('[Database] Error getting sync state:', error);
     return null;
@@ -1360,30 +1592,50 @@ export async function updateSyncState(
     const database = await getDb();
     if (!database) return;
     
+    // ✅ CRITICAL FIX: Move retryWithBackoff outside queue (wrap enqueue call)
+    const dbRef = database;
     await retryWithBackoff(async () => {
-      const existing = await database.getFirstAsync<SyncState>(
-        `SELECT * FROM sync_state 
-         WHERE conversation_id = ? AND conversation_type = ?`,
-        [conversationId, conversationType]
-      );
+      return await writeQueue.enqueue(async () => {
+        // Re-validate database inside callback
+        let dbToUse: SQLite.SQLiteDatabase | null = dbRef;
+        if (!dbToUse) {
+          dbToUse = await getDb();
+          if (!dbToUse) {
+            return;
+          }
+        }
+        
+        // Validate database is still valid
+        const isValid = await validateDatabase(dbToUse);
+        if (!isValid || !dbToUse) {
+          return;
+        }
+        
+        const validDb = dbToUse;
+        const existing = await validDb.getFirstAsync<SyncState>(
+          `SELECT * FROM sync_state 
+           WHERE conversation_id = ? AND conversation_type = ?`,
+          [conversationId, conversationType]
+        );
 
-      if (existing) {
-        await database.runAsync(
-          `UPDATE sync_state SET
-            last_sync_timestamp = datetime('now'),
-            sync_status = ?,
-            last_error = ?
-          WHERE conversation_id = ? AND conversation_type = ?`,
-          [syncStatus, lastError ?? null, conversationId, conversationType]
-        );
-      } else {
-        await database.runAsync(
-          `INSERT INTO sync_state (
-            conversation_id, conversation_type, last_sync_timestamp, sync_status, last_error
-          ) VALUES (?, ?, datetime('now'), ?, ?)`,
-          [conversationId, conversationType, syncStatus, lastError ?? null]
-        );
-      }
+        if (existing) {
+          await validDb.runAsync(
+            `UPDATE sync_state SET
+              last_sync_timestamp = datetime('now'),
+              sync_status = ?,
+              last_error = ?
+            WHERE conversation_id = ? AND conversation_type = ?`,
+            [syncStatus, lastError ?? null, conversationId, conversationType]
+          );
+        } else {
+          await validDb.runAsync(
+            `INSERT INTO sync_state (
+              conversation_id, conversation_type, last_sync_timestamp, sync_status, last_error
+            ) VALUES (?, ?, datetime('now'), ?, ?)`,
+            [conversationId, conversationType, syncStatus, lastError ?? null]
+          );
+        }
+      });
     });
   } catch (error) {
     if (!isDatabaseLockedError(error)) {
@@ -1413,11 +1665,33 @@ export async function getUsers(): Promise<DatabaseUser[]> {
       return [];
     }
     
-    const users = await database.getAllAsync<DatabaseUser>(
-      `SELECT * FROM users ORDER BY name ASC`
-    );
-    
-    return users || [];
+    // ✅ CRITICAL FIX: Put read operation through queue to prevent concurrent access
+    const dbRef = database;
+    return await retryWithBackoff(async () => {
+      return await writeQueue.enqueue(async () => {
+        // Re-validate database inside callback
+        let dbToUse: SQLite.SQLiteDatabase | null = dbRef;
+        if (!dbToUse) {
+          dbToUse = await getDb();
+          if (!dbToUse) {
+            return [];
+          }
+        }
+        
+        // Validate database is still valid
+        const isValid = await validateDatabase(dbToUse);
+        if (!isValid || !dbToUse) {
+          return [];
+        }
+        
+        const validDb = dbToUse;
+        const users = await validDb.getAllAsync<DatabaseUser>(
+          `SELECT * FROM users ORDER BY name ASC`
+        );
+        
+        return users || [];
+      });
+    });
   } catch (error) {
     console.error('[Database] Error getting users:', error);
     return [];
@@ -1526,11 +1800,11 @@ export async function saveUsers(
       // TypeScript now knows dbToUse is not null
       const validDb = dbToUse;
       
-      // Wrap transaction in try-catch to handle rollback errors with retry
+      // ✅ CRITICAL FIX: Remove retryWithBackoff - queue serializes operations, so retries are not needed
+      // If operation fails, it should fail fast and let next operation proceed
       try {
-        await retryWithBackoff(async () => {
-          await validDb.withTransactionAsync(async () => {
-            for (const user of users) {
+        await validDb.withTransactionAsync(async () => {
+          for (const user of users) {
               try {
                 const existing = await validDb.getFirstAsync<DatabaseUser>(
                   `SELECT * FROM users WHERE id = ?`,
@@ -1578,7 +1852,6 @@ export async function saveUsers(
               }
             }
           });
-        });
       } catch (transactionError: any) {
         // Handle transaction errors, including rollback issues
         if (transactionError?.message?.includes('rollback') || 
@@ -1588,12 +1861,11 @@ export async function saveUsers(
             console.warn('[Database] Transaction error, falling back to individual saves:', transactionError);
           }
           
-          // Fallback: Save users individually with retry
+          // Fallback: Save users individually (no retry - queue handles serialization)
           for (const user of users) {
             try {
-              await retryWithBackoff(async () => {
-                // CRITICAL FIX: Re-validate database in fallback
-                let fallbackDb: SQLite.SQLiteDatabase | null = dbToUse;
+              // CRITICAL FIX: Re-validate database in fallback
+              let fallbackDb: SQLite.SQLiteDatabase | null = dbToUse;
                 if (!fallbackDb) {
                   fallbackDb = await getDb();
                   if (!fallbackDb) {
@@ -1645,7 +1917,6 @@ export async function saveUsers(
                     ]
                   );
                 }
-              });
             } catch (individualError) {
               if (!isDatabaseLockedError(individualError)) {
                 console.error(`[Database] Error saving individual user ${user.id}:`, individualError);
@@ -1687,25 +1958,53 @@ export async function getPendingMessages(): Promise<DatabaseMessage[]> {
       return [];
     }
     
-    // CRITICAL FIX: Add try-catch around the actual query to handle NullPointerException
-    try {
-      // ✅ FIX: Also get failed messages (they should be retried)
-      const messages = await database.getAllAsync<DatabaseMessage>(
-        `SELECT * FROM messages 
-         WHERE (sync_status = 'pending' OR sync_status = 'failed')
-         AND server_id IS NULL
-         ORDER BY created_at ASC`
-      );
-      return messages || [];
-    } catch (queryError: any) {
-      // Check if it's a NullPointerException or database not ready error
-      if (queryError?.message?.includes('NullPointerException') || 
-          queryError?.message?.includes('prepareAsync')) {
-        console.error('[Database] Database not ready for query (NullPointerException):', queryError);
+    // ✅ CRITICAL FIX: Put read operation through queue to prevent concurrent access
+    const dbRef = database;
+    return await writeQueue.enqueue(async () => {
+      // Re-validate database inside callback
+      let dbToUse: SQLite.SQLiteDatabase | null = dbRef;
+      if (!dbToUse) {
+        dbToUse = await getDb();
+        if (!dbToUse) {
+          return [];
+        }
+      }
+      
+      // Validate database is still valid
+      const isValid = await validateDatabase(dbToUse);
+      if (!isValid || !dbToUse) {
         return [];
       }
-      throw queryError; // Re-throw other errors
-    }
+      
+      const validDb = dbToUse;
+      
+      // CRITICAL FIX: Add try-catch around the actual query to handle NullPointerException
+      try {
+        // ✅ FIX: Also get failed messages (they should be retried)
+        const messages = await validDb.getAllAsync<DatabaseMessage>(
+          `SELECT * FROM messages 
+           WHERE (sync_status = 'pending' OR sync_status = 'failed')
+           AND server_id IS NULL
+           ORDER BY created_at ASC`
+        );
+        return messages || [];
+      } catch (queryError: any) {
+        // Check if it's a NullPointerException or database not ready error
+        if (queryError?.message?.includes('NullPointerException') || 
+            queryError?.message?.includes('prepareAsync')) {
+          console.error('[Database] Database not ready for query (NullPointerException):', queryError);
+          return [];
+        }
+        // For database locked errors, return empty array (will retry later)
+        if (isDatabaseLockedError(queryError)) {
+          if (__DEV__) {
+            console.warn('[Database] Database locked during getPendingMessages (should not happen with queue)');
+          }
+          return [];
+        }
+        throw queryError; // Re-throw other errors
+      }
+    });
   } catch (error) {
     console.error('[Database] Error getting pending messages:', error);
     return [];
@@ -1717,17 +2016,143 @@ export async function updateMessageStatus(
   serverId?: number,
   syncStatus: 'synced' | 'pending' | 'failed' = 'synced',
   serverCreatedAt?: string
-): Promise<void> {
+): Promise<boolean> {
+  // ✅ CRITICAL FIX: Track if update actually succeeded
+  let updateSucceeded = false;
+  
   try {
-    const database = await getDb();
-    if (!database) return;
+    // ✅ CRITICAL FIX: Get database with retry
+    let database = await getDb();
+    if (!database) {
+      let retries = 0;
+      while (!database && retries < 5) {
+        await new Promise(resolve => setTimeout(resolve, 200));
+        database = await getDb();
+        retries++;
+      }
+    }
     
-    // Enqueue write operation to prevent concurrent writes
+    if (!database) {
+      if (__DEV__) {
+        console.warn('[Database] Database not available after retries, skipping update');
+      }
+      return false;
+    }
+    
+    // ✅ CRITICAL FIX: Validate database is still valid before enqueueing
+    const isValid = await validateDatabase(database);
+    if (!isValid) {
+      console.error('[Database] Database invalid, reinitializing...');
+      db = null;
+      database = await initDatabase();
+      if (!database) {
+        console.error('[Database] Failed to reinitialize, skipping update');
+        return false;
+      }
+    }
+    
+    // ✅ CRITICAL FIX: Capture database reference for use in callback
+    const dbRef = database;
+    
+    // ✅ CRITICAL FIX: Move ALL database operations inside write queue to prevent concurrent reads/writes
     await writeQueue.enqueue(async () => {
-      await retryWithBackoff(async () => {
+      // ✅ CRITICAL FIX: Re-validate database inside callback
+      let dbToUse: SQLite.SQLiteDatabase | null = dbRef;
+      if (!dbToUse) {
+        dbToUse = await getDb();
+        if (!dbToUse) {
+          console.error('[Database] Database became null in writeQueue callback');
+          updateSucceeded = false;
+          return;
+        }
+      }
+      
+      // ✅ CRITICAL FIX: Validate database is still valid
+      const isValid = await validateDatabase(dbToUse);
+      if (!isValid || !dbToUse) {
+        console.error('[Database] Database invalid in callback, skipping operation');
+        updateSucceeded = false;
+        return;
+      }
+      
+      // TypeScript now knows dbToUse is not null
+      const validDb = dbToUse;
+      
+      // ✅ CRITICAL FIX: Remove retryWithBackoff - queue serializes operations, so retries are not needed
+      // If operation fails, it should fail fast and let next operation proceed
+      try {
+        // ✅ CRITICAL FIX: Check current status INSIDE queue to prevent unnecessary writes
+        try {
+          const currentMessage = await validDb.getFirstAsync<{ server_id?: number; sync_status?: string }>(
+            `SELECT server_id, sync_status FROM messages WHERE id = ?`,
+            [localMessageId]
+          );
+          
+          // Skip update if message already has the same status and server_id
+          if (currentMessage) {
+            const currentServerId = currentMessage.server_id ?? null;
+            const currentSyncStatus = currentMessage.sync_status;
+            const newServerId = serverId ?? null;
+            
+            // If already synced with same server_id, skip update (but mark as succeeded)
+            if (currentSyncStatus === 'synced' && currentServerId === newServerId && newServerId !== null) {
+              updateSucceeded = true; // Already in correct state
+              return; // No update needed
+            }
+            
+            // If already has server_id and we're trying to set it again, skip (but mark as succeeded)
+            if (currentServerId !== null && currentServerId === newServerId && syncStatus === 'synced') {
+              updateSucceeded = true; // Already in correct state
+              return; // No update needed
+            }
+          }
+        } catch (checkError) {
+          // Continue with update if check fails
+        }
+        
+        // ✅ CRITICAL FIX: Check if another message already has this server_id INSIDE queue
+        if (serverId) {
+          try {
+            const existingMessage = await validDb.getFirstAsync<{ id: number; conversation_id: number; sender_id: number; message?: string }>(
+              `SELECT id, conversation_id, sender_id, message FROM messages WHERE server_id = ? AND id != ?`,
+              [serverId, localMessageId]
+            );
+            
+            if (existingMessage) {
+              // Another message already has this server_id
+              // Check if it's the same message (by content/sender/conversation)
+              const currentMessage = await validDb.getFirstAsync<{ conversation_id: number; sender_id: number; message?: string }>(
+                `SELECT conversation_id, sender_id, message FROM messages WHERE id = ?`,
+                [localMessageId]
+              );
+              
+              if (currentMessage && 
+                  currentMessage.conversation_id === existingMessage.conversation_id &&
+                  currentMessage.sender_id === existingMessage.sender_id &&
+                  currentMessage.message === existingMessage.message) {
+                // It's the same message - delete the duplicate (keep the one with server_id)
+                console.warn(`[Database] Duplicate message detected: ${localMessageId} and ${existingMessage.id} have same content. Deleting ${localMessageId}`);
+                await validDb.runAsync(`DELETE FROM attachments WHERE message_id = ?`, [localMessageId]);
+                await validDb.runAsync(`DELETE FROM messages WHERE id = ?`, [localMessageId]);
+                updateSucceeded = true; // Duplicate handled successfully
+                return; // Don't update, duplicate was deleted
+              } else {
+                // Different message with same server_id - this shouldn't happen, but handle gracefully
+                console.error(`[Database] UNIQUE constraint violation: server_id ${serverId} already exists on message ${existingMessage.id}, cannot assign to ${localMessageId}`);
+                // Don't update - keep message as pending
+                updateSucceeded = false;
+                return;
+              }
+            }
+          } catch (checkError) {
+            // Continue with update if check fails
+          }
+        }
+        
+        // ✅ Perform the update directly (no retry - queue handles serialization)
         if (serverCreatedAt) {
           // Update with server timestamp to match API response
-          await database.runAsync(
+          await validDb.runAsync(
             `UPDATE messages SET
               server_id = ?,
               sync_status = ?,
@@ -1738,7 +2163,7 @@ export async function updateMessageStatus(
           );
         } else {
           // Keep existing timestamp if server timestamp not provided
-          await database.runAsync(
+          await validDb.runAsync(
             `UPDATE messages SET
               server_id = ?,
               sync_status = ?,
@@ -1747,16 +2172,86 @@ export async function updateMessageStatus(
             [serverId ?? null, syncStatus, localMessageId]
           );
         }
-      });
+        
+        // ✅ Mark as succeeded if we got here without error
+        updateSucceeded = true;
+      } catch (updateError: any) {
+        // ✅ CRITICAL FIX: Handle UNIQUE constraint violations gracefully
+        const errorMessage = updateError?.message || String(updateError) || '';
+        if (errorMessage.includes('UNIQUE constraint') || errorMessage.includes('UNIQUE constraint failed')) {
+          // Another message already has this server_id
+          console.warn(`[Database] UNIQUE constraint violation for server_id ${serverId} on message ${localMessageId}. Checking for duplicate...`);
+          
+          try {
+            // Check if another message has this server_id
+            const existingMessage = await validDb.getFirstAsync<{ id: number }>(
+              `SELECT id FROM messages WHERE server_id = ? AND id != ?`,
+              [serverId, localMessageId]
+            );
+            
+            if (existingMessage) {
+              // Another message has this server_id - check if current message is a duplicate
+              const currentMessage = await validDb.getFirstAsync<{ conversation_id: number; sender_id: number; message?: string }>(
+                `SELECT conversation_id, sender_id, message FROM messages WHERE id = ?`,
+                [localMessageId]
+              );
+              
+              const duplicateMessage = await validDb.getFirstAsync<{ conversation_id: number; sender_id: number; message?: string }>(
+                `SELECT conversation_id, sender_id, message FROM messages WHERE id = ?`,
+                [existingMessage.id]
+              );
+              
+              if (currentMessage && duplicateMessage &&
+                  currentMessage.conversation_id === duplicateMessage.conversation_id &&
+                  currentMessage.sender_id === duplicateMessage.sender_id &&
+                  currentMessage.message === duplicateMessage.message) {
+                // Same message - delete the duplicate (keep the one with server_id)
+                console.warn(`[Database] Deleting duplicate message ${localMessageId}, keeping ${existingMessage.id} with server_id ${serverId}`);
+                await validDb.runAsync(`DELETE FROM attachments WHERE message_id = ?`, [localMessageId]);
+                await validDb.runAsync(`DELETE FROM messages WHERE id = ?`, [localMessageId]);
+                updateSucceeded = true; // Duplicate handled successfully
+                return; // Successfully handled duplicate
+              } else {
+                // Different messages - this is an error, but don't crash
+                console.error(`[Database] Cannot assign server_id ${serverId} to message ${localMessageId} - already assigned to different message ${existingMessage.id}`);
+                // Keep message as pending - don't update
+                updateSucceeded = false;
+                return;
+              }
+            } else {
+              // No existing message found - might be a race condition, but don't retry (queue handles serialization)
+              console.warn(`[Database] UNIQUE constraint error but no duplicate found for message ${localMessageId} with server_id ${serverId}`);
+              updateSucceeded = false;
+              return;
+            }
+          } catch (checkError) {
+            // Error checking for duplicate - fail the update
+            console.error(`[Database] Error checking for duplicate after UNIQUE constraint violation:`, checkError);
+            updateSucceeded = false;
+            return;
+          }
+        } else if (isDatabaseLockedError(updateError)) {
+          // Database locked error - this shouldn't happen with proper queue serialization
+          // But if it does, fail fast and let next operation proceed
+          console.warn(`[Database] Database locked during updateMessageStatus (this shouldn't happen with queue):`, updateError);
+          updateSucceeded = false;
+          return;
+        } else {
+          // Other error - fail the update
+          console.error(`[Database] Error updating message status:`, updateError);
+          updateSucceeded = false;
+          return;
+        }
+      }
     });
     
-    if (__DEV__) {
-      console.log(`[Database] Updated message ${localMessageId} status to ${syncStatus}${serverId ? ` with server_id ${serverId}` : ''}${serverCreatedAt ? ` and server timestamp ${serverCreatedAt}` : ''}`);
-    }
+    // ✅ Return success status
+    return updateSucceeded;
   } catch (error) {
     if (!isDatabaseLockedError(error)) {
       console.error('[Database] Error updating message status:', error);
     }
+    return false; // Return false on error
   }
 }
 
@@ -1770,38 +2265,88 @@ export async function updateMessageByServerId(
   }
 ): Promise<void> {
   try {
-    const database = await getDb();
-    if (!database) return;
+    // ✅ CRITICAL FIX: Get database with retry
+    let database = await getDb();
+    if (!database) {
+      let retries = 0;
+      while (!database && retries < 5) {
+        await new Promise(resolve => setTimeout(resolve, 200));
+        database = await getDb();
+        retries++;
+      }
+    }
     
-    // Enqueue write operation to prevent concurrent writes
-    await writeQueue.enqueue(async () => {
-      const updateFields: string[] = [];
-      const updateValues: any[] = [];
-      
-      if (updates.sync_status !== undefined) {
-        updateFields.push('sync_status = ?');
-        updateValues.push(updates.sync_status);
+    if (!database) {
+      if (__DEV__) {
+        console.warn('[Database] Database not available after retries, skipping update');
       }
-      if (updates.read_at !== undefined) {
-        updateFields.push('read_at = ?');
-        updateValues.push(updates.read_at);
+      return;
+    }
+    
+    // ✅ CRITICAL FIX: Validate database is still valid before enqueueing
+    const isValid = await validateDatabase(database);
+    if (!isValid) {
+      console.error('[Database] Database invalid, reinitializing...');
+      db = null;
+      database = await initDatabase();
+      if (!database) {
+        console.error('[Database] Failed to reinitialize, skipping update');
+        return;
       }
-      if (updates.edited_at !== undefined) {
-        updateFields.push('edited_at = ?');
-        updateValues.push(updates.edited_at);
-      }
-      if (updates.message !== undefined) {
-        updateFields.push('message = ?');
-        updateValues.push(updates.message);
-      }
-      
-      if (updateFields.length === 0) return;
-      
-      updateFields.push('updated_at = datetime(\'now\')');
-      updateValues.push(serverId);
-      
-      await retryWithBackoff(async () => {
-        await database.runAsync(
+    }
+    
+    // ✅ CRITICAL FIX: Capture database reference for use in callback
+    const dbRef = database;
+    
+    // ✅ CRITICAL FIX: Move retryWithBackoff outside queue (wrap enqueue call)
+    await retryWithBackoff(async () => {
+      return await writeQueue.enqueue(async () => {
+        // ✅ CRITICAL FIX: Re-validate database inside callback
+        let dbToUse: SQLite.SQLiteDatabase | null = dbRef;
+        if (!dbToUse) {
+          dbToUse = await getDb();
+          if (!dbToUse) {
+            console.error('[Database] Database became null in writeQueue callback');
+            return;
+          }
+        }
+        
+        // ✅ CRITICAL FIX: Validate database is still valid
+        const isValid = await validateDatabase(dbToUse);
+        if (!isValid || !dbToUse) {
+          console.error('[Database] Database invalid in callback, skipping operation');
+          return;
+        }
+        
+        // TypeScript now knows dbToUse is not null
+        const validDb = dbToUse;
+        
+        const updateFields: string[] = [];
+        const updateValues: any[] = [];
+        
+        if (updates.sync_status !== undefined) {
+          updateFields.push('sync_status = ?');
+          updateValues.push(updates.sync_status);
+        }
+        if (updates.read_at !== undefined) {
+          updateFields.push('read_at = ?');
+          updateValues.push(updates.read_at);
+        }
+        if (updates.edited_at !== undefined) {
+          updateFields.push('edited_at = ?');
+          updateValues.push(updates.edited_at);
+        }
+        if (updates.message !== undefined) {
+          updateFields.push('message = ?');
+          updateValues.push(updates.message);
+        }
+        
+        if (updateFields.length === 0) return;
+        
+        updateFields.push('updated_at = datetime(\'now\')');
+        updateValues.push(serverId);
+        
+        await validDb.runAsync(
           `UPDATE messages SET ${updateFields.join(', ')} WHERE server_id = ?`,
           updateValues
         );
@@ -1831,41 +2376,60 @@ export async function deleteMessage(
       return;
     }
     
-    // Enqueue write operation to prevent concurrent writes
-    await writeQueue.enqueue(async () => {
-      let messageId: number | null = null;
-      
-      // First, find the message to get its local ID
-      if (serverId) {
-        const message = await database.getFirstAsync<DatabaseMessage>(
-          `SELECT id FROM messages WHERE server_id = ?`,
-          [serverId]
-        );
-        if (message) {
-          messageId = message.id;
+    // ✅ CRITICAL FIX: Move retryWithBackoff outside queue (wrap enqueue call)
+    const dbRef = database;
+    await retryWithBackoff(async () => {
+      return await writeQueue.enqueue(async () => {
+        // Re-validate database inside callback
+        let dbToUse: SQLite.SQLiteDatabase | null = dbRef;
+        if (!dbToUse) {
+          dbToUse = await getDb();
+          if (!dbToUse) {
+            console.error('[Database] Database became null in writeQueue callback');
+            return;
+          }
         }
-      } else if (localId) {
-        messageId = localId;
-      }
-      
-      if (!messageId) {
-        if (__DEV__) {
-          console.warn(`[Database] Message not found for deletion: server_id=${serverId}, local_id=${localId}`);
+        
+        // Validate database is still valid
+        const isValid = await validateDatabase(dbToUse);
+        if (!isValid || !dbToUse) {
+          console.error('[Database] Database invalid in callback, skipping operation');
+          return;
         }
-        return;
-      }
-      
-      await retryWithBackoff(async () => {
+        
+        const validDb = dbToUse;
+        let messageId: number | null = null;
+        
+        // First, find the message to get its local ID
+        if (serverId) {
+          const message = await validDb.getFirstAsync<DatabaseMessage>(
+            `SELECT id FROM messages WHERE server_id = ?`,
+            [serverId]
+          );
+          if (message) {
+            messageId = message.id;
+          }
+        } else if (localId) {
+          messageId = localId;
+        }
+        
+        if (!messageId) {
+          if (__DEV__) {
+            console.warn(`[Database] Message not found for deletion: server_id=${serverId}, local_id=${localId}`);
+          }
+          return;
+        }
+        
         // Delete attachments first (foreign key constraint)
-        await database.runAsync(
+        await validDb.runAsync(
           `DELETE FROM attachments WHERE message_id = ?`,
-          [messageId!]
+          [messageId]
         );
         
         // Delete the message
-        await database.runAsync(
+        await validDb.runAsync(
           `DELETE FROM messages WHERE id = ?`,
-          [messageId!]
+          [messageId]
         );
       });
     });
@@ -2083,15 +2647,13 @@ export async function fixDuplicateMessagesWithWrongTimestamps(
             // Delete others (only if we have a matching API message or they're exact duplicates)
             const toDelete = group.filter(msg => msg.id !== keepMsg.id);
             for (const msg of toDelete) {
-              // ✅ PROTECT: Never delete pending messages sent by current user unless they're exact duplicates
-              // This protects user's sent messages that might be waiting to sync
-              if (msg.sync_status === 'pending' && !areExactDuplicates && !hasMatchingApiMessage) {
-                if (__DEV__) {
-                  console.log(`[Database] Protecting pending message from deletion: ${msg.id} (${msg.message})`);
-                }
-                continue; // Skip deletion - protect pending message
+              // ✅ CRITICAL: NEVER delete pending/failed messages - they're still being sent!
+              // Even if they look like duplicates, they might be retry attempts
+              if (msg.sync_status === 'pending' || msg.sync_status === 'failed') {
+                continue; // Skip deletion - ALWAYS protect pending/failed messages
               }
               
+              // Only delete synced messages that are confirmed duplicates
               await retryWithBackoff(async () => {
                 await database.runAsync(
                   `DELETE FROM attachments WHERE message_id = ?`,

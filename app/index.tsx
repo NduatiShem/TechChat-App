@@ -414,12 +414,15 @@ export default function ConversationsScreen() {
   useEffect(() => {
     // Only load conversations if user is authenticated and database is initialized
     if (user && dbInitialized) {
-      // ✅ API-FIRST: Try API first, fallback to cache only if API fails
+      // ✅ STAGGERED LOADING: Load immediately (default tab, no delay)
       setIsLoading(true);
-      loadConversations().catch((error) => {
-        console.error('[Conversations] Error in loadConversations:', error);
-        setIsLoading(false);
-      });
+      // Small delay to ensure database is fully ready
+      setTimeout(() => {
+        loadConversations().catch((error) => {
+          console.error('[Conversations] Error in loadConversations:', error);
+          setIsLoading(false);
+        });
+      }, 100); // 100ms delay for conversations (default tab)
       
       // Request notification permissions when the app loads
       requestPermissions();

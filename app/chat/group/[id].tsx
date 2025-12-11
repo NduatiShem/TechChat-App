@@ -12,7 +12,7 @@ import { useAuth } from '@/context/AuthContext';
 import { useNotifications } from '@/context/NotificationContext';
 import { useTheme } from '@/context/ThemeContext';
 import { groupsAPI, messagesAPI, usersAPI } from '@/services/api';
-import { deleteMessage as deleteDbMessage, fixDuplicateMessagesWithWrongTimestamps, getDb, getMessages as getDbMessages, hasMessagesForConversation, initDatabase, saveMessages as saveDbMessages, updateMessageByServerId, updateMessageStatus } from '@/services/database';
+import { deleteMessage as deleteDbMessage, getDb, getMessages as getDbMessages, hasMessagesForConversation, initDatabase, saveMessages as saveDbMessages, updateMessageByServerId, updateMessageStatus } from '@/services/database';
 import { startRetryService, retryPendingMessages } from '@/services/messageRetryService';
 import { syncConversationMessages } from '@/services/syncService';
 import { isVideoAttachment } from '@/utils/textUtils';
@@ -610,23 +610,11 @@ export default function GroupChatScreen() {
           }));
           await saveDbMessages(messagesToSave);
           
-          // Fix existing duplicates with wrong timestamps after saving
-          try {
-            await fixDuplicateMessagesWithWrongTimestamps(
-              Number(id),
-              'group',
-              uniqueMessages.map((msg: any) => ({
-                id: msg.id,
-                created_at: msg.created_at,
-                message: msg.message,
-                sender_id: msg.sender_id,
-              }))
-            );
-          } catch (cleanupError) {
-            if (__DEV__) {
-              console.warn('[GroupChat] Error cleaning up duplicates after save:', cleanupError);
-            }
-          }
+          // ❌ REMOVED: fixDuplicateMessagesWithWrongTimestamps - not needed since:
+          // 1. saveDbMessages already handles deduplication by server_id
+          // 2. API is source of truth, data is already correct
+          // 3. This function loads ALL messages which is slow
+          // 4. It was blocking UI on every conversation open
         } catch (dbError) {
           console.error('[GroupChat] Error saving messages to database:', dbError);
         }
@@ -1603,201 +1591,214 @@ export default function GroupChatScreen() {
         formData.append('is_voice_message', 'true');
       }
       
-          // Send to API
-      const res = await messagesAPI.sendMessage(formData);
-      
-          // CRITICAL: Enhanced logging - ALWAYS log full response structure for debugging
-          console.log('[GroupChat] FULL API Response Structure:', {
-            status: res.status,
-            statusText: res.statusText,
-            hasData: !!res.data,
-            dataType: typeof res.data,
-            dataIsArray: Array.isArray(res.data),
-            dataKeys: res.data ? Object.keys(res.data) : [],
-            nestedDataKeys: res.data?.data ? Object.keys(res.data.data) : [],
-            fullData: JSON.stringify(res.data, null, 2),
-          });
+          // ✅ IMMEDIATE RETRY LOGIC: Retry up to 3 times for network errors (reduced to prevent DB locks)
+          const MAX_IMMEDIATE_RETRIES = 3;
+          const RETRY_DELAYS = [1000, 2000, 3000]; // Exponential backoff: 1s, 2s, 3s
           
-          // STEP 4: Update SQLite with server response (change status to synced, update server_id and timestamp)
-          // Handle different response structures
+          let lastError: any = null;
+          let sendSuccess = false;
           let messageId: number | undefined;
           let serverCreatedAt: string | undefined;
           
-          if (res.data) {
-            // Standard structure: res.data.id
-            if (res.data.id) {
-              messageId = res.data.id;
-              serverCreatedAt = res.data.created_at;
-              console.log('[GroupChat] Found message ID in res.data.id:', messageId);
-            }
-            // Alternative: res.data.data.id (nested)
-            else if (res.data.data && res.data.data.id) {
-              messageId = res.data.data.id;
-              serverCreatedAt = res.data.data.created_at;
-              console.log('[GroupChat] Found message ID in res.data.data.id:', messageId);
-            }
-            // Alternative: res.data.message?.id
-            else if (res.data.message && res.data.message.id) {
-              messageId = res.data.message.id;
-              serverCreatedAt = res.data.message.created_at;
-              console.log('[GroupChat] Found message ID in res.data.message.id:', messageId);
-            }
-            // Additional check: res.data.message_id
-            else if (res.data.message_id) {
-              messageId = res.data.message_id;
-              serverCreatedAt = res.data.created_at || res.data.message_created_at;
-              console.log('[GroupChat] Found message ID in res.data.message_id:', messageId);
-            }
-            // Additional check: res.data.result?.id
-            else if (res.data.result && res.data.result.id) {
-              messageId = res.data.result.id;
-              serverCreatedAt = res.data.result.created_at;
-              console.log('[GroupChat] Found message ID in res.data.result.id:', messageId);
-            }
-            // Additional check: res.data is the message object directly
-            else if (typeof res.data === 'object' && res.data.id && (res.data.message !== undefined || res.data.text !== undefined)) {
-              messageId = res.data.id;
-              serverCreatedAt = res.data.created_at;
-              console.log('[GroupChat] Found message ID in res.data (direct object):', messageId);
-            }
-          }
-          
-          if (!messageId && res.data) {
-            console.warn('[GroupChat] Could not find message ID in response. Full response:', JSON.stringify(res.data, null, 2));
-          }
-          
-          if (messageId && dbInitialized) {
+          for (let attempt = 0; attempt <= MAX_IMMEDIATE_RETRIES; attempt++) {
             try {
-              // Update with server timestamp to prevent duplicates with different timestamps
+              if (attempt > 0) {
+                // Wait before retry (exponential backoff)
+                await new Promise(resolve => setTimeout(resolve, RETRY_DELAYS[attempt - 1]));
+              }
+              
+              // Send to API
+              const res = await messagesAPI.sendMessage(formData);
+              
+              // Check if status indicates success
+              if (res.status >= 200 && res.status < 300) {
+                sendSuccess = true;
+                
+                // Try to extract message ID from response (check all structures)
+                if (res.data) {
+                  if (res.data.id) {
+                    messageId = res.data.id;
+                    serverCreatedAt = res.data.created_at;
+                  } else if (res.data.data?.id) {
+                    messageId = res.data.data.id;
+                    serverCreatedAt = res.data.data.created_at;
+                  } else if (res.data.message?.id) {
+                    messageId = res.data.message.id;
+                    serverCreatedAt = res.data.message.created_at;
+                  } else if (res.data.message_id) {
+                    messageId = res.data.message_id;
+                    serverCreatedAt = res.data.created_at || res.data.message_created_at;
+                  } else if (res.data.result?.id) {
+                    messageId = res.data.result.id;
+                    serverCreatedAt = res.data.result.created_at;
+                  }
+                }
+                
+                // ✅ ALWAYS VERIFY by fetching from API (regardless of response structure)
+                try {
+                  // Wait a moment for backend to process
+                  await new Promise(resolve => setTimeout(resolve, 2000));
+                  
+                  // Fetch recent messages to verify
+                  const verifyRes = await messagesAPI.getByGroup(Number(id), 1, 20);
+                  const messagesData = verifyRes.data.messages?.data || verifyRes.data.messages || [];
+                  
+                  // Find our message by content and timestamp (within 2 minutes)
+                  const messageTime = new Date(now).getTime();
+                  const matchingMessage = messagesData.find((msg: any) => {
+                    const msgTime = new Date(msg.created_at).getTime();
+                    const timeDiff = Math.abs(msgTime - messageTime);
+                    const contentMatch = msg.message === messageText || 
+                                       (messageText && msg.message && 
+                                        (msg.message.includes(messageText.substring(0, 30)) ||
+                                         messageText.includes(msg.message.substring(0, 30))));
+                    
+                    return contentMatch && timeDiff < 120000; // Within 2 minutes
+                  });
+                  
+                  if (matchingMessage?.id) {
+                    // ✅ VERIFIED! Message is in API DB
+                    messageId = matchingMessage.id;
+                    serverCreatedAt = matchingMessage.created_at;
+                    break; // Success - exit retry loop
+                  } else {
+                    // Not found in API - might need another retry
+                    if (attempt < MAX_IMMEDIATE_RETRIES) {
+                      continue; // Retry
+                    } else {
+                      // Max retries reached, but send was successful - might be timing issue
+                      // Will be handled by background retry service
+                    }
+                  }
+                } catch (verifyError) {
+                  // If send was successful but verification failed, assume it was saved
+                  if (messageId) {
+                    break; // We have message ID, use it
+                  }
+                  // Otherwise continue retrying
+                  if (attempt < MAX_IMMEDIATE_RETRIES) {
+                    continue;
+                  }
+                }
+                
+                // If we got here and have messageId, success!
+                if (messageId) {
+                  break; // Exit retry loop
+                }
+              } else {
+                // Non-success status
+                throw new Error(`API returned status ${res.status}`);
+              }
+            } catch (apiError: any) {
+              lastError = apiError;
+              
+              // Check if it's a network error (retryable)
+              const isNetworkError = 
+                apiError.message === 'Network Error' || 
+                !apiError.response ||
+                apiError.code === 'ECONNABORTED' ||
+                apiError.message?.includes('timeout');
+              
+              // Check if it's a client error (4xx) - don't retry these
+              const isClientError = apiError.response?.status >= 400 && apiError.response?.status < 500;
+              
+              // Don't retry client errors (4xx) - mark as failed immediately
+              if (isClientError) {
+                if (dbInitialized) {
+                  await updateMessageStatus(tempLocalId, undefined, 'failed');
+                  setMessages(prev => prev.map(msg => 
+                    msg.id === tempLocalId 
+                      ? { ...msg, sync_status: 'failed' }
+                      : msg
+                  ));
+                }
+                return; // Exit - don't retry client errors
+              }
+              
+              // For network errors, continue retrying if we haven't reached max attempts
+              if (isNetworkError && attempt < MAX_IMMEDIATE_RETRIES) {
+                continue; // Retry
+              } else {
+                // Max retries reached or non-network error
+                break; // Exit retry loop
+              }
+            }
+          }
+          
+          // STEP 4: Handle final result
+          if (messageId && dbInitialized) {
+            // ✅ SUCCESS! Update SQLite with server_id
+            try {
+              // Check for duplicate before updating
+              const database = await getDb();
+              if (database) {
+                const existingByServerId = await database.getFirstAsync<{ id: number }>(
+                  `SELECT id FROM messages WHERE server_id = ? AND id != ?`,
+                  [messageId, tempLocalId]
+                );
+                
+                if (existingByServerId) {
+                  // Duplicate exists - remove tempLocalId message
+                  await database.runAsync(`DELETE FROM messages WHERE id = ?`, [tempLocalId]);
+                  setMessages(prev => prev.filter(msg => msg.id !== tempLocalId));
+                  return;
+                }
+              }
+              
               await updateMessageStatus(tempLocalId, messageId, 'synced', serverCreatedAt);
               
-              // Update UI message with server ID and server timestamp, checking for duplicates
-      setMessages(prev => {
-                // Check if message with server ID already exists (from a sync)
+              // Update UI message with server ID
+              setMessages(prev => {
                 const existingIds = new Set(prev.map(m => m.id));
                 const serverIdExists = existingIds.has(messageId);
                 
                 if (serverIdExists) {
-                  // Server ID already exists, remove the tempLocalId message to avoid duplication
-                  if (__DEV__) {
-                    console.log('[GroupChat] Server ID already exists, removing tempLocalId message:', tempLocalId);
-                  }
+                  // Server ID already exists, remove tempLocalId to avoid duplication
                   const filtered = prev.filter(msg => msg.id !== tempLocalId);
-                  // Ensure deduplication after filtering
                   return deduplicateMessages(filtered);
                 } else {
-                  // Update the tempLocalId to server ID AND update timestamp to match server
+                  // Update tempLocalId to server ID
                   const updated = prev.map(msg => 
                     msg.id === tempLocalId 
                       ? { 
                           ...msg, 
                           id: messageId, 
                           sync_status: 'synced',
-                          created_at: serverCreatedAt || msg.created_at // Use server timestamp
+                          created_at: serverCreatedAt || msg.created_at
                         }
                       : msg
                   );
-                  // Ensure deduplication after update
                   return deduplicateMessages(updated);
                 }
               });
               
-              // Update latest message ID
               latestMessageIdRef.current = messageId;
-              
-              if (__DEV__ || process.env.EXPO_PUBLIC_DEBUG_API === 'true') {
-                console.log('[GroupChat] Message synced successfully:', tempLocalId, '->', messageId, 'with timestamp:', serverCreatedAt);
-              }
             } catch (updateError) {
               console.error('[GroupChat] Error updating message status:', updateError);
             }
-          } else if (res.status >= 200 && res.status < 300) {
-            // ✅ CRITICAL FIX: API was successful but no message ID returned
-            // Try to verify by fetching recent messages
-            console.warn('[GroupChat] API response successful but no message ID found. Attempting verification...', {
-              status: res.status,
-              hasData: !!res.data,
-              dataKeys: res.data ? Object.keys(res.data) : [],
-              tempLocalId: tempLocalId,
-              messageText: messageText.substring(0, 50), // First 50 chars for matching
-            });
-            
-            // Verification: Try to find the message by fetching recent messages
-            try {
-              // Wait a moment for backend to process
-              await new Promise(resolve => setTimeout(resolve, 1500));
-              
-              // Fetch recent messages to see if our message is there
-              const verifyRes = await messagesAPI.getByGroup(Number(id), 1, 10);
-              const messagesData = verifyRes.data.messages?.data || verifyRes.data.messages || [];
-              
-              // Try to find our message by content and timestamp (within 30 seconds)
-              const now = new Date().getTime();
-              const matchingMessage = messagesData.find((msg: any) => {
-                const msgTime = new Date(msg.created_at).getTime();
-                const timeDiff = Math.abs(now - msgTime);
-                const contentMatch = msg.message === messageText || 
-                                   (messageText && msg.message && msg.message.includes(messageText.substring(0, 20)));
-                
-                return contentMatch && timeDiff < 30000; // Within 30 seconds
-              });
-              
-              if (matchingMessage?.id) {
-                console.log('[GroupChat] ✅ Verification successful! Found message ID:', matchingMessage.id);
-                messageId = matchingMessage.id;
-                serverCreatedAt = matchingMessage.created_at;
-                
-                // Update with the found ID
-                if (dbInitialized) {
-                  try {
-                    await updateMessageStatus(tempLocalId, messageId, 'synced', serverCreatedAt);
-                    
-                    // Update UI message with server ID
-                    setMessages(prev => {
-                      const existingIds = new Set(prev.map(m => m.id));
-                      const serverIdExists = existingIds.has(messageId);
-                      
-                      if (serverIdExists) {
-                        const filtered = prev.filter(msg => msg.id !== tempLocalId);
-                        return deduplicateMessages(filtered);
-                      } else {
-                        const updated = prev.map(msg => 
-                          msg.id === tempLocalId 
-                            ? { 
-                                ...msg, 
-                                id: messageId, 
-                                sync_status: 'synced',
-                                created_at: serverCreatedAt || msg.created_at
-                              }
-                            : msg
-                        );
-                        return deduplicateMessages(updated);
-                      }
-                    });
-                    
-                    latestMessageIdRef.current = messageId;
-                    console.log('[GroupChat] ✅ Message verified and synced:', tempLocalId, '->', messageId);
-                  } catch (verifyUpdateError) {
-                    console.error('[GroupChat] Error updating verified message:', verifyUpdateError);
-                  }
-                }
-              } else {
-                console.warn('[GroupChat] ❌ Verification failed - message not found in recent messages. Keeping as pending.');
-                // Ensure UI shows pending status (not synced) - message stays pending in DB
-                setMessages(prev => prev.map(msg => 
-                  msg.id === tempLocalId 
-                    ? { ...msg, sync_status: 'pending' }  // Explicitly set to pending
-                    : msg
-                ));
-              }
-            } catch (verifyError) {
-              console.error('[GroupChat] Verification query failed:', verifyError);
-              // Ensure UI shows pending status (not synced) - message stays pending in DB
+          } else if (!sendSuccess) {
+            // ❌ All retries failed - keep as pending for background retry service
+            // Ensure message is marked as pending (not failed) for background retry
+            if (dbInitialized) {
+              await updateMessageStatus(tempLocalId, undefined, 'pending');
               setMessages(prev => prev.map(msg => 
                 msg.id === tempLocalId 
-                  ? { ...msg, sync_status: 'pending' }  // Explicitly set to pending
+                  ? { ...msg, sync_status: 'pending' }
                   : msg
               ));
+            }
+            
+            // Trigger background retry service after a delay
+            setTimeout(() => {
+              retryPendingMessages().catch(err => {
+                console.error('[GroupChat] Background retry failed:', err);
+              });
+            }, 5000);
+          } else {
+            // Send was successful but no message ID found and verification failed
+            // Keep as pending - background retry service will handle it
+            if (dbInitialized) {
+              await updateMessageStatus(tempLocalId, undefined, 'pending');
             }
           }
           
@@ -1808,66 +1809,19 @@ export default function GroupChatScreen() {
             // Silently fail
           }
           
-        } catch (apiError: any) {
-          // STEP 5: Handle API failure gracefully
-          // CRITICAL: Always log errors in production for debugging
-          console.error('[GroupChat] Error sending message to API:', {
-            message: apiError.message,
-            status: apiError.response?.status,
-            statusText: apiError.response?.statusText,
-            data: apiError.response?.data,
-            code: apiError.code,
-            url: apiError.config?.url,
-            baseURL: apiError.config?.baseURL,
-            method: apiError.config?.method,
-            tempLocalId: tempLocalId,
-          });
+        } catch (e: unknown) {
+          const error = e as any;
+          console.error('[GroupChat] Unexpected error in handleSend:', error);
           
-          // Check if it's a network error (retryable) or permanent error
-          const isNetworkError = 
-            apiError.message === 'Network Error' || 
-            !apiError.response ||
-            apiError.code === 'ECONNABORTED' ||
-            apiError.message?.includes('timeout');
-          
+          // Ensure message is kept as pending for retry
           if (dbInitialized) {
-            if (!isNetworkError && apiError.response?.status >= 400 && apiError.response?.status < 500) {
-              // Client error (4xx) - mark as failed
-              await updateMessageStatus(tempLocalId, undefined, 'failed');
-              
-              // Update UI to show failed status
-              setMessages(prev => prev.map(msg => 
-                msg.id === tempLocalId 
-                  ? { ...msg, sync_status: 'failed' }
-                  : msg
-              ));
-              
-              if (__DEV__) {
-                console.log('[GroupChat] Message marked as failed:', tempLocalId);
-              }
-            } else {
-              // Network/server error - keep as pending for retry
-              // Retry service will handle it
-              if (__DEV__) {
-                console.log('[GroupChat] Message kept as pending for retry:', tempLocalId);
-              }
-            }
+            await updateMessageStatus(tempLocalId, undefined, 'pending');
+            setMessages(prev => prev.map(msg => 
+              msg.id === tempLocalId 
+                ? { ...msg, sync_status: 'pending' }
+                : msg
+            ));
           }
-          
-          // Silently retry immediately - no popup, process in background
-          // Trigger immediate retry for network/server errors
-          if (isNetworkError || (apiError.response?.status >= 500)) {
-            // Network/server error - trigger immediate retry after short delay
-          setTimeout(() => {
-              retryPendingMessages().catch(err => {
-                if (__DEV__) {
-                  console.error('[GroupChat] Immediate retry failed:', err);
-                }
-              });
-            }, 2000); // Retry after 2 seconds
-          }
-          // For 4xx errors, keep as pending/failed - retry service will handle it
-          // No popup - process silently in background
         }
       })();
       

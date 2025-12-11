@@ -304,12 +304,14 @@ export default function GroupsScreen() {
   useEffect(() => {
     // Only load groups if user is authenticated and database is initialized
     if (user && dbInitialized) {
-      // ✅ API-FIRST: Try API first, fallback to cache only if API fails
+      // ✅ STAGGERED LOADING: Delay to prevent concurrent database access
       setIsLoading(true);
-      loadGroups().catch((error) => {
-        console.error('[Groups] Error in loadGroups:', error);
-        setIsLoading(false);
-      });
+      setTimeout(() => {
+        loadGroups().catch((error) => {
+          console.error('[Groups] Error in loadGroups:', error);
+          setIsLoading(false);
+        });
+      }, 300); // 300ms delay for groups (staggered from conversations)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [user, dbInitialized]); // loadGroups is stable, no need to include

@@ -5,7 +5,10 @@ import {
     getDb,
     saveConversations,
     saveMessages,
-    updateSyncState
+    updateSyncState,
+    writeQueue,
+    retryWithBackoff,
+    validateDatabase
 } from './database';
 
 // Sync lock mechanism to prevent concurrent syncs
@@ -42,16 +45,39 @@ async function removeDeletedMessages(
       return 0;
     }
     
-    // ✅ CRITICAL FIX: Only get messages that are SYNCED (not pending/failed)
-    // We should NEVER delete messages that are pending or failed - they're still being sent!
-    const localMessages = await database.getAllAsync<DatabaseMessage & { created_at: string; sender_id: number; sync_status: string }>(
-      `SELECT id, server_id, created_at, sender_id, sync_status FROM messages 
-       WHERE conversation_id = ? 
-       AND conversation_type = ? 
-       AND server_id IS NOT NULL
-       AND sync_status = 'synced'`,
-      [conversationId, conversationType]
-    );
+    // ✅ CRITICAL FIX: Put read operation through queue to prevent concurrent access
+    const dbRef = database;
+    const localMessages = await retryWithBackoff(async () => {
+      return await writeQueue.enqueue(async () => {
+        // Re-validate database inside callback
+        let dbToUse = dbRef;
+        if (!dbToUse) {
+          dbToUse = await getDb();
+          if (!dbToUse) {
+            return [];
+          }
+        }
+        
+        // Validate database is still valid
+        const isValid = await validateDatabase(dbToUse);
+        if (!isValid || !dbToUse) {
+          return [];
+        }
+        
+        const validDb = dbToUse;
+        
+        // ✅ CRITICAL FIX: Only get messages that are SYNCED (not pending/failed)
+        // We should NEVER delete messages that are pending or failed - they're still being sent!
+        return await validDb.getAllAsync<DatabaseMessage & { created_at: string; sender_id: number; sync_status: string }>(
+          `SELECT id, server_id, created_at, sender_id, sync_status FROM messages 
+           WHERE conversation_id = ? 
+           AND conversation_type = ? 
+           AND server_id IS NOT NULL
+           AND sync_status = 'synced'`,
+          [conversationId, conversationType]
+        );
+      });
+    });
     
     if (localMessages.length === 0) {
       return 0;

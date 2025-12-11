@@ -118,17 +118,20 @@ function AppTabsLayout() {
         
         if (db) {
           console.log('[AppTabsLayout] Database initialized, starting retry service');
-          // Start retry service globally - this ensures pending messages are retried
-          // even when user is not in a chat screen
-          startRetryService(30000); // Retry every 30 seconds
-          retryServiceStartedRef.current = true;
-          
-          // Also retry immediately after delay to catch any pending messages from previous session
+          // ✅ STAGGERED LOADING: Delay retry service to prevent concurrent database access
           setTimeout(() => {
-            retryPendingMessages().catch(err => {
-              console.error('[AppTabsLayout] Error in initial retry:', err);
-            });
-          }, 2000); // Wait 2 seconds for app to fully load
+            // Start retry service globally - this ensures pending messages are retried
+            // even when user is not in a chat screen
+            startRetryService(30000); // Retry every 30 seconds
+            retryServiceStartedRef.current = true;
+            
+            // Also retry immediately after delay to catch any pending messages from previous session
+            setTimeout(() => {
+              retryPendingMessages().catch(err => {
+                console.error('[AppTabsLayout] Error in initial retry:', err);
+              });
+            }, 1000); // Wait 1 second after service starts
+          }, 800); // 800ms delay for retry service (after screens start loading)
         } else {
           console.error('[AppTabsLayout] Database initialization failed after retries, retry service not started');
         }
