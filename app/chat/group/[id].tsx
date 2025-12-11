@@ -824,8 +824,56 @@ export default function GroupChatScreen() {
         );
         
         if (newMessages.length > 0) {
+          // ✅ CRITICAL FIX: Merge with pending messages from SQLite before updating UI
+          // This prevents pending messages from disappearing when sync runs
+          let pendingMessages: Message[] = [];
+          if (dbInitialized) {
+            try {
+              const { getPendingMessages } = await import('@/services/database');
+              const pending = await getPendingMessages(Number(id), 'group');
+              
+              // ✅ DEBUG LOGGING: Log all pending messages found
+              console.log(`[GroupChat] 📋 Sync: Found ${pending.length} pending messages in SQLite:`, 
+                pending.map(m => ({ id: m.id, message: m.message?.substring(0, 30), sync_status: m.sync_status }))
+              );
+              
+              // Filter out messages that are currently being sent (they're already in UI)
+              const messagesBeingSent = getMessagesBeingSent();
+              console.log(`[GroupChat] 📋 Sync: ${messagesBeingSent.size} message(s) currently being sent:`, 
+                Array.from(messagesBeingSent)
+              );
+              
+              pendingMessages = pending.filter(msg => 
+                msg.id != null && !messagesBeingSent.has(msg.id)
+              );
+              
+              console.log(`[GroupChat] 📋 Sync: After filtering, ${pendingMessages.length} pending messages to merge`);
+              
+              if (pendingMessages.length > 0) {
+                console.log(`[GroupChat] 📋 Sync: Pending messages to merge:`, 
+                  pendingMessages.map(m => ({ id: m.id, message: m.message?.substring(0, 30) }))
+                );
+              }
+            } catch (dbError) {
+              console.error('[GroupChat] Error fetching pending messages during sync:', dbError);
+            }
+          }
+          
           // Update UI with all messages from SQLite (ensures consistency)
           setMessages(prev => {
+            // ✅ DEBUG LOGGING: Log state before sync update
+            console.log(`[GroupChat] 🔄 Sync: Before update - ${prev.length} messages in UI:`, 
+              prev.map(m => ({ id: m.id, message: m.message?.substring(0, 30), sync_status: m.sync_status }))
+            );
+            
+            console.log(`[GroupChat] 🔄 Sync: ${newMessages.length} new synced messages:`, 
+              newMessages.map(m => ({ id: m.id, message: m.message?.substring(0, 30) }))
+            );
+            
+            console.log(`[GroupChat] 🔄 Sync: ${pendingMessages.length} pending messages to merge:`, 
+              pendingMessages.map(m => ({ id: m.id, message: m.message?.substring(0, 30) }))
+            );
+            
             // CRITICAL FIX: Use comprehensive duplicate check (ID + content+sender+timestamp)
             const existingIds = new Set(prev.map(m => m.id).filter(id => id != null));
             const existingMessagesMap = new Map<number | string, Message>();
@@ -835,10 +883,18 @@ export default function GroupChatScreen() {
               }
             });
             
+            // ✅ CRITICAL FIX: Merge pending messages with new synced messages
+            // Combine pending messages with new synced messages before deduplication
+            const allNewMessages = [...newMessages, ...pendingMessages];
+            
+            console.log(`[GroupChat] 🔄 Sync: Combined ${allNewMessages.length} messages (${newMessages.length} synced + ${pendingMessages.length} pending)`);
+            
             // ✅ CRITICAL FIX: Improved deduplication - match by server_id, content+sender+timestamp, or ID
-            const uniqueNewMessages = newMessages.filter(newMsg => {
+            // ✅ CRITICAL FIX: Prefer synced messages over pending ones when they match
+            const uniqueNewMessages = allNewMessages.filter(newMsg => {
               // Check 1: Same ID
               if (newMsg.id != null && existingIds.has(newMsg.id)) {
+                console.log(`[GroupChat] 🔄 Sync: Filtering out duplicate by ID: ${newMsg.id}`);
                 return false; // Duplicate by ID
               }
               
@@ -852,13 +908,14 @@ export default function GroupChatScreen() {
                 });
                 
                 if (hasMatchingServerId) {
+                  console.log(`[GroupChat] 🔄 Sync: Filtering out duplicate by server_id: ${newMsg.id}`);
                   return false; // Duplicate by server_id
                 }
               }
               
               // Check 3: Same content + sender + timestamp (within 2 seconds) - exact duplicate
-              // ✅ Increased time window to 2 seconds to catch messages that were just sent
-              const isExactDuplicate = prev.some(existing => {
+              // ✅ CRITICAL FIX: Prefer synced messages over pending ones
+              const matchingExisting = prev.find(existing => {
                 if (existing.id === newMsg.id) return true; // Already checked above
                 
                 const timeDiff = Math.abs(
@@ -867,20 +924,74 @@ export default function GroupChatScreen() {
                 const contentMatch = (existing.message || '') === (newMsg.message || '');
                 const senderMatch = existing.sender_id === newMsg.sender_id;
                 
-                // If same content, sender, and timestamp within 2 seconds, it's an exact duplicate
+                // If same content, sender, and timestamp within 2 seconds, it's a match
                 return contentMatch && senderMatch && timeDiff < 2000;
               });
               
-              return !isExactDuplicate;
+              if (matchingExisting) {
+                // ✅ CRITICAL FIX: If existing is pending and new is synced, prefer synced (keep new, remove existing from prev)
+                // If existing is synced and new is pending, prefer synced (filter out pending)
+                if (matchingExisting.sync_status === 'pending' && newMsg.sync_status === 'synced') {
+                  console.log(`[GroupChat] 🔄 Sync: Found pending message ${matchingExisting.id} matching synced ${newMsg.id}, will replace pending with synced`);
+                  // Keep the synced message, the pending one will be replaced in the merge
+                  return true; // Keep synced message
+                }
+                if (matchingExisting.sync_status === 'synced' && newMsg.sync_status === 'pending') {
+                  console.log(`[GroupChat] 🔄 Sync: Found synced message ${matchingExisting.id} matching pending ${newMsg.id}, filtering out pending`);
+                  return false; // Filter out pending, keep synced
+                }
+                // Both same status - it's a duplicate
+                console.log(`[GroupChat] 🔄 Sync: Filtering out duplicate (same status): existing=${matchingExisting.id} (${matchingExisting.sync_status}), new=${newMsg.id} (${newMsg.sync_status})`);
+                return false;
+              }
+              
+              return true; // Not a duplicate, keep it
             });
             
+            console.log(`[GroupChat] 🔄 Sync: After deduplication, ${uniqueNewMessages.length} unique new messages`);
+            
             if (uniqueNewMessages.length === 0) {
+              console.log(`[GroupChat] 🔄 Sync: No new unique messages, keeping existing ${prev.length} messages`);
               return prev; // No new unique messages
             }
             
-            // Merge with existing messages
+            // ✅ CRITICAL FIX: Merge with existing messages, but remove pending messages that match synced ones
+            // BUT: Don't remove pending messages that are currently being sent (handleSend is processing them)
+            // First, remove pending messages from prev that match synced messages in uniqueNewMessages
+            const messagesBeingSent = getMessagesBeingSent();
+            const prevWithoutDuplicates = prev.filter(existing => {
+              // If existing is pending, check if there's a synced version in uniqueNewMessages
+              if (existing.sync_status === 'pending') {
+                // ✅ CRITICAL FIX: Don't remove pending messages that are currently being sent
+                // handleSend needs to update them first
+                if (existing.id != null && messagesBeingSent.has(existing.id)) {
+                  console.log(`[GroupChat] 🔄 Sync: Keeping pending message ${existing.id} (currently being sent by handleSend)`);
+                  return true; // Keep it, handleSend will update it
+                }
+                
+                const hasSyncedVersion = uniqueNewMessages.some(newMsg => {
+                  if (newMsg.sync_status !== 'synced') return false;
+                  
+                  const timeDiff = Math.abs(
+                    new Date(existing.created_at).getTime() - new Date(newMsg.created_at).getTime()
+                  );
+                  const contentMatch = (existing.message || '') === (newMsg.message || '');
+                  const senderMatch = existing.sender_id === newMsg.sender_id;
+                  
+                  return contentMatch && senderMatch && timeDiff < 2000;
+                });
+                
+                if (hasSyncedVersion) {
+                  console.log(`[GroupChat] 🔄 Sync: Removing pending message ${existing.id} (replaced by synced version)`);
+                  return false; // Remove pending, keep synced
+                }
+              }
+              return true; // Keep this message
+            });
+            
+            // Merge with existing messages (after removing duplicate pending ones)
             const allUniqueMessages = [
-              ...prev,
+              ...prevWithoutDuplicates,
               ...uniqueNewMessages
             ].sort((a: Message, b: Message) => 
               new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
@@ -888,6 +999,11 @@ export default function GroupChatScreen() {
             
             // CRITICAL: Always deduplicate (defense in depth)
             const deduplicated = deduplicateMessages(allUniqueMessages);
+            
+            // ✅ DEBUG LOGGING: Log final state after sync update
+            console.log(`[GroupChat] ✅ Sync: After update - ${deduplicated.length} messages in UI:`, 
+              deduplicated.map(m => ({ id: m.id, message: m.message?.substring(0, 30), sync_status: m.sync_status }))
+            );
             
             // Update latest message ID
             if (deduplicated.length > 0) {
@@ -1474,10 +1590,12 @@ export default function GroupChatScreen() {
               if (savedMessage) {
                 actualMessageId = savedMessage.id;
                 if (actualMessageId !== tempLocalId) {
-                  console.log(`[GroupChat] ⚠️ ID MISMATCH: tempLocalId=${tempLocalId}, SQLite ID=${actualMessageId}. Updating marking.`);
-                  // Update marking to use SQLite ID
-                  unmarkMessageAsSending(tempLocalId);
+                  console.log(`[GroupChat] ⚠️ ID MISMATCH: tempLocalId=${tempLocalId}, SQLite ID=${actualMessageId}. Marking BOTH as sending.`);
+                  // ✅ CRITICAL FIX: Keep BOTH IDs marked as sending
+                  // UI message has tempLocalId, but database has actualMessageId
+                  // Sync needs to preserve the message regardless of which ID it checks
                   markMessageAsSending(actualMessageId);
+                  // Don't unmark tempLocalId - keep it marked so sync preserves the UI message
                 } else {
                   console.log(`[GroupChat] ✅ Message saved with tempLocalId: ${tempLocalId}`);
                 }
@@ -1512,12 +1630,20 @@ export default function GroupChatScreen() {
       
       // STEP 2: Show message immediately in UI (optimistic update)
       setMessages(prev => {
+        // ✅ DEBUG LOGGING: Track message addition
+        console.log(`[GroupChat] ➕ Adding message to UI:`, {
+          tempLocalId,
+          actualMessageId,
+          message: messageText?.substring(0, 30),
+          sync_status: 'pending',
+          currentMessagesCount: prev.length,
+          existingMessageIds: prev.map(m => ({ id: m.id, status: m.sync_status, message: m.message?.substring(0, 20) })),
+        });
+        
         // Check if message with this tempLocalId already exists (prevent duplicates)
         const existingIds = new Set(prev.map(m => m.id));
         if (existingIds.has(tempLocalId)) {
-          if (__DEV__) {
-            console.warn('[GroupChat] Message with tempLocalId already exists, skipping:', tempLocalId);
-          }
+          console.warn(`[GroupChat] ⚠️ Message ${tempLocalId} already exists in UI, skipping add`);
           return prev; // Don't add duplicate
         }
         
@@ -1529,9 +1655,16 @@ export default function GroupChatScreen() {
         
         const uniqueMessages = deduplicateMessages(updatedMessages);
         
+        // ✅ DEBUG LOGGING: Log final state after adding
+        console.log(`[GroupChat] ✅ Added message to UI - Total: ${uniqueMessages.length} messages:`, 
+          uniqueMessages.map(m => ({ id: m.id, message: m.message?.substring(0, 30), sync_status: m.sync_status }))
+        );
+        
         if (uniqueMessages.length > 0) {
           const latestMsg = uniqueMessages[uniqueMessages.length - 1];
+          const previousLatestId = latestMessageIdRef.current;
           latestMessageIdRef.current = latestMsg.id;
+          console.log(`[GroupChat] 📌 Updated latestMessageIdRef from ${previousLatestId} to ${latestMessageIdRef.current} (tempLocalId: ${tempLocalId})`);
         }
         
         // Scroll to bottom after sending
@@ -1746,6 +1879,11 @@ export default function GroupChatScreen() {
                     console.log(`[GroupChat] ✅ DATABASE UPDATE SUCCESS for message ${messageIdToUpdate} | server_id: ${messageId} | Duration: ${updateDuration}ms`);
                     // Update UI message with server ID
                     setMessages(prev => {
+                      // ✅ DEBUG LOGGING: Log state before update
+                      console.log(`[GroupChat] 🔄 handleSend update: Before - ${prev.length} messages:`, 
+                        prev.map(m => ({ id: m.id, message: m.message?.substring(0, 30), sync_status: m.sync_status }))
+                      );
+                      
                       const existingIds = new Set(prev.map(m => m.id));
                       const serverIdExists = existingIds.has(messageId);
                       
@@ -1754,12 +1892,17 @@ export default function GroupChatScreen() {
                         msg.id === tempLocalId || msg.id === actualMessageId
                       );
                       
+                      console.log(`[GroupChat] 🔄 handleSend update: Looking for message with tempLocalId=${tempLocalId} or actualMessageId=${actualMessageId}`);
+                      console.log(`[GroupChat] 🔄 handleSend update: Found message:`, messageToUpdate ? { id: messageToUpdate.id, message: messageToUpdate.message?.substring(0, 30) } : 'NOT FOUND');
+                      console.log(`[GroupChat] 🔄 handleSend update: Server ID ${messageId} exists in UI:`, serverIdExists);
+                      
                       if (serverIdExists && messageToUpdate) {
-                        // Server ID already exists (from polling), remove tempLocalId/actualMessageId to avoid duplication
+                        // Server ID already exists (from sync), remove tempLocalId/actualMessageId to avoid duplication
                         console.log(`[GroupChat] 🔄 Server ID ${messageId} already exists in UI, removing tempLocalId ${tempLocalId} and actualMessageId ${actualMessageId}`);
                         const filtered = prev.filter(msg => 
                           msg.id !== tempLocalId && msg.id !== actualMessageId
                         );
+                        console.log(`[GroupChat] 🔄 handleSend update: After removal - ${filtered.length} messages`);
                         return deduplicateMessages(filtered);
                       } else if (messageToUpdate) {
                         // Update tempLocalId/actualMessageId to server ID
@@ -1774,9 +1917,10 @@ export default function GroupChatScreen() {
                               }
                             : msg
                         );
+                        console.log(`[GroupChat] 🔄 handleSend update: After update - ${updated.length} messages`);
                         return deduplicateMessages(updated);
                       } else {
-                        // Message not found in UI (might have been removed by polling)
+                        // Message not found in UI (might have been removed by sync)
                         // Add it back with server_id
                         console.log(`[GroupChat] ⚠️ Message ${tempLocalId}/${actualMessageId} not found in UI, adding with server_id ${messageId}`);
                         const newMessage: Message = {
@@ -1791,6 +1935,7 @@ export default function GroupChatScreen() {
                         const updated = [...prev, newMessage].sort((a, b) => 
                           new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
                         );
+                        console.log(`[GroupChat] 🔄 handleSend update: After add - ${updated.length} messages`);
                         return deduplicateMessages(updated);
                       }
                     });
@@ -1803,10 +1948,16 @@ export default function GroupChatScreen() {
                   // ✅ CRITICAL FIX: Only unmark AFTER updateMessageStatus completes
                   // This prevents retry service from picking it up before status is updated
                   unmarkMessageAsSending(tempLocalId);
+                  if (actualMessageId !== tempLocalId) {
+                    unmarkMessageAsSending(actualMessageId);
+                  }
                 } catch (updateError) {
                   console.error('[GroupChat] Error updating message status:', updateError);
                   // ✅ Unmark even on error so retry service can handle it
                   unmarkMessageAsSending(tempLocalId);
+                  if (actualMessageId !== tempLocalId) {
+                    unmarkMessageAsSending(actualMessageId);
+                  }
                 }
               } else {
                 // No messageId in response - leave as pending, retry service will verify and update
@@ -1814,10 +1965,16 @@ export default function GroupChatScreen() {
                 // Don't unmark here - let retry service unmark after it verifies/updates
                 // Actually, we should unmark here since we're not updating status
                 unmarkMessageAsSending(tempLocalId);
+                if (actualMessageId !== tempLocalId) {
+                  unmarkMessageAsSending(actualMessageId);
+                }
               }
             } else {
               // Non-success status - leave as pending, retry service will retry
               unmarkMessageAsSending(tempLocalId); // ✅ Unmark so retry service can retry
+              if (actualMessageId !== tempLocalId) {
+                unmarkMessageAsSending(actualMessageId);
+              }
             }
           } catch (apiError: any) {
             // Check if it's a client error (4xx) - mark as failed
@@ -1834,9 +1991,15 @@ export default function GroupChatScreen() {
                 ));
               }
               unmarkMessageAsSending(tempLocalId); // ✅ Unmark
+              if (actualMessageId !== tempLocalId) {
+                unmarkMessageAsSending(actualMessageId);
+              }
             } else {
               // Network error or other - leave as pending, retry service will retry
               unmarkMessageAsSending(tempLocalId); // ✅ Unmark so retry service can retry
+              if (actualMessageId !== tempLocalId) {
+                unmarkMessageAsSending(actualMessageId);
+              }
             }
           }
           
@@ -1861,6 +2024,9 @@ export default function GroupChatScreen() {
             ));
           }
           unmarkMessageAsSending(tempLocalId); // ✅ Unmark so retry service can pick it up
+          if (actualMessageId !== tempLocalId) {
+            unmarkMessageAsSending(actualMessageId);
+          }
         }
       })();
       

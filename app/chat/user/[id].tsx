@@ -973,8 +973,56 @@ export default function UserChatScreen() {
         );
         
         if (newMessages.length > 0) {
+          // ✅ CRITICAL FIX: Merge with pending messages from SQLite before updating UI
+          // This prevents pending messages from disappearing when polling runs
+          let pendingMessages: Message[] = [];
+          if (dbInitialized) {
+            try {
+              const { getPendingMessages } = await import('@/services/database');
+              const pending = await getPendingMessages(Number(id), 'individual');
+              
+              // ✅ DEBUG LOGGING: Log all pending messages found
+              console.log(`[UserChat] 📋 Polling: Found ${pending.length} pending messages in SQLite:`, 
+                pending.map(m => ({ id: m.id, message: m.message?.substring(0, 30), sync_status: m.sync_status }))
+              );
+              
+              // Filter out messages that are currently being sent (they're already in UI)
+              const messagesBeingSent = getMessagesBeingSent();
+              console.log(`[UserChat] 📋 Polling: ${messagesBeingSent.size} message(s) currently being sent:`, 
+                Array.from(messagesBeingSent)
+              );
+              
+              pendingMessages = pending.filter(msg => 
+                msg.id != null && !messagesBeingSent.has(msg.id)
+              );
+              
+              console.log(`[UserChat] 📋 Polling: After filtering, ${pendingMessages.length} pending messages to merge`);
+              
+              if (pendingMessages.length > 0) {
+                console.log(`[UserChat] 📋 Polling: Pending messages to merge:`, 
+                  pendingMessages.map(m => ({ id: m.id, message: m.message?.substring(0, 30) }))
+                );
+              }
+            } catch (dbError) {
+              console.error('[UserChat] Error fetching pending messages during poll:', dbError);
+            }
+          }
+          
           // Add new messages to existing messages (append at end, they're already sorted)
           setMessages(prev => {
+            // ✅ DEBUG LOGGING: Log state before polling update
+            console.log(`[UserChat] 🔄 Polling: Before update - ${prev.length} messages in UI:`, 
+              prev.map(m => ({ id: m.id, message: m.message?.substring(0, 30), sync_status: m.sync_status }))
+            );
+            
+            console.log(`[UserChat] 🔄 Polling: ${newMessages.length} new API messages:`, 
+              newMessages.map(m => ({ id: m.id, message: m.message?.substring(0, 30) }))
+            );
+            
+            console.log(`[UserChat] 🔄 Polling: ${pendingMessages.length} pending messages to merge:`, 
+              pendingMessages.map(m => ({ id: m.id, message: m.message?.substring(0, 30) }))
+            );
+            
             // CRITICAL FIX: Use prev (current state) instead of stale closure 'messages'
             // Check for duplicates before adding - use comprehensive check
             const existingIds = new Set(prev.map(m => m.id).filter(id => id != null));
@@ -985,8 +1033,14 @@ export default function UserChatScreen() {
               }
             });
             
+            // ✅ CRITICAL FIX: Merge pending messages with new API messages
+            // Combine pending messages with new API messages before deduplication
+            const allNewMessages = [...newMessages, ...pendingMessages];
+            
+            console.log(`[UserChat] 🔄 Polling: Combined ${allNewMessages.length} messages (${newMessages.length} API + ${pendingMessages.length} pending)`);
+            
             // ✅ CRITICAL FIX: Improved deduplication - match by server_id, content+sender+timestamp, or ID
-            const uniqueNewMessages = newMessages.filter(newMsg => {
+            const uniqueNewMessages = allNewMessages.filter(newMsg => {
               // Check 1: Same ID
               if (newMsg.id != null && existingIds.has(newMsg.id)) {
                 return false; // Duplicate by ID
@@ -1024,7 +1078,10 @@ export default function UserChatScreen() {
               return !isExactDuplicate;
             });
             
+            console.log(`[UserChat] 🔄 Polling: After deduplication, ${uniqueNewMessages.length} unique new messages`);
+            
             if (uniqueNewMessages.length === 0) {
+              console.log(`[UserChat] 🔄 Polling: No new unique messages, keeping existing ${prev.length} messages`);
               return prev; // No new unique messages
             }
             
@@ -1061,6 +1118,11 @@ export default function UserChatScreen() {
             
             // CRITICAL: Always deduplicate (defense in depth)
             const uniqueMessages = deduplicateMessages(allMessages);
+            
+            // ✅ DEBUG LOGGING: Log final state after polling update
+            console.log(`[UserChat] ✅ Polling: After update - ${uniqueMessages.length} messages in UI:`, 
+              uniqueMessages.map(m => ({ id: m.id, message: m.message?.substring(0, 30), sync_status: m.sync_status }))
+            );
             
             // Update latest message ID
             if (uniqueMessages.length > 0) {
@@ -1744,7 +1806,7 @@ export default function UserChatScreen() {
       attachments: localMessage.attachments,
     };
     
-    try {
+  try {
       // ✅ CRITICAL FIX: Mark message as sending BEFORE saving to SQLite
       // This prevents retry service from picking it up before handleSend sends it
       console.log(`[UserChat] 🔒 Marking message ${tempLocalId} as sending BEFORE SQLite save | Content: "${messageText?.substring(0, 50)}"`);
@@ -1789,10 +1851,12 @@ export default function UserChatScreen() {
               if (savedMessage) {
                 actualMessageId = savedMessage.id;
                 if (actualMessageId !== tempLocalId) {
-                  console.log(`[UserChat] ⚠️ ID MISMATCH: tempLocalId=${tempLocalId}, SQLite ID=${actualMessageId}. Updating marking.`);
-                  // Update marking to use SQLite ID
-                  unmarkMessageAsSending(tempLocalId);
+                  console.log(`[UserChat] ⚠️ ID MISMATCH: tempLocalId=${tempLocalId}, SQLite ID=${actualMessageId}. Marking BOTH as sending.`);
+                  // ✅ CRITICAL FIX: Keep BOTH IDs marked as sending
+                  // UI message has tempLocalId, but database has actualMessageId
+                  // Sync needs to preserve the message regardless of which ID it checks
                   markMessageAsSending(actualMessageId);
+                  // Don't unmark tempLocalId - keep it marked so sync preserves the UI message
                 } else {
                   console.log(`[UserChat] ✅ Message saved with tempLocalId: ${tempLocalId}`);
                 }
@@ -1827,12 +1891,20 @@ export default function UserChatScreen() {
       
       // STEP 2: Show message immediately in UI (optimistic update)
       setMessages(prev => {
+        // ✅ DEBUG LOGGING: Track message addition
+        console.log(`[UserChat] ➕ Adding message to UI:`, {
+          tempLocalId,
+          actualMessageId,
+          message: messageText?.substring(0, 30),
+          sync_status: 'pending',
+          currentMessagesCount: prev.length,
+          existingMessageIds: prev.map(m => ({ id: m.id, status: m.sync_status, message: m.message?.substring(0, 20) })),
+        });
+        
         // Check if message with this tempLocalId already exists (prevent duplicates)
         const existingIds = new Set(prev.map(m => m.id));
         if (existingIds.has(tempLocalId)) {
-          if (__DEV__) {
-            console.warn('[UserChat] Message with tempLocalId already exists, skipping:', tempLocalId);
-          }
+          console.warn(`[UserChat] ⚠️ Message ${tempLocalId} already exists in UI, skipping add`);
           return prev; // Don't add duplicate
         }
         
@@ -1843,6 +1915,11 @@ export default function UserChatScreen() {
         });
         
         const uniqueMessages = deduplicateMessages(updatedMessages);
+        
+        // ✅ DEBUG LOGGING: Log final state after adding
+        console.log(`[UserChat] ✅ Added message to UI - Total: ${uniqueMessages.length} messages:`, 
+          uniqueMessages.map(m => ({ id: m.id, message: m.message?.substring(0, 30), sync_status: m.sync_status }))
+        );
         
         if (uniqueMessages.length > 0) {
           const latestMsg = uniqueMessages[uniqueMessages.length - 1];
@@ -2028,6 +2105,11 @@ export default function UserChatScreen() {
                     console.log(`[UserChat] ✅ DATABASE UPDATE SUCCESS for message ${messageIdToUpdate} | server_id: ${messageId} | Duration: ${updateDuration}ms`);
                     // Update UI message with server ID
                     setMessages(prev => {
+                      // ✅ DEBUG LOGGING: Log state before update
+                      console.log(`[UserChat] 🔄 handleSend update: Before - ${prev.length} messages:`, 
+                        prev.map(m => ({ id: m.id, message: m.message?.substring(0, 30), sync_status: m.sync_status }))
+                      );
+                      
                       const existingIds = new Set(prev.map(m => m.id));
                       const serverIdExists = existingIds.has(messageId);
                       
@@ -2036,12 +2118,17 @@ export default function UserChatScreen() {
                         msg.id === tempLocalId || msg.id === actualMessageId
                       );
                       
+                      console.log(`[UserChat] 🔄 handleSend update: Looking for message with tempLocalId=${tempLocalId} or actualMessageId=${actualMessageId}`);
+                      console.log(`[UserChat] 🔄 handleSend update: Found message:`, messageToUpdate ? { id: messageToUpdate.id, message: messageToUpdate.message?.substring(0, 30) } : 'NOT FOUND');
+                      console.log(`[UserChat] 🔄 handleSend update: Server ID ${messageId} exists in UI:`, serverIdExists);
+                      
                       if (serverIdExists && messageToUpdate) {
                         // Server ID already exists (from polling), remove tempLocalId/actualMessageId to avoid duplication
                         console.log(`[UserChat] 🔄 Server ID ${messageId} already exists in UI, removing tempLocalId ${tempLocalId} and actualMessageId ${actualMessageId}`);
                         const filtered = prev.filter(msg => 
                           msg.id !== tempLocalId && msg.id !== actualMessageId
                         );
+                        console.log(`[UserChat] 🔄 handleSend update: After removal - ${filtered.length} messages`);
                         return deduplicateMessages(filtered);
                       } else if (messageToUpdate) {
                         // Update tempLocalId/actualMessageId to server ID
@@ -2056,6 +2143,7 @@ export default function UserChatScreen() {
                               }
                             : msg
                         );
+                        console.log(`[UserChat] 🔄 handleSend update: After update - ${updated.length} messages`);
                         return deduplicateMessages(updated);
                       } else {
                         // Message not found in UI (might have been removed by polling)
@@ -2073,6 +2161,7 @@ export default function UserChatScreen() {
                         const updated = [...prev, newMessage].sort((a, b) => 
                           new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
                         );
+                        console.log(`[UserChat] 🔄 handleSend update: After add - ${updated.length} messages`);
                         return deduplicateMessages(updated);
                       }
                     });
@@ -2157,6 +2246,9 @@ export default function UserChatScreen() {
         } finally {
           // ✅ CRITICAL FIX: Always unmark message as being sent, even if something goes wrong
           unmarkMessageAsSending(tempLocalId);
+          if (actualMessageId !== tempLocalId) {
+            unmarkMessageAsSending(actualMessageId);
+          }
         }
       })();
       
@@ -3366,14 +3458,15 @@ export default function UserChatScreen() {
               updateCellsBatchingPeriod={50} // Batch updates every 50ms
               // ✅ CRITICAL FIX: Always start at the last message (latest at bottom) on initial load
               // This ensures the latest message is visible even when all messages fit on screen
+              // Only set initialScrollIndex when we're truly on initial load and haven't completed positioning
               initialScrollIndex={
-                isInitialLoadRef.current && visibleMessages.length > 0 
+                isInitialLoadRef.current && visibleMessages.length > 0 && !initialScrollCompleteRef.current
                   ? visibleMessages.length - 1  // Always start at last message on initial load
                   : undefined
               }
               getItemLayout={(data, index) => {
-                // Provide item layout for better scrollToIndex performance
-                // CRITICAL: This must be accurate for initialScrollIndex to work properly
+                // ✅ CRITICAL FIX: getItemLayout must be accurate for initialScrollIndex to work
+                // If this is inaccurate, initialScrollIndex won't position correctly
                 // Estimate ~60px per message (will be adjusted by onLayout)
                 const estimatedHeight = 60; // Base height per message
                 return { 
@@ -3404,6 +3497,9 @@ export default function UserChatScreen() {
               contentContainerStyle={{ 
                 padding: 16, 
                 paddingBottom: 0, // Let KeyboardAvoidingView handle spacing
+                flexGrow: 1, // ✅ CRITICAL FIX: Allow content to grow and fill viewport
+                justifyContent: 'flex-end', // ✅ CRITICAL FIX: Align content to bottom when shorter than viewport
+                minHeight: '100%', // ✅ CRITICAL FIX: Ensure container is at least viewport height for proper scrolling
               }}
               inverted={false} // Normal scrolling - latest messages at bottom (correct for chat apps)
               keyboardShouldPersistTaps="handled"
@@ -3532,46 +3628,36 @@ export default function UserChatScreen() {
                   } : null,
                 });
                 
-                // ✅ CRITICAL FIX: On initial load, always scroll to bottom when messages are set
-                // This handles the case where initialScrollIndex worked, but then messages update and push content down
+                // ✅ CRITICAL FIX: On initial load, verify positioning without scrolling
+                // Rely on initialScrollIndex and contentContainerStyle to position correctly
+                // Only verify we're at bottom, don't scroll to avoid interrupting user
                 if (isInitialLoadRef.current && !loading && visibleMessages.length > 0) {
-                  // Check if we're not at bottom (content grew and pushed us up)
+                  // Check if we're at bottom (initialScrollIndex should have positioned us correctly)
                   const isAtBottom = distanceFromBottom <= 100;
                   
-                  if (!isAtBottom || !initialScrollCompleteRef.current) {
-                    console.log(`[UserChat] 🔄 Initial load - content changed, scrolling to bottom`, {
+                  if (isAtBottom && !initialScrollCompleteRef.current) {
+                    // We're positioned correctly by initialScrollIndex/contentContainerStyle
+                    console.log(`[UserChat] ✅ Initial load - positioned at bottom correctly`, {
                       contentHeight,
                       viewportHeight,
                       distanceFromBottom,
-                      isAtBottom,
-                      initialScrollComplete: initialScrollCompleteRef.current,
+                      note: 'initialScrollIndex and contentContainerStyle handled positioning',
                     });
                     
-                    // Scroll to bottom to keep latest message visible
+                    // Mark as complete - no scrolling needed
+                    initialScrollCompleteRef.current = true;
+                    setHasScrolledToBottom(true);
+                    isAtBottomRef.current = true;
+                    shouldMaintainPositionRef.current = true;
+                    
                     setTimeout(() => {
-                      if (flatListRef.current && visibleMessages.length > 0) {
-                        try {
-                          // Use scrollToEnd for inverted=false FlatList
-                          (flatListRef.current as any).scrollToEnd({ animated: false });
-                          console.log(`[UserChat] ✅ Scrolled to bottom after content change`);
-                          
-                          // Mark as complete after scroll
-                          initialScrollCompleteRef.current = true;
-                          setHasScrolledToBottom(true);
-                          isAtBottomRef.current = true;
-                          shouldMaintainPositionRef.current = true;
-                          
-                          setTimeout(() => {
-                            isInitialLoadRef.current = false;
-                            console.log(`[UserChat] ✅ Marked initial load as complete`);
-                          }, 300);
-                        } catch (scrollError: any) {
-                          console.warn(`[UserChat] ⚠️ Scroll to end failed:`, scrollError?.message);
-                        }
-                      }
-                    }, 100); // Small delay to ensure content is rendered
+                      isInitialLoadRef.current = false;
+                      console.log(`[UserChat] ✅ Marked initial load as complete`);
+                    }, 100);
                     return; // Exit early, don't run maintain position logic during initial load
                   }
+                  // If not at bottom, initialScrollIndex should handle it on next render
+                  // Don't scroll here to avoid interrupting user - let initialScrollIndex do its job
                 }
                 
                 // Maintain fixed position of last message when content changes (polling, refetch, image loading)
