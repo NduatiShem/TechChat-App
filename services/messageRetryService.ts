@@ -16,6 +16,31 @@ let appStateSubscription: any = null;
 const messagesBeingRetried = new Set<number>();
 
 /**
+ * ✅ CRITICAL FIX: Export functions to mark messages as being sent
+ * This prevents retry service from picking up messages that handleSend is already sending
+ * Uses in-memory Set (no database operations) - won't cause database locks
+ */
+export function markMessageAsSending(messageId: number): void {
+  messagesBeingRetried.add(messageId);
+}
+
+export function unmarkMessageAsSending(messageId: number): void {
+  messagesBeingRetried.delete(messageId);
+}
+
+export function isMessageBeingSent(messageId: number): boolean {
+  return messagesBeingRetried.has(messageId);
+}
+
+/**
+ * Get all message IDs currently being sent
+ * Used by getPendingMessages to exclude them
+ */
+export function getMessagesBeingSent(): Set<number> {
+  return new Set(messagesBeingRetried);
+}
+
+/**
  * ✅ CLEANUP: Mark messages with server_id as synced (safety net)
  * This catches edge cases where messages have server_id but are still marked as pending/failed
  */
@@ -79,32 +104,37 @@ async function cleanupSyncedMessages(): Promise<void> {
 
 export async function retryPendingMessages(): Promise<void> {
   if (isRetrying) {
+    console.log(`[MessageRetry] ⏸️ Already retrying, skipping this cycle`);
     return; // Already retrying
   }
 
   try {
     isRetrying = true;
+    const retryStartTime = Date.now();
+    console.log(`[MessageRetry] 🔄 Starting retry cycle at ${new Date().toISOString()}`);
     
     // ✅ CLEANUP: First, clean up any messages that have server_id but are still pending/failed
     await cleanupSyncedMessages();
     
     const pendingMessages = await getPendingMessages();
     
+    console.log(`[MessageRetry] 📋 Found ${pendingMessages.length} pending messages from database`);
+    
     if (pendingMessages.length === 0) {
+      console.log(`[MessageRetry] ✅ No pending messages, exiting`);
       return;
     }
 
-    if (__DEV__) {
-      console.log(`[MessageRetry] Found ${pendingMessages.length} pending messages`);
-    }
+    // Log all pending messages
+    pendingMessages.forEach(msg => {
+      console.log(`[MessageRetry] 📝 Pending message: id=${msg.id}, content="${msg.message?.substring(0, 50)}", server_id=${msg.server_id || 'NULL'}, sync_status=${msg.sync_status}, marked_as_sending=${messagesBeingRetried.has(msg.id)}`);
+    });
 
     // Filter out messages that are already being retried or have server_id (already synced)
     const messagesToRetry = pendingMessages.filter(msg => {
       // Skip if already has server_id (already synced)
       if (msg.server_id) {
-        if (__DEV__) {
-          console.log(`[MessageRetry] Skipping message ${msg.id} - already has server_id ${msg.server_id}`);
-        }
+        console.log(`[MessageRetry] ⏭️ Skipping message ${msg.id} - already has server_id ${msg.server_id}`);
         // Update status to synced if it has server_id but status is still pending
         updateMessageStatus(msg.id, msg.server_id, 'synced').catch(() => {});
         return false;
@@ -112,9 +142,7 @@ export async function retryPendingMessages(): Promise<void> {
       
       // Skip if currently being retried
       if (messagesBeingRetried.has(msg.id)) {
-        if (__DEV__) {
-          console.log(`[MessageRetry] Skipping message ${msg.id} - already being retried`);
-        }
+        console.log(`[MessageRetry] ⏭️ Skipping message ${msg.id} - currently being sent by handleSend (marked as sending)`);
         return false;
       }
       
@@ -122,12 +150,11 @@ export async function retryPendingMessages(): Promise<void> {
     });
     
     if (messagesToRetry.length === 0) {
+      console.log(`[MessageRetry] ✅ All pending messages filtered out, exiting`);
       return;
     }
 
-    if (__DEV__) {
-      console.log(`[MessageRetry] Retrying ${messagesToRetry.length} pending messages`);
-    }
+    console.log(`[MessageRetry] 🚀 Retrying ${messagesToRetry.length} pending messages (filtered from ${pendingMessages.length})`);
 
     for (const message of messagesToRetry) {
       // Mark as being retried
@@ -344,6 +371,9 @@ async function retrySingleMessage(message: DatabaseMessage): Promise<void> {
         
         // ✅ If we got the ID from response, update immediately and skip verification
         if (messageIdFromResponse) {
+          console.log(`[MessageRetry] 💾 Updating message ${message.id} status to synced with server_id ${messageIdFromResponse} (from API response)`);
+          const updateStartTime = Date.now();
+          
           const updateSucceeded = await updateMessageStatus(
             message.id, 
             messageIdFromResponse, 
@@ -351,12 +381,14 @@ async function retrySingleMessage(message: DatabaseMessage): Promise<void> {
             serverCreatedAtFromResponse
           );
           
+          const updateDuration = Date.now() - updateStartTime;
+          
           if (updateSucceeded) {
-            console.log(`[MessageRetry] ✅ Successfully retried message ${message.id} -> server_id: ${messageIdFromResponse}`);
+            console.log(`[MessageRetry] ✅ RETRY DATABASE UPDATE SUCCESS for message ${message.id} | server_id: ${messageIdFromResponse} | Duration: ${updateDuration}ms`);
             messagesBeingRetried.delete(message.id);
             return; // Success - exit function immediately
           } else {
-            console.warn(`[MessageRetry] ⚠️ Failed to update message ${message.id} in database (API saved it with server_id: ${messageIdFromResponse}, but local update failed)`);
+            console.error(`[MessageRetry] ❌ RETRY DATABASE UPDATE FAILED for message ${message.id} | server_id: ${messageIdFromResponse} | Duration: ${updateDuration}ms | API saved it but local update failed`);
             // Message is saved on API but local update failed - cleanup will catch it later
             messagesBeingRetried.delete(message.id);
             return;
@@ -472,6 +504,9 @@ async function retrySingleMessage(message: DatabaseMessage): Promise<void> {
         if (matchingMessage?.id) {
           // ✅ SUCCESS! Message was saved to API DB
           // Update SQLite with server_id and mark as synced (removes from pending/failed)
+          console.log(`[MessageRetry] 💾 Updating message ${message.id} status to synced with server_id ${matchingMessage.id} (from verification)`);
+          const verifyUpdateStartTime = Date.now();
+          
           const updateSucceeded = await updateMessageStatus(
             message.id, 
             matchingMessage.id, 
@@ -479,10 +514,12 @@ async function retrySingleMessage(message: DatabaseMessage): Promise<void> {
             matchingMessage.created_at
           );
           
+          const verifyUpdateDuration = Date.now() - verifyUpdateStartTime;
+          
           if (updateSucceeded) {
-            console.log(`[MessageRetry] ✅ Successfully retried message ${message.id} -> server_id: ${matchingMessage.id}, marked as synced`);
+            console.log(`[MessageRetry] ✅ RETRY VERIFICATION DATABASE UPDATE SUCCESS for message ${message.id} | server_id: ${matchingMessage.id} | Duration: ${verifyUpdateDuration}ms`);
           } else {
-            console.warn(`[MessageRetry] ⚠️ Failed to update message ${message.id} in database (API saved it with server_id: ${matchingMessage.id}, but local update failed)`);
+            console.error(`[MessageRetry] ❌ RETRY VERIFICATION DATABASE UPDATE FAILED for message ${message.id} | server_id: ${matchingMessage.id} | Duration: ${verifyUpdateDuration}ms`);
           }
           
           messagesBeingRetried.delete(message.id);

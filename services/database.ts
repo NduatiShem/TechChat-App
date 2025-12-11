@@ -625,28 +625,76 @@ export async function saveMessages(
             messageId = existingMessage.id;
           } else {
             // INSERT new message (not in cache, assume new)
-            // Try INSERT first, if it fails due to constraint, the retry will handle it as UPDATE
-            const result = await validDb.runAsync(
-              `INSERT INTO messages (
-                server_id, conversation_id, conversation_type, sender_id, receiver_id, group_id,
-                message, created_at, read_at, edited_at, reply_to_id, sync_status
-              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-              [
-                msg.server_id ?? null,
-                msg.conversation_id,
-                msg.conversation_type,
-                msg.sender_id,
-                msg.receiver_id ?? null,
-                msg.group_id ?? null,
-                msg.message ?? null,
-                msg.created_at,
-                msg.read_at ?? null,
-                msg.edited_at ?? null,
-                msg.reply_to_id ?? null,
-                msg.sync_status ?? 'synced',
-              ]
-            );
-            messageId = result.lastInsertRowId;
+            // ✅ CRITICAL FIX: Use provided id if available (for tempLocalId from handleSend)
+            // This ensures the ID used for marking matches the ID in the database
+            if (msg.id && typeof msg.id === 'number') {
+              // Try to insert with provided ID (tempLocalId)
+              try {
+                const result = await validDb.runAsync(
+                  `INSERT INTO messages (
+                    id, server_id, conversation_id, conversation_type, sender_id, receiver_id, group_id,
+                    message, created_at, read_at, edited_at, reply_to_id, sync_status
+                  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                  [
+                    msg.id, // Use provided ID (tempLocalId)
+                    msg.server_id ?? null,
+                    msg.conversation_id,
+                    msg.conversation_type,
+                    msg.sender_id,
+                    msg.receiver_id ?? null,
+                    msg.group_id ?? null,
+                    msg.message ?? null,
+                    msg.created_at,
+                    msg.read_at ?? null,
+                    msg.edited_at ?? null,
+                    msg.reply_to_id ?? null,
+                    msg.sync_status ?? 'synced',
+                  ]
+                );
+                messageId = msg.id; // Use provided ID
+                if (__DEV__) {
+                  console.log(`[Database] Inserted message with provided ID: ${msg.id}`);
+                }
+              } catch (insertError: any) {
+                // If insert fails (e.g., ID already exists), fall back to auto-increment
+                if (insertError?.message?.includes('UNIQUE constraint') || insertError?.message?.includes('PRIMARY KEY')) {
+                  if (__DEV__) {
+                    console.warn(`[Database] Provided ID ${msg.id} already exists, using auto-increment instead`);
+                  }
+                  // Fall through to auto-increment INSERT below
+                } else {
+                  throw insertError; // Re-throw other errors
+                }
+              }
+            }
+            
+            // If no ID provided or insert with provided ID failed, use auto-increment
+            if (!messageId) {
+              const result = await validDb.runAsync(
+                `INSERT INTO messages (
+                  server_id, conversation_id, conversation_type, sender_id, receiver_id, group_id,
+                  message, created_at, read_at, edited_at, reply_to_id, sync_status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                [
+                  msg.server_id ?? null,
+                  msg.conversation_id,
+                  msg.conversation_type,
+                  msg.sender_id,
+                  msg.receiver_id ?? null,
+                  msg.group_id ?? null,
+                  msg.message ?? null,
+                  msg.created_at,
+                  msg.read_at ?? null,
+                  msg.edited_at ?? null,
+                  msg.reply_to_id ?? null,
+                  msg.sync_status ?? 'synced',
+                ]
+              );
+              messageId = result.lastInsertRowId;
+              if (__DEV__) {
+                console.log(`[Database] Inserted message with auto-increment ID: ${messageId}`);
+              }
+            }
             // If INSERT fails with constraint error, retryWithBackoff will retry
             // and on retry, the pre-fetch should have the message, so it will UPDATE instead
           }
@@ -1981,13 +2029,31 @@ export async function getPendingMessages(): Promise<DatabaseMessage[]> {
       // CRITICAL FIX: Add try-catch around the actual query to handle NullPointerException
       try {
         // ✅ FIX: Also get failed messages (they should be retried)
-        const messages = await validDb.getAllAsync<DatabaseMessage>(
+        const allMessages = await validDb.getAllAsync<DatabaseMessage>(
           `SELECT * FROM messages 
            WHERE (sync_status = 'pending' OR sync_status = 'failed')
            AND server_id IS NULL
            ORDER BY created_at ASC`
         );
-        return messages || [];
+        
+        // ✅ CRITICAL FIX: Filter out messages that are currently being sent by handleSend
+        // Import dynamically to avoid circular dependency
+        const { getMessagesBeingSent } = await import('./messageRetryService');
+        const messagesBeingSent = getMessagesBeingSent();
+        
+        console.log(`[Database] 📋 getPendingMessages: Found ${allMessages?.length || 0} pending messages | ${messagesBeingSent.size} currently being sent`);
+        
+        const messages = (allMessages || []).filter(msg => {
+          if (messagesBeingSent.has(msg.id)) {
+            console.log(`[Database] ⏭️ Excluding message ${msg.id} from pending - currently being sent by handleSend | Content: "${msg.message?.substring(0, 50)}"`);
+            return false;
+          }
+          return true;
+        });
+        
+        console.log(`[Database] ✅ getPendingMessages: Returning ${messages.length} messages after filtering (excluded ${(allMessages?.length || 0) - messages.length})`);
+        
+        return messages;
       } catch (queryError: any) {
         // Check if it's a NullPointerException or database not ready error
         if (queryError?.message?.includes('NullPointerException') || 
