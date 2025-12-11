@@ -13,7 +13,7 @@ import { useNotifications } from '@/context/NotificationContext';
 import { useTheme } from '@/context/ThemeContext';
 import { messagesAPI, usersAPI } from '@/services/api';
 import { deleteMessage as deleteDbMessage, getDb, getMessages as getDbMessages, hasMessagesForConversation, initDatabase, saveMessages as saveDbMessages, updateMessageByServerId, updateMessageStatus } from '@/services/database';
-import { startRetryService, retryPendingMessages, markMessageAsSending, unmarkMessageAsSending, isMessageBeingSent } from '@/services/messageRetryService';
+import { startRetryService, retryPendingMessages, markMessageAsSending, unmarkMessageAsSending, isMessageBeingSent, getMessagesBeingSent } from '@/services/messageRetryService';
 import { syncConversationMessages, syncOlderMessages } from '@/services/syncService';
 import { isVideoAttachment } from '@/utils/textUtils';
 import { MaterialCommunityIcons, MaterialIcons } from '@expo/vector-icons';
@@ -830,13 +830,19 @@ export default function UserChatScreen() {
     // 2. User is loading more messages (pagination)
     // 3. User is sending a message
     // 4. No latest message ID tracked yet
+    // ✅ CRITICAL FIX: Don't poll if there are messages currently being sent (prevent race conditions)
+    const messagesBeingSent = getMessagesBeingSent();
     if (
       isPollingRef.current ||
       loadingMore ||
       isPaginatingRef.current ||
       sending ||
-      !latestMessageIdRef.current
+      !latestMessageIdRef.current ||
+      messagesBeingSent.size > 0
     ) {
+      if (messagesBeingSent.size > 0 && __DEV__) {
+        console.log(`[UserChat] ⏸️ Skipping poll - ${messagesBeingSent.size} message(s) being sent`);
+      }
       return;
     }
 
@@ -878,14 +884,29 @@ export default function UserChatScreen() {
               }
             });
             
-            // Filter out messages that are truly duplicates (same ID OR same content+sender+timestamp)
+            // ✅ CRITICAL FIX: Improved deduplication - match by server_id, content+sender+timestamp, or ID
             const uniqueNewMessages = newMessages.filter(newMsg => {
               // Check 1: Same ID
               if (newMsg.id != null && existingIds.has(newMsg.id)) {
                 return false; // Duplicate by ID
               }
               
-              // Check 2: Same content + sender + timestamp (within 1 second) - exact duplicate
+              // Check 2: Match by server_id if message has server_id
+              // This handles the case where UI has tempLocalId but API returns server_id
+              if (newMsg.id != null) {
+                const hasMatchingServerId = prev.some(existing => {
+                  // If existing message has same server_id (stored in id field after sync)
+                  // or if they're the same message with different IDs
+                  return existing.id === newMsg.id;
+                });
+                
+                if (hasMatchingServerId) {
+                  return false; // Duplicate by server_id
+                }
+              }
+              
+              // Check 3: Same content + sender + timestamp (within 2 seconds) - exact duplicate
+              // ✅ Increased time window to 2 seconds to catch messages that were just sent
               const isExactDuplicate = prev.some(existing => {
                 if (existing.id === newMsg.id) return true; // Already checked above
                 
@@ -895,8 +916,8 @@ export default function UserChatScreen() {
                 const contentMatch = (existing.message || '') === (newMsg.message || '');
                 const senderMatch = existing.sender_id === newMsg.sender_id;
                 
-                // If same content, sender, and timestamp within 1 second, it's an exact duplicate
-                return contentMatch && senderMatch && timeDiff < 1000;
+                // If same content, sender, and timestamp within 2 seconds, it's an exact duplicate
+                return contentMatch && senderMatch && timeDiff < 2000;
               });
               
               return !isExactDuplicate;
@@ -1890,14 +1911,23 @@ export default function UserChatScreen() {
                       const existingIds = new Set(prev.map(m => m.id));
                       const serverIdExists = existingIds.has(messageId);
                       
-                      if (serverIdExists) {
-                        // Server ID already exists, remove tempLocalId to avoid duplication
-                        const filtered = prev.filter(msg => msg.id !== tempLocalId);
+                      // ✅ CRITICAL FIX: Find message by both tempLocalId AND actualMessageId
+                      const messageToUpdate = prev.find(msg => 
+                        msg.id === tempLocalId || msg.id === actualMessageId
+                      );
+                      
+                      if (serverIdExists && messageToUpdate) {
+                        // Server ID already exists (from polling), remove tempLocalId/actualMessageId to avoid duplication
+                        console.log(`[UserChat] 🔄 Server ID ${messageId} already exists in UI, removing tempLocalId ${tempLocalId} and actualMessageId ${actualMessageId}`);
+                        const filtered = prev.filter(msg => 
+                          msg.id !== tempLocalId && msg.id !== actualMessageId
+                        );
                         return deduplicateMessages(filtered);
-                      } else {
-                        // Update tempLocalId to server ID
+                      } else if (messageToUpdate) {
+                        // Update tempLocalId/actualMessageId to server ID
+                        console.log(`[UserChat] 🔄 Updating message ${tempLocalId}/${actualMessageId} to server_id ${messageId}`);
                         const updated = prev.map(msg => 
-                          msg.id === tempLocalId 
+                          (msg.id === tempLocalId || msg.id === actualMessageId)
                             ? { 
                                 ...msg, 
                                 id: messageId, 
@@ -1905,6 +1935,23 @@ export default function UserChatScreen() {
                                 created_at: serverCreatedAt || msg.created_at
                               }
                             : msg
+                        );
+                        return deduplicateMessages(updated);
+                      } else {
+                        // Message not found in UI (might have been removed by polling)
+                        // Add it back with server_id
+                        console.log(`[UserChat] ⚠️ Message ${tempLocalId}/${actualMessageId} not found in UI, adding with server_id ${messageId}`);
+                        const newMessage: Message = {
+                          id: messageId,
+                          message: messageText || null,
+                          sender_id: Number(user?.id || 0),
+                          receiver_id: Number(id),
+                          created_at: serverCreatedAt || now,
+                          sync_status: 'synced',
+                          attachments: localMessage.attachments || [],
+                        };
+                        const updated = [...prev, newMessage].sort((a, b) => 
+                          new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
                         );
                         return deduplicateMessages(updated);
                       }
