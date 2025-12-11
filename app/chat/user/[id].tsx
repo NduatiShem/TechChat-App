@@ -117,16 +117,57 @@ export default function UserChatScreen() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [visibleMessagesStartIndex, setVisibleMessagesStartIndex] = useState<number | null>(null); // Track which messages to display (null = show all, number = start index)
   
+  // ✅ CRITICAL FIX: Define INITIAL_VISIBLE_MESSAGES before useMemo to prevent NaN
+  const INITIAL_VISIBLE_MESSAGES = 30; // Show only last 30 messages initially (latest at bottom)
+  
   // Compute visible messages - show only last N messages initially
   const visibleMessages = useMemo(() => {
     if (messages.length === 0) return [];
     if (visibleMessagesStartIndex === null) {
       // Initial load: show only last N messages (latest at bottom)
       const startIndex = Math.max(0, messages.length - INITIAL_VISIBLE_MESSAGES);
-      return messages.slice(startIndex);
+      const sliced = messages.slice(startIndex);
+      
+      // ✅ DEBUG LOGGING: Track visible messages computation
+      console.log(`[UserChat] 📋 visibleMessages computed:`, {
+        totalMessages: messages.length,
+        visibleMessagesStartIndex: null,
+        computedStartIndex: startIndex,
+        visibleCount: sliced.length,
+        firstVisibleMessage: sliced[0] ? {
+          id: sliced[0].id,
+          content: sliced[0].message?.substring(0, 30),
+          created_at: sliced[0].created_at,
+        } : null,
+        lastVisibleMessage: sliced[sliced.length - 1] ? {
+          id: sliced[sliced.length - 1].id,
+          content: sliced[sliced.length - 1].message?.substring(0, 30),
+          created_at: sliced[sliced.length - 1].created_at,
+        } : null,
+      });
+      
+      return sliced;
     }
     // Show messages from startIndex to end
-    return messages.slice(visibleMessagesStartIndex);
+    const sliced = messages.slice(visibleMessagesStartIndex);
+    
+    console.log(`[UserChat] 📋 visibleMessages computed (with startIndex):`, {
+      totalMessages: messages.length,
+      visibleMessagesStartIndex,
+      visibleCount: sliced.length,
+      firstVisibleMessage: sliced[0] ? {
+        id: sliced[0].id,
+        content: sliced[0].message?.substring(0, 30),
+        created_at: sliced[0].created_at,
+      } : null,
+      lastVisibleMessage: sliced[sliced.length - 1] ? {
+        id: sliced[sliced.length - 1].id,
+        content: sliced[sliced.length - 1].message?.substring(0, 30),
+        created_at: sliced[sliced.length - 1].created_at,
+      } : null,
+    });
+    
+    return sliced;
   }, [messages, visibleMessagesStartIndex]);
   
   // Robust deduplication function using composite key (ID + created_at + message content)
@@ -471,7 +512,7 @@ export default function UserChatScreen() {
   const [dbInitialized, setDbInitialized] = useState(false);
   const [loadedMessagesCount, setLoadedMessagesCount] = useState(0);
   const MESSAGES_PER_PAGE = 50; // Load 50 messages at a time
-  const INITIAL_VISIBLE_MESSAGES = 30; // Show only last 30 messages initially (latest at bottom)
+  // Note: INITIAL_VISIBLE_MESSAGES moved above visibleMessages useMemo to prevent NaN
 
   // Initialize database on mount
   useEffect(() => {
@@ -538,9 +579,14 @@ export default function UserChatScreen() {
   // Fetch messages and user info
   // ✅ API-FIRST STRATEGY: Try API first, fallback to SQLite only if API fails
   const fetchMessages = useCallback(async (showLoading = true) => {
+      // ✅ CRITICAL FIX: Capture isInitialLoad state at start of fetchMessages
+      // This ensures we know if this is truly the initial load, even if flag changes during async operations
+      const isActuallyInitialLoad = isInitialLoadRef.current;
+      
       // Reset scroll flag on initial load
-      if (isInitialLoadRef.current) {
+      if (isActuallyInitialLoad) {
         setHasScrolledToBottom(false);
+        initialScrollCompleteRef.current = false; // ✅ Reset scroll complete flag to allow scrolling
       }
     
     // Show loading spinner if requested
@@ -692,23 +738,68 @@ export default function UserChatScreen() {
     }
     
     // STEP 2: Handle API result or fallback to SQLite
+    // ✅ CRITICAL FIX: Use the captured isActuallyInitialLoad from the start of the function
     if (apiSuccess) {
       // ✅ API succeeded - use API data (even if empty, it's the truth)
+      console.log(`[UserChat] 📥 fetchMessages API success:`, {
+        messageCount: apiMessages.length,
+        isInitialLoad: isActuallyInitialLoad,
+        INITIAL_VISIBLE_MESSAGES,
+      });
+      
       setMessages(apiMessages);
       messagesLengthRef.current = apiMessages.length;
       
       if (apiMessages.length > 0) {
         const latestMsg = apiMessages[apiMessages.length - 1];
         latestMessageIdRef.current = latestMsg.id;
+        console.log(`[UserChat] 📌 Latest message ID set to: ${latestMsg.id}`);
+        
+        // ✅ DEBUG LOGGING: Log initial message state
+        console.log(`[UserChat] 📊 Initial message state after setMessages:`, {
+          totalMessages: apiMessages.length,
+          firstMessage: {
+            id: apiMessages[0].id,
+            content: apiMessages[0].message?.substring(0, 30),
+            created_at: apiMessages[0].created_at,
+          },
+          lastMessage: {
+            id: latestMsg.id,
+            content: latestMsg.message?.substring(0, 30),
+            created_at: latestMsg.created_at,
+          },
+          isInitialLoad: isInitialLoadRef.current,
+          visibleMessagesStartIndex: visibleMessagesStartIndex,
+          note: 'FlatList will render these messages. With inverted=false, latest messages appear at bottom (need to scroll to bottom).',
+        });
       }
       
+      // ✅ CRITICAL FIX: Use captured isActuallyInitialLoad
       // Initially show only last N messages (latest at bottom)
-      if (isInitialLoadRef.current && apiMessages.length > INITIAL_VISIBLE_MESSAGES) {
+      if (isActuallyInitialLoad && apiMessages.length > INITIAL_VISIBLE_MESSAGES) {
         const startIndex = apiMessages.length - INITIAL_VISIBLE_MESSAGES;
+        console.log(`[UserChat] 🎯 Setting visibleMessagesStartIndex:`, {
+          totalMessages: apiMessages.length,
+          INITIAL_VISIBLE_MESSAGES,
+          startIndex,
+          willShowMessagesFrom: startIndex,
+          willShowMessagesTo: apiMessages.length - 1,
+          firstMessageToShow: apiMessages[startIndex] ? {
+            id: apiMessages[startIndex].id,
+            content: apiMessages[startIndex].message?.substring(0, 30),
+            created_at: apiMessages[startIndex].created_at,
+          } : null,
+          lastMessageToShow: apiMessages[apiMessages.length - 1] ? {
+            id: apiMessages[apiMessages.length - 1].id,
+            content: apiMessages[apiMessages.length - 1].message?.substring(0, 30),
+            created_at: apiMessages[apiMessages.length - 1].created_at,
+          } : null,
+        });
         setVisibleMessagesStartIndex(startIndex);
-      } else if (visibleMessagesStartIndex === null) {
-        setVisibleMessagesStartIndex(null);
       }
+      // ✅ CRITICAL FIX: When messages < INITIAL_VISIBLE_MESSAGES, visibleMessagesStartIndex stays null
+      // This is correct - visibleMessages useMemo will show all messages
+      // But initialScrollIndex will still be set to ensure FlatList starts at the bottom
       
       setLoadedMessagesCount(apiMessages.length);
       
@@ -716,7 +807,8 @@ export default function UserChatScreen() {
         setLoading(false);
       }
       
-      if (isInitialLoadRef.current || isAtBottomRef.current) {
+      // ✅ CRITICAL FIX: Use captured isActuallyInitialLoad
+      if (isActuallyInitialLoad || isAtBottomRef.current) {
         setHasScrolledToBottom(false);
       }
     } else {
@@ -740,12 +832,21 @@ export default function UserChatScreen() {
               latestMessageIdRef.current = latestMsg.id;
             }
             
-            if (isInitialLoadRef.current && uniqueMessages.length > INITIAL_VISIBLE_MESSAGES) {
+            // ✅ CRITICAL FIX: Use captured isActuallyInitialLoad
+            if (isActuallyInitialLoad && uniqueMessages.length > INITIAL_VISIBLE_MESSAGES) {
               const startIndex = uniqueMessages.length - INITIAL_VISIBLE_MESSAGES;
+              console.log(`[UserChat] 🎯 Setting visibleMessagesStartIndex (SQLite fallback):`, {
+                totalMessages: uniqueMessages.length,
+                INITIAL_VISIBLE_MESSAGES,
+                startIndex,
+                willShowMessagesFrom: startIndex,
+                willShowMessagesTo: uniqueMessages.length - 1,
+              });
               setVisibleMessagesStartIndex(startIndex);
-            } else if (visibleMessagesStartIndex === null) {
-              setVisibleMessagesStartIndex(null);
             }
+            // ✅ CRITICAL FIX: When messages < INITIAL_VISIBLE_MESSAGES, visibleMessagesStartIndex stays null
+            // This is correct - visibleMessages useMemo will show all messages
+            // But initialScrollIndex will still be set to ensure FlatList starts at the bottom
             
             if (showLoading) {
               setLoading(false);
@@ -1043,6 +1144,7 @@ export default function UserChatScreen() {
     latestMessageIdRef.current = null; // Reset latest message ID
     isPollingRef.current = false; // Reset polling flag
     initialScrollCompleteRef.current = false; // Reset initial scroll flag
+    isInitialLoadRef.current = true; // ✅ CRITICAL FIX: Set initial load flag when conversation changes
     setVisibleMessagesStartIndex(null); // Reset visible messages start index
     
     // Clear polling interval
@@ -1150,6 +1252,24 @@ export default function UserChatScreen() {
       console.warn('Duplicate message IDs found:', duplicateIds);
     }
   }, [messages]);
+  
+  // ✅ DEBUG LOGGING: Track when visibleMessages changes
+  useEffect(() => {
+    console.log(`[UserChat] 🔄 visibleMessages changed:`, {
+      count: visibleMessages.length,
+      startIndex: visibleMessagesStartIndex,
+      firstMessage: visibleMessages[0] ? {
+        id: visibleMessages[0].id,
+        content: visibleMessages[0].message?.substring(0, 30),
+        created_at: visibleMessages[0].created_at,
+      } : null,
+      lastMessage: visibleMessages[visibleMessages.length - 1] ? {
+        id: visibleMessages[visibleMessages.length - 1].id,
+        content: visibleMessages[visibleMessages.length - 1].message?.substring(0, 30),
+        created_at: visibleMessages[visibleMessages.length - 1].created_at,
+      } : null,
+    });
+  }, [visibleMessages, visibleMessagesStartIndex]);
 
   // Keyboard listeners
   useEffect(() => {
@@ -3244,6 +3364,24 @@ export default function UserChatScreen() {
               maxToRenderPerBatch={15} // Render 15 items per batch
               removeClippedSubviews={true} // Remove off-screen views for better performance
               updateCellsBatchingPeriod={50} // Batch updates every 50ms
+              // ✅ CRITICAL FIX: Always start at the last message (latest at bottom) on initial load
+              // This ensures the latest message is visible even when all messages fit on screen
+              initialScrollIndex={
+                isInitialLoadRef.current && visibleMessages.length > 0 
+                  ? visibleMessages.length - 1  // Always start at last message on initial load
+                  : undefined
+              }
+              getItemLayout={(data, index) => {
+                // Provide item layout for better scrollToIndex performance
+                // CRITICAL: This must be accurate for initialScrollIndex to work properly
+                // Estimate ~60px per message (will be adjusted by onLayout)
+                const estimatedHeight = 60; // Base height per message
+                return { 
+                  length: estimatedHeight, 
+                  offset: estimatedHeight * index, 
+                  index 
+                };
+              }}
               // REMOVED: onEndReached - it fires at bottom (newest messages) but we want to load at top (oldest)
               // Loading more messages is handled by onScroll handler when user scrolls to top
               keyExtractor={(item, index) => {
@@ -3267,7 +3405,7 @@ export default function UserChatScreen() {
                 padding: 16, 
                 paddingBottom: 0, // Let KeyboardAvoidingView handle spacing
               }}
-              inverted={false} // Normal scrolling - scroll down to see older messages
+              inverted={false} // Normal scrolling - latest messages at bottom (correct for chat apps)
               keyboardShouldPersistTaps="handled"
               keyboardDismissMode={Platform.OS === 'ios' ? 'interactive' : 'on-drag'}
               // CRITICAL: Maintain scroll position relative to last visible message
@@ -3293,6 +3431,22 @@ export default function UserChatScreen() {
                 const viewportHeight = layoutMeasurement.height;
                 const distanceFromBottom = contentHeight - (currentOffset + viewportHeight);
                 const isAtBottom = distanceFromBottom <= 50;
+                
+                // ✅ DEBUG LOGGING: Track scroll position (especially on initial load)
+                if (isInitialLoadRef.current || !initialScrollCompleteRef.current) {
+                  console.log(`[UserChat] 📜 onScroll (initial load):`, {
+                    contentOffsetY: currentOffset,
+                    contentHeight,
+                    viewportHeight,
+                    distanceFromBottom,
+                    isAtBottom,
+                    scrollPercentage: contentHeight > 0 ? ((currentOffset / (contentHeight - viewportHeight)) * 100).toFixed(1) + '%' : '0%',
+                    isInitialLoad: isInitialLoadRef.current,
+                    initialScrollComplete: initialScrollCompleteRef.current,
+                    visibleMessagesCount: visibleMessages.length,
+                    messagesCount: messages.length,
+                  });
+                }
                 
                 // Update anchor message and position maintenance flag when user is at bottom
                 if (isAtBottom && visibleMessages.length > 0) {
@@ -3342,7 +3496,86 @@ export default function UserChatScreen() {
                 ) : null
               }
               onContentSizeChange={(contentWidth, contentHeight) => {
+                // ✅ DEBUG LOGGING: Track content size changes
+                const viewportHeight = viewportHeightRef.current || 0;
+                const scrollPosition = lastScrollOffsetRef.current || 0;
+                const distanceFromBottom = contentHeight - (scrollPosition + viewportHeight);
+                const scrollPercentage = contentHeight > viewportHeight 
+                  ? ((scrollPosition / (contentHeight - viewportHeight)) * 100).toFixed(1) + '%'
+                  : '0% (all visible)';
+                
+                console.log(`[UserChat] 📏 onContentSizeChange:`, {
+                  contentWidth,
+                  contentHeight,
+                  viewportHeight,
+                  scrollPosition,
+                  distanceFromBottom,
+                  scrollPercentage,
+                  isAtTop: scrollPosition <= 10,
+                  isAtBottom: distanceFromBottom <= 50,
+                  messagesCount: messages.length,
+                  visibleMessagesCount: visibleMessages.length,
+                  visibleMessagesStartIndex,
+                  isInitialLoad: isInitialLoadRef.current,
+                  initialScrollComplete: initialScrollCompleteRef.current,
+                  loading,
+                  hasScrolledToBottom,
+                  isAtBottom: isAtBottomRef.current,
+                  firstVisibleMessageId: visibleMessages[0]?.id,
+                  lastVisibleMessageId: visibleMessages[visibleMessages.length - 1]?.id,
+                  shouldMaintainPosition: shouldMaintainPositionRef.current,
+                  lastMessageHeight: lastMessageHeightRef.current,
+                  // Calculate which message should be visible at current scroll position
+                  estimatedVisibleRange: viewportHeight > 0 && visibleMessages.length > 0 ? {
+                    estimatedFirstVisibleIndex: Math.floor((scrollPosition / contentHeight) * visibleMessages.length),
+                    estimatedLastVisibleIndex: Math.floor(((scrollPosition + viewportHeight) / contentHeight) * visibleMessages.length),
+                  } : null,
+                });
+                
+                // ✅ CRITICAL FIX: On initial load, always scroll to bottom when messages are set
+                // This handles the case where initialScrollIndex worked, but then messages update and push content down
+                if (isInitialLoadRef.current && !loading && visibleMessages.length > 0) {
+                  // Check if we're not at bottom (content grew and pushed us up)
+                  const isAtBottom = distanceFromBottom <= 100;
+                  
+                  if (!isAtBottom || !initialScrollCompleteRef.current) {
+                    console.log(`[UserChat] 🔄 Initial load - content changed, scrolling to bottom`, {
+                      contentHeight,
+                      viewportHeight,
+                      distanceFromBottom,
+                      isAtBottom,
+                      initialScrollComplete: initialScrollCompleteRef.current,
+                    });
+                    
+                    // Scroll to bottom to keep latest message visible
+                    setTimeout(() => {
+                      if (flatListRef.current && visibleMessages.length > 0) {
+                        try {
+                          // Use scrollToEnd for inverted=false FlatList
+                          (flatListRef.current as any).scrollToEnd({ animated: false });
+                          console.log(`[UserChat] ✅ Scrolled to bottom after content change`);
+                          
+                          // Mark as complete after scroll
+                          initialScrollCompleteRef.current = true;
+                          setHasScrolledToBottom(true);
+                          isAtBottomRef.current = true;
+                          shouldMaintainPositionRef.current = true;
+                          
+                          setTimeout(() => {
+                            isInitialLoadRef.current = false;
+                            console.log(`[UserChat] ✅ Marked initial load as complete`);
+                          }, 300);
+                        } catch (scrollError: any) {
+                          console.warn(`[UserChat] ⚠️ Scroll to end failed:`, scrollError?.message);
+                        }
+                      }
+                    }, 100); // Small delay to ensure content is rendered
+                    return; // Exit early, don't run maintain position logic during initial load
+                  }
+                }
+                
                 // Maintain fixed position of last message when content changes (polling, refetch, image loading)
+                // This only runs AFTER initial load is complete
                 if (shouldMaintainPositionRef.current && 
                     !isInitialLoadRef.current && 
                     initialScrollCompleteRef.current &&
@@ -3368,22 +3601,111 @@ export default function UserChatScreen() {
                   }, 50); // Small delay to ensure layout is complete
                 }
                 
-                // Mark initial load as complete - no scrolling needed since we're showing latest messages at bottom
-                if (isInitialLoadRef.current && !loading && visibleMessages.length > 0 && !initialScrollCompleteRef.current) {
+                // ✅ CRITICAL FIX: Scroll to bottom on initial load to show latest messages (at bottom)
+                // This is a fallback for when the above logic doesn't catch it
+                // Check if we need to scroll: initial load AND not already scrolled AND messages exist
+                const needsInitialScroll = isInitialLoadRef.current && !loading && visibleMessages.length > 0 && !initialScrollCompleteRef.current;
+                // Also check if scroll is not at bottom (distanceFromBottom > 100px) - this handles the case where initialScrollComplete is true but scroll didn't happen
+                const isNearBottom = distanceFromBottom <= 100; // Within 100px of bottom
+                const shouldScrollToBottom = needsInitialScroll || (isInitialLoadRef.current && !isNearBottom && visibleMessages.length > 0 && !initialScrollCompleteRef.current);
+                
+                if (shouldScrollToBottom) {
+                  console.log(`[UserChat] ✅ Initial load - scrolling to bottom to show latest messages`, {
+                    isInitialLoad: isInitialLoadRef.current,
+                    initialScrollComplete: initialScrollCompleteRef.current,
+                    scrollPosition,
+                    contentHeight,
+                    viewportHeight,
+                    distanceFromBottom,
+                    isNearBottom,
+                    needsInitialScroll,
+                    shouldScrollToBottom,
+                  });
+                  
+                  // Use scrollToIndex to scroll to the last message (latest at bottom)
+                  setTimeout(() => {
+                    if (flatListRef.current && visibleMessages.length > 0) {
+                      try {
+                        const lastIndex = visibleMessages.length - 1;
+                        console.log(`[UserChat] 📜 Scrolling to index ${lastIndex} (latest message at bottom)`);
+                        flatListRef.current.scrollToIndex({
+                          index: lastIndex,
+                          animated: false,
+                          viewPosition: 1, // 1 = bottom of viewport (latest message visible)
+                        });
+                        console.log(`[UserChat] ✅ Scrolled to bottom successfully`);
+                      } catch (scrollError: any) {
+                        // If scrollToIndex fails, fallback to scrollToEnd
+                        console.warn(`[UserChat] ⚠️ scrollToIndex failed, using scrollToEnd:`, scrollError?.message);
+                        try {
+                          (flatListRef.current as any).scrollToEnd({ animated: false });
+                          console.log(`[UserChat] ✅ Used scrollToEnd fallback`);
+                        } catch (endError) {
+                          console.error(`[UserChat] ❌ Both scroll methods failed:`, endError);
+                        }
+                      }
+                    }
+                  }, 300); // Increased delay to ensure messages are fully rendered
+                  
+                  // ✅ CRITICAL FIX: Only mark as complete AFTER scroll is attempted
                   initialScrollCompleteRef.current = true;
-                  isInitialLoadRef.current = false;
                   setHasScrolledToBottom(true);
                   isAtBottomRef.current = true;
                   shouldMaintainPositionRef.current = true;
                   if (visibleMessages.length > 0) {
                     lastVisibleMessageIdRef.current = visibleMessages[visibleMessages.length - 1].id;
+                    console.log(`[UserChat] 📌 Set lastVisibleMessageIdRef to: ${lastVisibleMessageIdRef.current}`);
+                    
+                    // ✅ CRITICAL FIX: Set isInitialLoad to false AFTER scroll is initiated
+                    // This prevents it from being false before scroll happens
+                    setTimeout(() => {
+                      isInitialLoadRef.current = false;
+                      console.log(`[UserChat] ✅ Marked initial load as complete after scroll`);
+                    }, 500); // Wait for scroll to complete
                   }
                 }
               }}
               onLayout={(event) => {
                 // Track viewport height when layout changes
-                const { height } = event.nativeEvent.layout;
+                const { height, width, x, y } = event.nativeEvent.layout;
+                const previousViewportHeight = viewportHeightRef.current;
+                
+                // ✅ DEBUG LOGGING: Track layout changes
+                console.log(`[UserChat] 📐 FlatList onLayout:`, {
+                  height,
+                  width,
+                  x,
+                  y,
+                  previousViewportHeight,
+                  heightChanged: previousViewportHeight !== height,
+                  isInitialLoad: isInitialLoadRef.current,
+                  initialScrollComplete: initialScrollCompleteRef.current,
+                  visibleMessagesCount: visibleMessages.length,
+                  messagesCount: messages.length,
+                  visibleMessagesStartIndex,
+                  // Check if FlatList is ready to show content
+                  flatListRefExists: !!flatListRef.current,
+                  // Estimate how many messages fit in viewport (rough estimate: ~60px per message)
+                  estimatedMessagesInViewport: Math.ceil(height / 60),
+                });
+                
                 viewportHeightRef.current = height;
+                
+                // ✅ DEBUG: Log initial scroll position after layout
+                if (isInitialLoadRef.current && !initialScrollCompleteRef.current && flatListRef.current) {
+                  setTimeout(() => {
+                    // Try to get current scroll position
+                    if (flatListRef.current) {
+                      console.log(`[UserChat] 🔍 Initial layout complete - checking scroll state:`, {
+                        viewportHeight: height,
+                        visibleMessagesCount: visibleMessages.length,
+                        firstMessageId: visibleMessages[0]?.id,
+                        lastMessageId: visibleMessages[visibleMessages.length - 1]?.id,
+                        note: 'FlatList with inverted=true shows last item (latest message) at bottom by default',
+                      });
+                    }
+                  }, 100);
+                }
               }}
               ListEmptyComponent={() => (
                 <View style={{ 
