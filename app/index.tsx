@@ -54,7 +54,8 @@ interface Conversation {
   };
 }
 
-// Removed CONVERSATIONS_CACHE_KEY - using SQLite only
+// Hybrid Cache Strategy: AsyncStorage (fast) + SQLite (persistent) + API (source of truth)
+const CONVERSATIONS_CACHE_KEY = '@techchat_conversations';
 
 export default function ConversationsScreen() {
   const [conversations, setConversations] = useState<Conversation[]>([]);
@@ -110,7 +111,34 @@ export default function ConversationsScreen() {
     return Array.from(seen.values());
   }, []);
 
-  // Load conversations from SQLite (local-first) - only individual conversations for messages tab
+  // ✅ HYBRID CACHE: Load from AsyncStorage (fastest, instant display)
+  const loadAsyncStorageConversations = async (): Promise<Conversation[]> => {
+    try {
+      const cachedData = await AsyncStorage.getItem(CONVERSATIONS_CACHE_KEY);
+      if (!cachedData) return [];
+      
+      const conversations = JSON.parse(cachedData);
+      if (!Array.isArray(conversations)) return [];
+      
+      // Filter out groups (messages tab is for individual conversations only)
+      const individualConversations = conversations.filter(conv => !conv.is_group);
+      return deduplicateConversations(individualConversations);
+    } catch (error) {
+      console.error('[Conversations] Error loading from AsyncStorage:', error);
+      return [];
+    }
+  };
+
+  // ✅ HYBRID CACHE: Save to AsyncStorage (fast cache layer)
+  const saveAsyncStorageConversations = async (convs: Conversation[]): Promise<void> => {
+    try {
+      await AsyncStorage.setItem(CONVERSATIONS_CACHE_KEY, JSON.stringify(convs));
+    } catch (error) {
+      console.error('[Conversations] Error saving to AsyncStorage:', error);
+    }
+  };
+
+  // Load conversations from SQLite (persistent storage) - only individual conversations for messages tab
   const loadCachedConversations = async (): Promise<Conversation[]> => {
     try {
       if (!dbInitialized) return [];
@@ -146,18 +174,43 @@ export default function ConversationsScreen() {
   };
 
   const loadConversations = async (forceRefresh = false) => {
-    // If offline, load from cache only
+    // ✅ API-FIRST STRATEGY: Try API first, fallback to AsyncStorage/SQLite only if API fails
+    // Only show empty state if API returns empty AND all fallbacks are empty AND requests completed successfully
+    
+    // If offline and not forcing refresh, use cached data only
     if (!isOnline && !forceRefresh) {
-      const cachedConversations = await loadCachedConversations();
-      if (cachedConversations.length > 0) {
-        const deduplicated = deduplicateConversations(cachedConversations);
-        setConversations(deduplicated);
-        setFilteredConversations(deduplicated);
+      // Try AsyncStorage first
+      const asyncStorageConversations = await loadAsyncStorageConversations();
+      if (asyncStorageConversations.length > 0) {
+        setConversations(asyncStorageConversations);
+        setFilteredConversations(asyncStorageConversations);
         setIsLoading(false);
         return;
       }
+      
+      // Try SQLite as fallback
+      const sqliteConversations = await loadCachedConversations();
+      if (sqliteConversations.length > 0) {
+        const deduplicated = deduplicateConversations(sqliteConversations);
+        setConversations(deduplicated);
+        setFilteredConversations(deduplicated);
+        await saveAsyncStorageConversations(deduplicated);
+        setIsLoading(false);
+        return;
+      }
+      
+      // Both empty - show empty state
+      setConversations([]);
+      setFilteredConversations([]);
+      setIsLoading(false);
+      return;
     }
 
+    // STEP 1: Try API first (source of truth)
+    let apiSuccess = false;
+    let apiConversations: Conversation[] = [];
+    let apiError: any = null;
+    
     try {
       const response = await conversationsAPI.getAll();
       let conversationsData = response.data;
@@ -228,20 +281,23 @@ export default function ConversationsScreen() {
       );
       
       // Sync unread counts from backend to notification context
-      // Update all conversations (including those with 0 unread)
       uniqueConversations.forEach((conversation) => {
         const conversationId = conversation.conversation_id || conversation.id;
         const unreadCount = conversation.unread_count || 0;
-        // Update count for each conversation (this will automatically calculate total)
         updateUnreadCount(Number(conversationId), unreadCount);
       });
       
       // Deduplicate before setting state
       const deduplicated = deduplicateConversations(uniqueConversations);
-      setConversations(deduplicated);
-      setFilteredConversations(deduplicated);
       
-      // Save to SQLite database
+      // Mark API as successful
+      apiSuccess = true;
+      apiConversations = deduplicated;
+      
+      // Save to both AsyncStorage (fast) and SQLite (persistent)
+      await saveAsyncStorageConversations(deduplicated);
+      
+      // Save to SQLite database (persistent)
       try {
         const conversationsToSave = uniqueConversations.map(conv => ({
           conversation_id: conv.conversation_id || conv.id,
@@ -262,36 +318,11 @@ export default function ConversationsScreen() {
         await saveDbConversations(conversationsToSave);
       } catch (dbError) {
         console.error('[Conversations] Error saving to database:', dbError);
-        // No fallback - SQLite is the only storage
       }
     } catch (error: any) {
-      console.error('Failed to load conversations:', error);
-      // If offline or network error, try to load from cache
-      if (!isOnline || error?.message?.includes('Network') || error?.code === 'NETWORK_ERROR') {
-        const cachedConversations = await loadCachedConversations();
-        if (cachedConversations.length > 0) {
-          const deduplicated = deduplicateConversations(cachedConversations);
-          setConversations(deduplicated);
-          setFilteredConversations(deduplicated);
-          setIsLoading(false);
-          return;
-        }
-      }
-      // Don't clear conversations on error - preserve existing data
-      // Only clear if we have no existing conversations (initial load)
-      if (conversations.length === 0) {
-        // Try loading from cache one more time
-        const cachedConversations = await loadCachedConversations();
-        if (cachedConversations.length > 0) {
-          const deduplicated = deduplicateConversations(cachedConversations);
-          setConversations(deduplicated);
-          setFilteredConversations(deduplicated);
-        } else {
-          setConversations([]);
-          setFilteredConversations([]);
-        }
-      }
-      // Log error details for debugging
+      apiError = error;
+      console.error('Failed to load conversations from API:', error);
+      
       if (error?.response) {
         console.error('API Error Response:', {
           status: error.response.status,
@@ -299,7 +330,39 @@ export default function ConversationsScreen() {
           headers: error.response.headers
         });
       }
-    } finally {
+    }
+    
+    // STEP 2: Handle API result or fallback to AsyncStorage/SQLite
+    if (apiSuccess) {
+      // ✅ API succeeded - use API data (even if empty, it's the truth)
+      setConversations(apiConversations);
+      setFilteredConversations(apiConversations);
+      setIsLoading(false);
+    } else {
+      // ❌ API failed - fallback to AsyncStorage → SQLite
+      // Try AsyncStorage first
+      const asyncStorageConversations = await loadAsyncStorageConversations();
+      if (asyncStorageConversations.length > 0) {
+        setConversations(asyncStorageConversations);
+        setFilteredConversations(asyncStorageConversations);
+        setIsLoading(false);
+        return;
+      }
+      
+      // Try SQLite fallback
+      const sqliteConversations = await loadCachedConversations();
+      if (sqliteConversations.length > 0) {
+        const deduplicated = deduplicateConversations(sqliteConversations);
+        setConversations(deduplicated);
+        setFilteredConversations(deduplicated);
+        await saveAsyncStorageConversations(deduplicated);
+        setIsLoading(false);
+        return;
+      }
+      
+      // ❌ Both API and fallbacks are empty - show empty state
+      setConversations([]);
+      setFilteredConversations([]);
       setIsLoading(false);
     }
   };
@@ -351,76 +414,15 @@ export default function ConversationsScreen() {
   useEffect(() => {
     // Only load conversations if user is authenticated and database is initialized
     if (user && dbInitialized) {
-      const loadData = async () => {
-        try {
-          // Check if database is empty (first-time user)
-          const isEmpty = await isDatabaseEmpty();
-          
-          if (isEmpty) {
-            // First-time user: Fetch from API first, then save to SQLite
-            if (__DEV__) {
-              console.log('[Conversations] First-time user detected, fetching from API...');
-            }
-            setIsLoading(true);
-            
-            const syncResult = await syncConversations();
-            
-            if (syncResult.success) {
-              // Load from database after sync
-              const synced = await loadCachedConversations();
-              if (synced.length > 0) {
-                const deduplicated = deduplicateConversations(synced);
-                setConversations(deduplicated);
-                setFilteredConversations(deduplicated);
-              }
-              setIsLoading(false);
-            } else {
-              // Fallback to regular API load if sync fails
-              await loadConversations();
-            }
-          } else {
-            // Returning user: Load from SQLite instantly
-            if (__DEV__) {
-              console.log('[Conversations] Returning user, loading from SQLite...');
-            }
-            loadCachedConversations().then(cached => {
-              if (cached.length > 0) {
-                const deduplicated = deduplicateConversations(cached);
-                setConversations(deduplicated);
-                setFilteredConversations(deduplicated);
-                setIsLoading(false);
-              } else {
-                // If no cached data, fetch from API
-                loadConversations();
-              }
-            });
-            
-            // Then sync from API in background (will update database if successful)
-            syncConversations().then(result => {
-              if (result.success) {
-                // Reload from database to get synced data
-                loadCachedConversations().then(synced => {
-                  if (synced.length > 0) {
-                    const deduplicated = deduplicateConversations(synced);
-                    setConversations(deduplicated);
-                    setFilteredConversations(deduplicated);
-                  }
-                });
-              }
-            }).catch((error) => {
-              if (__DEV__) {
-                console.error('[Conversations] Background sync failed:', error);
-              }
-            });
-          }
-        } catch (error) {
-          console.error('[Conversations] Error in loadData:', error);
-          // Fallback to regular API load
-          await loadConversations();
-        }
-      };
-      
-      loadData();
+      // ✅ STAGGERED LOADING: Load immediately (default tab, no delay)
+      setIsLoading(true);
+      // Small delay to ensure database is fully ready
+      setTimeout(() => {
+        loadConversations().catch((error) => {
+          console.error('[Conversations] Error in loadConversations:', error);
+          setIsLoading(false);
+        });
+      }, 100); // 100ms delay for conversations (default tab)
       
       // Request notification permissions when the app loads
       requestPermissions();
@@ -434,25 +436,10 @@ export default function ConversationsScreen() {
     useCallback(() => {
       // Only reload if user is authenticated and database is initialized
       if (user && dbInitialized) {
-        // Load from local DB first for instant display
-        loadCachedConversations().then(cached => {
-          if (cached.length > 0) {
-            const deduplicated = deduplicateConversations(cached);
-            setConversations(deduplicated);
-            setFilteredConversations(deduplicated);
-          }
-        });
-        
-        // Then sync in background
-        syncConversations().then(result => {
-          if (result.success) {
-            loadCachedConversations().then(synced => {
-              if (synced.length > 0) {
-                const deduplicated = deduplicateConversations(synced);
-                setConversations(deduplicated);
-                setFilteredConversations(deduplicated);
-              }
-            });
+        // ✅ API-FIRST: Try API first, fallback to cache only if API fails
+        loadConversations().catch((error) => {
+          if (__DEV__) {
+            console.error('[Conversations] Background refresh failed:', error);
           }
         });
       }

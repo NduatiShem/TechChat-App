@@ -5,7 +5,10 @@ import {
     getDb,
     saveConversations,
     saveMessages,
-    updateSyncState
+    updateSyncState,
+    writeQueue,
+    retryWithBackoff,
+    validateDatabase
 } from './database';
 
 // Sync lock mechanism to prevent concurrent syncs
@@ -23,11 +26,18 @@ const MESSAGE_SYNC_DEBOUNCE_MS = 1000; // Wait 1 second between message syncs fo
 /**
  * Remove messages that exist locally but were deleted on the server
  * This detects hard-deleted messages (not soft-deleted) that are missing from API response
+ * 
+ * ✅ CRITICAL PROTECTIONS:
+ * - Never delete pending/failed messages (still being sent)
+ * - Never delete messages sent by current user (user's sent messages)
+ * - Never delete recent messages (< 1 hour old, pagination protection)
+ * - Only delete old synced messages confirmed deleted on server
  */
 async function removeDeletedMessages(
   conversationId: number,
   conversationType: 'individual' | 'group',
-  serverIdsFromAPI: number[]
+  serverIdsFromAPI: number[],
+  currentUserId: number
 ): Promise<number> {
   try {
     const database = await getDb();
@@ -35,12 +45,39 @@ async function removeDeletedMessages(
       return 0;
     }
     
-    // Get all local messages with server_id for this conversation
-    const localMessages = await database.getAllAsync<DatabaseMessage>(
-      `SELECT id, server_id FROM messages 
-       WHERE conversation_id = ? AND conversation_type = ? AND server_id IS NOT NULL`,
-      [conversationId, conversationType]
-    );
+    // ✅ CRITICAL FIX: Put read operation through queue to prevent concurrent access
+    const dbRef = database;
+    const localMessages = await retryWithBackoff(async () => {
+      return await writeQueue.enqueue(async () => {
+        // Re-validate database inside callback
+        let dbToUse = dbRef;
+        if (!dbToUse) {
+          dbToUse = await getDb();
+          if (!dbToUse) {
+            return [];
+          }
+        }
+        
+        // Validate database is still valid
+        const isValid = await validateDatabase(dbToUse);
+        if (!isValid || !dbToUse) {
+          return [];
+        }
+        
+        const validDb = dbToUse;
+        
+        // ✅ CRITICAL FIX: Only get messages that are SYNCED (not pending/failed)
+        // We should NEVER delete messages that are pending or failed - they're still being sent!
+        return await validDb.getAllAsync<DatabaseMessage & { created_at: string; sender_id: number; sync_status: string }>(
+          `SELECT id, server_id, created_at, sender_id, sync_status FROM messages 
+           WHERE conversation_id = ? 
+           AND conversation_type = ? 
+           AND server_id IS NOT NULL
+           AND sync_status = 'synced'`,
+          [conversationId, conversationType]
+        );
+      });
+    });
     
     if (localMessages.length === 0) {
       return 0;
@@ -49,10 +86,43 @@ async function removeDeletedMessages(
     // Create set of server IDs from API for quick lookup
     const apiServerIds = new Set(serverIdsFromAPI);
     
-    // Find messages that exist locally but not in API (deleted on server)
-    const messagesToDelete = localMessages.filter(msg => 
-      msg.server_id && !apiServerIds.has(msg.server_id)
-    );
+    // ✅ CRITICAL FIX: Only delete messages that:
+    // 1. Are synced (already sent successfully)
+    // 2. Are NOT in the API response (deleted on server)
+    // 3. Are NOT sent by current user (protect user's sent messages)
+    // 4. Are older than 1 hour (protect recent messages from pagination issues)
+    const now = Date.now();
+    const ONE_HOUR = 60 * 60 * 1000;
+    
+    const messagesToDelete = localMessages.filter(msg => {
+      // Must have server_id and not be in API response
+      if (!msg.server_id || apiServerIds.has(msg.server_id)) {
+        return false;
+      }
+      
+      // ✅ PROTECT: Never delete messages sent by current user
+      // User's sent messages should never be deleted, even if not in API response
+      // (could be pagination issue, API caching, etc.)
+      if (msg.sender_id === currentUserId) {
+        if (__DEV__) {
+          console.log(`[Sync] Protecting user's sent message from deletion: ${msg.server_id}`);
+        }
+        return false; // Never delete user's sent messages
+      }
+      
+      // ✅ PROTECT: Don't delete messages created within last hour
+      // This protects against pagination issues and API timing problems
+      const messageAge = now - new Date(msg.created_at).getTime();
+      if (messageAge < ONE_HOUR) {
+        if (__DEV__) {
+          console.log(`[Sync] Protecting recent message from deletion: ${msg.server_id} (${Math.round(messageAge / 1000 / 60)}min old)`);
+        }
+        return false; // Too recent, might be pagination issue
+      }
+      
+      // ✅ SAFE TO DELETE: Old synced message, not sent by user, not in API
+      return true;
+    });
     
     if (messagesToDelete.length === 0) {
       return 0;
@@ -63,6 +133,9 @@ async function removeDeletedMessages(
       try {
         await deleteMessage(msg.server_id!, msg.id);
         deletedCount++;
+        if (__DEV__) {
+          console.log(`[Sync] Deleted message ${msg.server_id} (not in API, old enough, not user's)`);
+        }
       } catch (error) {
         // Log but continue deleting other messages
         if (__DEV__) {
@@ -161,7 +234,7 @@ export async function syncConversationMessages(
       
       // Remove messages that exist locally but were deleted on the server
       const serverIds = messagesToSave.map(msg => msg.server_id!).filter(Boolean);
-      const deletedCount = await removeDeletedMessages(conversationId, conversationType, serverIds);
+      const deletedCount = await removeDeletedMessages(conversationId, conversationType, serverIds, currentUserId);
       
       await updateSyncState(conversationId, conversationType, 'synced');
 
@@ -283,7 +356,8 @@ export async function syncOlderMessages(
   conversationId: number,
   conversationType: 'individual' | 'group',
   page: number = 1,
-  perPage: number = 50
+  perPage: number = 50,
+  currentUserId: number = 0
 ): Promise<{ success: boolean; messagesCount: number; deletedCount?: number; hasMore: boolean; error?: string }> {
   try {
     let response;
@@ -330,7 +404,7 @@ export async function syncOlderMessages(
     // Note: For pagination, we only check deletions for the current page's messages
     // Full deletion check should be done in syncConversationMessages (page 1)
     const serverIds = messagesToSave.map(msg => msg.server_id!).filter(Boolean);
-    const deletedCount = await removeDeletedMessages(conversationId, conversationType, serverIds);
+    const deletedCount = await removeDeletedMessages(conversationId, conversationType, serverIds, currentUserId);
 
     if (__DEV__) {
       console.log(`[Sync] Synced ${messagesToSave.length} older messages, removed ${deletedCount} deleted messages for ${conversationType} ${conversationId}`);
@@ -344,12 +418,12 @@ export async function syncOlderMessages(
   }
 }
 
-export async function backgroundSync(activeConversationId?: number, activeConversationType?: 'individual' | 'group'): Promise<void> {
+export async function backgroundSync(activeConversationId?: number, activeConversationType?: 'individual' | 'group', currentUserId: number = 0): Promise<void> {
   try {
     await syncConversations();
 
     if (activeConversationId && activeConversationType) {
-      await syncConversationMessages(activeConversationId, activeConversationType, 0);
+      await syncConversationMessages(activeConversationId, activeConversationType, currentUserId);
     }
   } catch (error) {
     console.error('[Sync] Error in background sync:', error);

@@ -1,11 +1,13 @@
-import LastMessagePreview from '@/components/LastMessagePreview';
 import GroupAvatar from '@/components/GroupAvatar';
+import LastMessagePreview from '@/components/LastMessagePreview';
 import { useAuth } from '@/context/AuthContext';
 import { useNotifications } from '@/context/NotificationContext';
 import { useTheme } from '@/context/ThemeContext';
 import { groupsAPI } from '@/services/api';
-import { getGroups as getDbGroups, initDatabase, saveConversations as saveDbGroups } from '@/services/database';
+import { getGroups as getDbGroups, initDatabase, saveGroups as saveDbGroups } from '@/services/database';
 import { MaterialCommunityIcons } from '@expo/vector-icons';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import NetInfo from '@react-native-community/netinfo';
 import { useFocusEffect } from '@react-navigation/native';
 import { router } from 'expo-router';
 import React, { useEffect, useState } from 'react';
@@ -20,8 +22,9 @@ import {
   View,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import NetInfo from '@react-native-community/netinfo';
-// Removed AsyncStorage import - groups now stored in SQLite only
+
+// Hybrid Cache Strategy: AsyncStorage (fast) + SQLite (persistent) + API (source of truth)
+const GROUPS_CACHE_KEY = '@techchat_groups';
 
 interface Group {
   id: number;
@@ -46,8 +49,6 @@ interface Group {
 export const options = {
   title: "Groups",
 };
-
-// Removed GROUPS_CACHE_KEY - groups now stored in SQLite only
 
 export default function GroupsScreen() {
   const [groups, setGroups] = useState<Group[]>([]);
@@ -85,7 +86,32 @@ export default function GroupsScreen() {
     };
   }, []);
 
-  // Load groups from SQLite (local-first)
+  // ✅ HYBRID CACHE: Load from AsyncStorage (fastest, instant display)
+  const loadAsyncStorageGroups = async (): Promise<Group[]> => {
+    try {
+      const cachedData = await AsyncStorage.getItem(GROUPS_CACHE_KEY);
+      if (!cachedData) return [];
+      
+      const groups = JSON.parse(cachedData);
+      if (!Array.isArray(groups)) return [];
+      
+      return groups;
+    } catch (error) {
+      console.error('[Groups] Error loading from AsyncStorage:', error);
+      return [];
+    }
+  };
+
+  // ✅ HYBRID CACHE: Save to AsyncStorage (fast cache layer)
+  const saveAsyncStorageGroups = async (groups: Group[]): Promise<void> => {
+    try {
+      await AsyncStorage.setItem(GROUPS_CACHE_KEY, JSON.stringify(groups));
+    } catch (error) {
+      console.error('[Groups] Error saving to AsyncStorage:', error);
+    }
+  };
+
+  // Load groups from SQLite (persistent storage)
   const loadCachedGroups = async (): Promise<Group[]> => {
     try {
       if (!dbInitialized) return [];
@@ -94,10 +120,10 @@ export default function GroupsScreen() {
       
       // Transform database format to UI format
       return dbGroups.map(group => ({
-        id: group.group_id || group.conversation_id,
+        id: group.id,
         name: group.name,
-        description: undefined,
-        owner_id: 0, // Not stored in conversations table
+        description: group.description || undefined,
+        owner_id: group.owner_id || 0,
         last_message: group.last_message || undefined,
         last_message_date: group.last_message_date || undefined,
         created_at: group.created_at,
@@ -112,23 +138,52 @@ export default function GroupsScreen() {
   };
 
   const loadGroups = async (forceRefresh = false) => {
-    // If offline, load from SQLite only
+    // ✅ API-FIRST STRATEGY: Try API first, fallback to AsyncStorage/SQLite only if API fails
+    // Only show empty state if API returns empty AND all fallbacks are empty AND requests completed successfully
+    
+    // If offline and not forcing refresh, use cached data only
     if (!isOnline && !forceRefresh) {
-      const cachedGroups = await loadCachedGroups();
-      if (cachedGroups.length > 0) {
-        setGroups(cachedGroups);
-        setFilteredGroups(cachedGroups);
+      // Try AsyncStorage first
+      const asyncStorageGroups = await loadAsyncStorageGroups();
+      if (asyncStorageGroups.length > 0) {
+        setGroups(asyncStorageGroups);
+        setFilteredGroups(asyncStorageGroups);
         setIsLoading(false);
         return;
       }
+      
+      // Try SQLite as fallback
+      const sqliteGroups = await loadCachedGroups();
+      if (sqliteGroups.length > 0) {
+        setGroups(sqliteGroups);
+        setFilteredGroups(sqliteGroups);
+        await saveAsyncStorageGroups(sqliteGroups);
+        setIsLoading(false);
+        return;
+      }
+      
+      // Both empty - show empty state
+      setGroups([]);
+      setFilteredGroups([]);
+      setIsLoading(false);
+      return;
     }
 
+    // STEP 1: Try API first (source of truth)
+    let apiSuccess = false;
+    let apiGroups: Group[] = [];
+    let apiError: any = null;
+    
     try {
       const response = await groupsAPI.getAll();
       const groupsData = response.data;
       
       // Ensure groupsData is always an array
       const safeGroupsData = Array.isArray(groupsData) ? groupsData : [];
+      
+      // Mark API as successful
+      apiSuccess = true;
+      apiGroups = safeGroupsData;
       
       // Sync unread counts from backend to notification context
       if (safeGroupsData.length > 0) {
@@ -140,23 +195,21 @@ export default function GroupsScreen() {
         updateGroupUnreadCount(totalGroupUnread);
       }
       
-      setGroups(safeGroupsData);
-      setFilteredGroups(safeGroupsData);
+      // Save to both AsyncStorage (fast) and SQLite (persistent)
+      await saveAsyncStorageGroups(safeGroupsData);
       
       // Save groups to SQLite for offline access
       if (dbInitialized) {
         try {
           const groupsToSave = safeGroupsData.map((group: any) => ({
-            conversation_id: group.id,
-            conversation_type: 'group' as const,
-            group_id: group.id,
+            id: group.id,
             name: group.name || 'Unknown Group',
-            email: undefined,
-            avatar_url: group.avatar_url,
-            last_message: group.last_message,
-            last_message_date: group.last_message_date || group.updated_at,
-            last_message_sender_id: undefined,
-            last_message_read_at: undefined,
+            description: group.description || null,
+            owner_id: group.owner_id || null,
+            avatar_url: group.avatar_url || null,
+            member_count: group.users?.length || group.member_count || 0,
+            last_message: group.last_message || null,
+            last_message_date: group.last_message_date || group.updated_at || null,
             unread_count: group.unread_count ?? 0,
             created_at: group.created_at || new Date().toISOString(),
             updated_at: group.updated_at || group.last_message_date || new Date().toISOString(),
@@ -166,18 +219,41 @@ export default function GroupsScreen() {
           console.error('[Groups] Error saving to database:', dbError);
         }
       }
-    } catch {
-      // Failed to load groups - try to load from SQLite
-      const cachedGroups = await loadCachedGroups();
-      if (cachedGroups.length > 0) {
-        setGroups(cachedGroups);
-        setFilteredGroups(cachedGroups);
-      } else {
-        // No cache available - set empty array
-        setGroups([]);
-        setFilteredGroups([]);
+    } catch (error: any) {
+      apiError = error;
+      console.error('Failed to load groups from API:', error);
+    }
+    
+    // STEP 2: Handle API result or fallback to AsyncStorage/SQLite
+    if (apiSuccess) {
+      // ✅ API succeeded - use API data (even if empty, it's the truth)
+      setGroups(apiGroups);
+      setFilteredGroups(apiGroups);
+      setIsLoading(false);
+    } else {
+      // ❌ API failed - fallback to AsyncStorage → SQLite
+      // Try AsyncStorage first
+      const asyncStorageGroups = await loadAsyncStorageGroups();
+      if (asyncStorageGroups.length > 0) {
+        setGroups(asyncStorageGroups);
+        setFilteredGroups(asyncStorageGroups);
+        setIsLoading(false);
+        return;
       }
-    } finally {
+      
+      // Try SQLite fallback
+      const sqliteGroups = await loadCachedGroups();
+      if (sqliteGroups.length > 0) {
+        setGroups(sqliteGroups);
+        setFilteredGroups(sqliteGroups);
+        await saveAsyncStorageGroups(sqliteGroups);
+        setIsLoading(false);
+        return;
+      }
+      
+      // ❌ Both API and fallbacks are empty - show empty state
+      setGroups([]);
+      setFilteredGroups([]);
       setIsLoading(false);
     }
   };
@@ -228,30 +304,32 @@ export default function GroupsScreen() {
   useEffect(() => {
     // Only load groups if user is authenticated and database is initialized
     if (user && dbInitialized) {
-      // First try to load from SQLite for instant display
-      loadCachedGroups().then(cached => {
-        if (cached.length > 0) {
-          setGroups(cached);
-          setFilteredGroups(cached);
+      // ✅ STAGGERED LOADING: Delay to prevent concurrent database access
+      setIsLoading(true);
+      setTimeout(() => {
+        loadGroups().catch((error) => {
+          console.error('[Groups] Error in loadGroups:', error);
           setIsLoading(false);
-        }
-      });
-      
-      // Then load from API (will update SQLite if successful)
-      loadGroups();
+        });
+      }, 300); // 300ms delay for groups (staggered from conversations)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [user]); // loadGroups is stable, no need to include
+  }, [user, dbInitialized]); // loadGroups is stable, no need to include
 
   // Refresh groups when screen comes into focus
   useFocusEffect(
     React.useCallback(() => {
-      // Only reload if user is authenticated
-      if (user) {
-        loadGroups();
+      // Only reload if user is authenticated and database is initialized
+      if (user && dbInitialized) {
+        // ✅ API-FIRST: Try API first, fallback to cache only if API fails
+        loadGroups().catch((error) => {
+          if (__DEV__) {
+            console.error('[Groups] Background refresh failed:', error);
+          }
+        });
       }
       // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [user]) // loadGroups is stable, no need to include
+    }, [user, dbInitialized]) // loadGroups is stable, no need to include
   );
 
   const formatDate = (dateString: string | null | undefined): string => {
@@ -321,13 +399,13 @@ export default function GroupsScreen() {
               {item.name ? String(item.name) : ' '}
             </Text>
             {/* Show unread count on the right side - like WhatsApp */}
-            {item.unread_count > 0 && (
+            {(item.unread_count ?? 0) > 0 && (
               <View 
                 className="ml-2 h-5 px-1.5 rounded-full bg-green-500 items-center justify-center"
                 style={{ minWidth: 20 }}
               >
                 <Text className="text-white text-xs font-bold">
-                  {item.unread_count > 99 ? '99+' : item.unread_count.toString()}
+                  {(item.unread_count ?? 0) > 99 ? '99+' : (item.unread_count ?? 0).toString()}
                 </Text>
               </View>
             )}

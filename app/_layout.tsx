@@ -13,6 +13,8 @@ import { ActivityIndicator, AppState, View } from "react-native";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 import { useBackgroundUpdateCheck } from "@/hooks/useBackgroundUpdateCheck";
 import { UpdateNotification } from "@/components/UpdateNotification";
+import { startRetryService, retryPendingMessages } from "@/services/messageRetryService";
+import { initDatabase } from "@/services/database";
 import "../global.css";
 
 // Prevent splash screen from auto-hiding
@@ -25,6 +27,7 @@ function AppTabsLayout() {
   const pathname = usePathname();
   const isDark = currentTheme === 'dark';
   const lastSeenIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const retryServiceStartedRef = useRef(false);
   const ENABLE_UNREAD_SYNC = false; // Temporarily disabled until v1.2.0
 
   // Hide tab bar in chat screens
@@ -98,6 +101,48 @@ function AppTabsLayout() {
     }
   };
 
+  // Initialize database and start retry service globally when authenticated
+  useEffect(() => {
+    if (!isAuthenticated || retryServiceStartedRef.current) return;
+    
+    const initializeServices = async () => {
+      try {
+        // CRITICAL FIX: Wait for database to be fully initialized
+        let db = await initDatabase();
+        let retries = 0;
+        while (!db && retries < 5) {
+          await new Promise(resolve => setTimeout(resolve, 200));
+          db = await initDatabase();
+          retries++;
+        }
+        
+        if (db) {
+          console.log('[AppTabsLayout] Database initialized, starting retry service');
+          // ✅ STAGGERED LOADING: Delay retry service to prevent concurrent database access
+          setTimeout(() => {
+            // Start retry service globally - this ensures pending messages are retried
+            // even when user is not in a chat screen
+            startRetryService(30000); // Retry every 30 seconds
+            retryServiceStartedRef.current = true;
+            
+            // Also retry immediately after delay to catch any pending messages from previous session
+            setTimeout(() => {
+              retryPendingMessages().catch(err => {
+                console.error('[AppTabsLayout] Error in initial retry:', err);
+              });
+            }, 1000); // Wait 1 second after service starts
+          }, 800); // 800ms delay for retry service (after screens start loading)
+        } else {
+          console.error('[AppTabsLayout] Database initialization failed after retries, retry service not started');
+        }
+      } catch (error) {
+        console.error('[AppTabsLayout] Error initializing services:', error);
+      }
+    };
+    
+    initializeServices();
+  }, [isAuthenticated]);
+
   // Handle app state changes for badge management and last_seen updates
   useEffect(() => {
     if (!isAuthenticated) return; // Don't set up if not authenticated
@@ -112,6 +157,14 @@ function AppTabsLayout() {
           syncUnreadCount().catch(err => console.error('syncUnreadCount error:', err));
           // Load groups to update group counter when app becomes active
           loadGroupsForCounter().catch(err => console.error('loadGroupsForCounter error:', err));
+          
+          // CRITICAL: Retry pending messages immediately when app comes to foreground
+          // This ensures messages are sent even if retry service was stopped
+          if (retryServiceStartedRef.current) {
+            retryPendingMessages().catch(err => {
+              console.error('[AppTabsLayout] Error retrying messages on foreground:', err);
+            });
+          }
           
           // Set up periodic updates every 2 minutes while app is active
           if (lastSeenIntervalRef.current) {

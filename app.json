@@ -20,7 +20,8 @@
       "bundleIdentifier": "com.techchat.app",
       "infoPlist": {
         "UIBackgroundModes": [
-          "remote-notification"
+          "remote-notification",
+          "fetch"
         ]
       }
     },

@@ -12,13 +12,14 @@ import { useAuth } from '@/context/AuthContext';
 import { useNotifications } from '@/context/NotificationContext';
 import { useTheme } from '@/context/ThemeContext';
 import { groupsAPI, messagesAPI, usersAPI } from '@/services/api';
-import { deleteMessage as deleteDbMessage, fixDuplicateMessagesWithWrongTimestamps, getDb, getMessages as getDbMessages, hasMessagesForConversation, initDatabase, saveMessages as saveDbMessages, updateMessageByServerId, updateMessageStatus } from '@/services/database';
-import { startRetryService } from '@/services/messageRetryService';
+import { deleteMessage as deleteDbMessage, getDb, getMessages as getDbMessages, hasMessagesForConversation, initDatabase, saveMessages as saveDbMessages, updateMessageByServerId, updateMessageStatus } from '@/services/database';
+import { startRetryService, retryPendingMessages, markMessageAsSending, unmarkMessageAsSending, isMessageBeingSent, getMessagesBeingSent } from '@/services/messageRetryService';
 import { syncConversationMessages } from '@/services/syncService';
 import { isVideoAttachment } from '@/utils/textUtils';
 import { MaterialCommunityIcons, MaterialIcons } from '@expo/vector-icons';
 import { useFocusEffect } from '@react-navigation/native';
 import { Picker } from 'emoji-mart-native';
+import NetInfo from '@react-native-community/netinfo';
 import * as DocumentPicker from 'expo-document-picker';
 import * as FileSystem from 'expo-file-system/legacy';
 import * as ImagePicker from 'expo-image-picker';
@@ -26,20 +27,20 @@ import { router, useLocalSearchParams } from 'expo-router';
 import * as Sharing from 'expo-sharing';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
-    ActivityIndicator,
-    Alert,
-    BackHandler,
-    FlatList,
-    Image,
-    Keyboard,
-    KeyboardAvoidingView,
-    Modal,
-    Platform,
-    StatusBar,
-    Text,
-    TextInput,
-    TouchableOpacity,
-    View
+  ActivityIndicator,
+  Alert,
+  BackHandler,
+  FlatList,
+  Image,
+  Keyboard,
+  KeyboardAvoidingView,
+  Modal,
+  Platform,
+  StatusBar,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  View
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
@@ -157,7 +158,18 @@ export default function GroupChatScreen() {
         const existingById = seenById.get(msg.id);
         
         if (existingById) {
-          // Same ID exists - prefer the one with synced status or more complete data
+          // Same ID exists - check if they're truly identical (exact duplicate)
+          const isIdentical = 
+            (existingById.message || '') === (msg.message || '') &&
+            existingById.sender_id === msg.sender_id &&
+            existingById.created_at === msg.created_at;
+          
+          if (isIdentical) {
+            // Truly identical - skip this duplicate
+            continue;
+          }
+          
+          // Same ID but different content - prefer the one with synced status or more complete data
           const existingIsBetter = 
             (existingById.sync_status === 'synced' && msg.sync_status !== 'synced') ||
             (existingById.attachments && !msg.attachments) ||
@@ -175,6 +187,9 @@ export default function GroupChatScreen() {
         
         // New ID, add it
         seenById.set(msg.id, msg);
+        // CRITICAL FIX: Also add to seenMessages immediately so content+sender check can find it
+        const messageKey = `${msg.id}_${msg.created_at}_${msg.message || ''}`;
+        seenMessages.set(messageKey, msg);
       }
       
       // Secondary deduplication: Check by content+sender for messages with same content
@@ -184,79 +199,71 @@ export default function GroupChatScreen() {
       const messageTime = new Date(msg.created_at).getTime();
       const senderId = msg.sender_id;
       
-      // Check if we already have this message by content+sender
+      // CRITICAL FIX: Check BOTH seenById AND seenMessages for content+sender duplicates
+      // This ensures we catch duplicates even if one is in seenById and one is in seenMessages
       let foundDuplicate = false;
-      for (const [key, existing] of seenMessages.entries()) {
+      
+      // First check seenById for duplicates (messages with IDs)
+      for (const existing of seenById.values()) {
+        if (existing.id === msg.id) continue; // Skip self
         const existingTime = new Date(existing.created_at).getTime();
         const timeDiff = Math.abs(existingTime - messageTime);
         const contentMatch = (existing.message || '') === messageContent;
         const senderMatch = existing.sender_id === senderId;
         
-        // CRITICAL FIX: For messages with same content+sender, check if they're duplicates
-        // regardless of timestamp if:
-        // 1. Both have server_id (synced messages) - match by content+sender only
-        // 2. One has tempLocalId and one has server_id - match if within reasonable time window
         if (contentMatch && senderMatch) {
           const msgHasServerId = msg.id && typeof msg.id === 'number' && msg.id < 1000000000000;
           const existingHasServerId = existing.id && typeof existing.id === 'number' && existing.id < 1000000000000;
           
-          // Case 1: Both have server_id - match regardless of timestamp (they're the same message)
+          // Case 1: Both have server_id - match regardless of timestamp
           if (msgHasServerId && existingHasServerId) {
-            // Same content, same sender, both synced - they're duplicates
-            // Prefer the one with more recent timestamp or better sync status
+            // Prefer the one with better sync status or newer timestamp
             if (msg.sync_status === 'synced' && existing.sync_status !== 'synced') {
-              seenMessages.delete(key);
+              seenById.delete(existing.id);
+              seenById.set(msg.id, msg);
+              const existingKey = `${existing.id}_${existing.created_at}_${messageContent}`;
               const newKey = `${msg.id}_${msg.created_at}_${messageContent}`;
+              seenMessages.delete(existingKey);
               seenMessages.set(newKey, msg);
-              if (existing.id && seenById.has(existing.id)) {
-                seenById.delete(existing.id);
-                seenById.set(msg.id, msg);
-              }
             } else if (messageTime > existingTime && msg.sync_status === 'synced') {
-              // Prefer newer timestamp if both are synced
-              seenMessages.delete(key);
+              seenById.delete(existing.id);
+              seenById.set(msg.id, msg);
+              const existingKey = `${existing.id}_${existing.created_at}_${messageContent}`;
               const newKey = `${msg.id}_${msg.created_at}_${messageContent}`;
+              seenMessages.delete(existingKey);
               seenMessages.set(newKey, msg);
-              if (existing.id && seenById.has(existing.id)) {
-                seenById.delete(existing.id);
-                seenById.set(msg.id, msg);
-              }
             }
             foundDuplicate = true;
             break;
           }
           
           // Case 2: One has tempLocalId, one has server_id - match if within 10 minutes
-          // (allows for network delays and clock differences)
           if ((msgHasServerId && !existingHasServerId) || (!msgHasServerId && existingHasServerId)) {
             if (timeDiff < 600000) { // 10 minutes window
-              // Prefer the one with server_id (synced) over tempLocalId (pending)
+              // Prefer the one with server_id (synced)
               if (msg.sync_status === 'synced' && existing.sync_status !== 'synced') {
-                seenMessages.delete(key);
+                seenById.delete(existing.id);
+                seenById.set(msg.id, msg);
+                const existingKey = `${existing.id}_${existing.created_at}_${messageContent}`;
                 const newKey = `${msg.id}_${msg.created_at}_${messageContent}`;
+                seenMessages.delete(existingKey);
                 seenMessages.set(newKey, msg);
-                if (existing.id && seenById.has(existing.id)) {
-                  seenById.delete(existing.id);
-                  seenById.set(msg.id, msg);
-                }
               }
               foundDuplicate = true;
               break;
             }
           }
           
-          // Case 3: Both have tempLocalId - match if within 5 seconds (same send attempt)
+          // Case 3: Both have tempLocalId - match if within 5 seconds
           if (!msgHasServerId && !existingHasServerId) {
             if (timeDiff < 5000) {
-              // Prefer the one with better sync status
               if (msg.sync_status === 'synced' && existing.sync_status !== 'synced') {
-                seenMessages.delete(key);
+                seenById.delete(existing.id);
+                seenById.set(msg.id, msg);
+                const existingKey = `${existing.id}_${existing.created_at}_${messageContent}`;
                 const newKey = `${msg.id}_${msg.created_at}_${messageContent}`;
+                seenMessages.delete(existingKey);
                 seenMessages.set(newKey, msg);
-                if (existing.id && seenById.has(existing.id)) {
-                  seenById.delete(existing.id);
-                  seenById.set(msg.id, msg);
-                }
               }
               foundDuplicate = true;
               break;
@@ -265,11 +272,92 @@ export default function GroupChatScreen() {
         }
       }
       
+      // Then check seenMessages for duplicates (if not found in seenById)
       if (!foundDuplicate) {
-        // Create composite key for deduplication
-        const messageKey = msg.id 
-          ? `${msg.id}_${msg.created_at}_${messageContent}` 
-          : `${msg.created_at}_${messageContent}_${senderId}`;
+        for (const [key, existing] of seenMessages.entries()) {
+          const existingTime = new Date(existing.created_at).getTime();
+          const timeDiff = Math.abs(existingTime - messageTime);
+          const contentMatch = (existing.message || '') === messageContent;
+          const senderMatch = existing.sender_id === senderId;
+          
+          // CRITICAL FIX: For messages with same content+sender, check if they're duplicates
+          // regardless of timestamp if:
+          // 1. Both have server_id (synced messages) - match by content+sender only
+          // 2. One has tempLocalId and one has server_id - match if within reasonable time window
+          if (contentMatch && senderMatch) {
+            const msgHasServerId = msg.id && typeof msg.id === 'number' && msg.id < 1000000000000;
+            const existingHasServerId = existing.id && typeof existing.id === 'number' && existing.id < 1000000000000;
+            
+            // Case 1: Both have server_id - match regardless of timestamp (they're the same message)
+            if (msgHasServerId && existingHasServerId) {
+              // Same content, same sender, both synced - they're duplicates
+              // Prefer the one with more recent timestamp or better sync status
+              if (msg.sync_status === 'synced' && existing.sync_status !== 'synced') {
+                seenMessages.delete(key);
+                const newKey = `${msg.id}_${msg.created_at}_${messageContent}`;
+                seenMessages.set(newKey, msg);
+                if (existing.id && seenById.has(existing.id)) {
+                  seenById.delete(existing.id);
+                  seenById.set(msg.id, msg);
+                }
+              } else if (messageTime > existingTime && msg.sync_status === 'synced') {
+                // Prefer newer timestamp if both are synced
+                seenMessages.delete(key);
+                const newKey = `${msg.id}_${msg.created_at}_${messageContent}`;
+                seenMessages.set(newKey, msg);
+                if (existing.id && seenById.has(existing.id)) {
+                  seenById.delete(existing.id);
+                  seenById.set(msg.id, msg);
+                }
+              }
+              foundDuplicate = true;
+              break;
+            }
+            
+            // Case 2: One has tempLocalId, one has server_id - match if within 10 minutes
+            // (allows for network delays and clock differences)
+            if ((msgHasServerId && !existingHasServerId) || (!msgHasServerId && existingHasServerId)) {
+              if (timeDiff < 600000) { // 10 minutes window
+                // Prefer the one with server_id (synced) over tempLocalId (pending)
+                if (msg.sync_status === 'synced' && existing.sync_status !== 'synced') {
+                  seenMessages.delete(key);
+                  const newKey = `${msg.id}_${msg.created_at}_${messageContent}`;
+                  seenMessages.set(newKey, msg);
+                  if (existing.id && seenById.has(existing.id)) {
+                    seenById.delete(existing.id);
+                    seenById.set(msg.id, msg);
+                  }
+                }
+                foundDuplicate = true;
+                break;
+              }
+            }
+            
+            // Case 3: Both have tempLocalId - match if within 5 seconds (same send attempt)
+            if (!msgHasServerId && !existingHasServerId) {
+              if (timeDiff < 5000) {
+                // Prefer the one with better sync status
+                if (msg.sync_status === 'synced' && existing.sync_status !== 'synced') {
+                  seenMessages.delete(key);
+                  const newKey = `${msg.id}_${msg.created_at}_${messageContent}`;
+                  seenMessages.set(newKey, msg);
+                  if (existing.id && seenById.has(existing.id)) {
+                    seenById.delete(existing.id);
+                    seenById.set(msg.id, msg);
+                  }
+                }
+                foundDuplicate = true;
+                break;
+              }
+            }
+          }
+        }
+      }
+      
+      // Only add to seenMessages if not already added (messages with IDs are already added above)
+      if (!foundDuplicate && (!msg.id || msg.id === undefined || msg.id === null || msg.id === 0)) {
+        // Create composite key for deduplication (only for messages without IDs)
+        const messageKey = `${msg.created_at}_${messageContent}_${senderId}`;
         seenMessages.set(messageKey, msg);
       }
     }
@@ -351,19 +439,25 @@ export default function GroupChatScreen() {
   const isPaginatingRef = useRef<boolean>(false); // Track if user is currently paginating (loading older messages)
   const lastFocusTimeRef = useRef<number>(0); // Track when screen last gained focus
   
-  // Scroll management refs
-  const userScrolledRef = useRef<boolean>(false); // Track if user manually scrolled
+  // Precise scroll position tracking
   const isInitialLoadRef = useRef<boolean>(true); // Track if this is the initial load
-  const lastScrollOffsetRef = useRef<number>(0); // Track last scroll offset to detect user scrolling
-  const shouldAutoScrollRef = useRef<boolean>(true); // Flag to determine if auto-scroll should happen
+  const initialScrollCompleteRef = useRef<boolean>(false); // Track if initial scroll to bottom is complete
+  const lastScrollOffsetRef = useRef<number>(0); // Track last scroll offset for pagination
+  const isAtBottomRef = useRef<boolean>(true); // Track if user is at bottom
+  const lastVisibleMessageIdRef = useRef<number | null>(null); // Track last visible message ID for anchor
+  const needsMarkAsReadRef = useRef<boolean>(false); // Track if mark-read needs retry when network comes back
+  
+  // Precise position tracking refs
+  const viewportHeightRef = useRef<number>(0); // Viewport/window height
+  const lastMessageHeightRef = useRef<number>(0); // Last message bubble height
+  const lastMessageYPositionRef = useRef<number>(0); // Last message's Y position from top of content
+  const targetBottomOffsetRef = useRef<number>(20); // Desired distance from bottom (20px padding)
+  const shouldMaintainPositionRef = useRef<boolean>(false); // Whether to maintain fixed position
+  const messageHeightsRef = useRef<Map<number | string, number>>(new Map()); // Track heights of all messages
   
   // Background sync state - for checking new messages (uses sync service + SQLite)
   const pollingIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const latestMessageIdRef = useRef<number | null>(null); // Track latest message ID to detect new messages
-  const scrollTimeoutRef = useRef<NodeJS.Timeout | null>(null); // Debounced scroll timeout to prevent multiple rapid scrolls
-  const contentSizeRef = useRef<{ width: number; height: number } | null>(null); // Track content size
-  const viewportSizeRef = useRef<{ width: number; height: number } | null>(null); // Track viewport size
-  const hasAttemptedInitialScrollRef = useRef<boolean>(false); // Track if we've attempted initial scroll
   const isPollingRef = useRef<boolean>(false); // Track if sync is active
   const POLLING_INTERVAL = 3000; // Sync every 3 seconds
   const MAX_RETRY_ATTEMPTS = 5; // Maximum retry attempts
@@ -436,117 +530,37 @@ export default function GroupChatScreen() {
   }, [id, dbInitialized]);
 
   // Fetch messages
+  // ✅ API-FIRST STRATEGY: Try API first, fallback to SQLite only if API fails
   const fetchMessages = useCallback(async (showLoading = true) => {
+    setHasScrolledToBottom(false); // Reset scroll flag when fetching new messages
+    
+    // Show loading spinner if requested
+    if (showLoading) {
+      setLoading(true);
+    }
+    
+    // STEP 1: Try API first (source of truth)
+    let apiSuccess = false;
+    let apiMessages: Message[] = [];
+    let apiError: any = null;
+    
     try {
-      if (showLoading) {
-        setLoading(true);
-      }
-      setHasScrolledToBottom(false); // Reset scroll flag when fetching new messages
-      
-      // Check if this is first-time opening this conversation (no messages in DB)
-      if (dbInitialized) {
-        const hasMessages = await hasMessagesForConversation(Number(id), 'group');
-        
-        if (!hasMessages) {
-          // First-time: Fetch from API first, then save to SQLite
-          if (__DEV__) {
-            console.log('[GroupChat] First-time opening conversation, fetching from API...');
-          }
-          try {
-            const syncResult = await syncConversationMessages(Number(id), 'group', user?.id || 0);
-            if (syncResult.success) {
-              // Fix existing duplicates with wrong timestamps
-              try {
-                const response = await messagesAPI.getByGroup(Number(id), 1, 50);
-                const messagesData = response.data.messages?.data || response.data.messages || [];
-                
-                if (messagesData.length > 0) {
-                  await fixDuplicateMessagesWithWrongTimestamps(
-                    Number(id),
-                    'group',
-                    messagesData.map((msg: any) => ({
-                      id: msg.id,
-                      created_at: msg.created_at,
-                      message: msg.message,
-                      sender_id: msg.sender_id,
-                    }))
-                  );
-                }
-              } catch (cleanupError) {
-                // Silently fail - cleanup is not critical
-                if (__DEV__) {
-                  console.warn('[GroupChat] Error cleaning up duplicates:', cleanupError);
-                }
-              }
-              
-              if (syncResult.newMessagesCount > 0) {
-                // Load from database after sync
-                const syncedMessages = await loadMessagesFromDb(MESSAGES_PER_PAGE, 0);
-                if (syncedMessages.length > 0) {
-                  const sorted = syncedMessages.sort((a, b) => 
-                    new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
-                  );
-                  // Deduplicate before setting
-                  const uniqueMessages = deduplicateMessages(sorted);
-                  setMessages(uniqueMessages);
-                  setLoadedMessagesCount(uniqueMessages.length);
-                  if (uniqueMessages.length > 0) {
-                    const latestMsg = uniqueMessages[uniqueMessages.length - 1];
-                    latestMessageIdRef.current = latestMsg.id;
-                  }
-                }
-              }
-            }
-          } catch (syncError) {
-            console.error('[GroupChat] Error in first-time sync:', syncError);
-          }
-        } else {
-          // Returning: Load from local database for instant display
-          const localMessages = await loadMessagesFromDb(MESSAGES_PER_PAGE, 0);
-          if (localMessages.length > 0) {
-            const sortedMessages = localMessages.sort((a, b) => 
-              new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
-            );
-            // Deduplicate before setting
-            const uniqueMessages = deduplicateMessages(sortedMessages);
-            setMessages(uniqueMessages);
-            setLoadedMessagesCount(uniqueMessages.length);
-            if (showLoading) {
-              setLoading(false);
-            }
-            
-            // Update latest message ID
-            if (uniqueMessages.length > 0) {
-              const latestMsg = uniqueMessages[uniqueMessages.length - 1];
-              latestMessageIdRef.current = latestMsg.id;
-            }
-          }
-        }
-      }
-      
-      // Then sync from API in background (for updates)
-      // Fetch more messages (50) to match syncConversationMessages and ensure all messages are loaded
+      // Fetch messages from API (comprehensive data)
       const response = await messagesAPI.getByGroup(Number(id), 1, 50);
-      // Handle Laravel pagination format
       const messagesData = response.data.messages?.data || response.data.messages || [];
       const pagination = response.data.messages || {};
       
-      // Check if there are more messages using Laravel pagination
       setHasMoreMessages(pagination.current_page < pagination.last_page);
       
       // Process messages to ensure reply_to data is properly structured
-      // If a message has reply_to_id but no reply_to object, we need to find the original message
       const processedMessages = messagesData.map((msg: any) => {
-        // If message already has reply_to object, use it
         if (msg.reply_to) {
           return msg;
         }
         
-        // If message has reply_to_id but no reply_to object, try to find it in the messages list
         if (msg.reply_to_id) {
           const repliedMessage = messagesData.find((m: any) => m.id === msg.reply_to_id);
           if (repliedMessage) {
-            // Construct reply_to object from the found message
             msg.reply_to = {
               id: repliedMessage.id,
               message: repliedMessage.message,
@@ -566,10 +580,21 @@ export default function GroupChatScreen() {
       const sortedMessages = processedMessages.sort((a: Message, b: Message) => 
         new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
       );
+      
+      // Deduplicate messages
+      const uniqueMessages = deduplicateMessages(sortedMessages);
+      
+      // Mark API as successful
+      apiSuccess = true;
+      apiMessages = uniqueMessages.map(msg => ({
+        ...msg,
+        sync_status: msg.sync_status || 'synced' as const,
+      }));
+      
       // Save messages to database
       if (dbInitialized) {
         try {
-          const messagesToSave = sortedMessages.map((msg: any) => ({
+          const messagesToSave = uniqueMessages.map((msg: any) => ({
             server_id: msg.id,
             conversation_id: Number(id),
             conversation_type: 'group' as const,
@@ -585,140 +610,34 @@ export default function GroupChatScreen() {
           }));
           await saveDbMessages(messagesToSave);
           
-          // Fix existing duplicates with wrong timestamps after saving
-          try {
-            await fixDuplicateMessagesWithWrongTimestamps(
-              Number(id),
-              'group',
-              sortedMessages.map((msg: any) => ({
-                id: msg.id,
-                created_at: msg.created_at,
-                message: msg.message,
-                sender_id: msg.sender_id,
-              }))
-            );
-          } catch (cleanupError) {
-            // Silently fail - cleanup is not critical
-            if (__DEV__) {
-              console.warn('[GroupChat] Error cleaning up duplicates after save:', cleanupError);
-            }
-          }
+          // ❌ REMOVED: fixDuplicateMessagesWithWrongTimestamps - not needed since:
+          // 1. saveDbMessages already handles deduplication by server_id
+          // 2. API is source of truth, data is already correct
+          // 3. This function loads ALL messages which is slow
+          // 4. It was blocking UI on every conversation open
         } catch (dbError) {
           console.error('[GroupChat] Error saving messages to database:', dbError);
         }
       }
       
-      // Only update UI if we didn't already load from DB (to avoid flicker)
-      if (!dbInitialized || messages.length === 0) {
-        // Ensure all messages have sync_status (default to 'synced' for API messages)
-        const messagesWithStatus = sortedMessages.map(msg => ({
-          ...msg,
-          sync_status: msg.sync_status || 'synced' as const,
-        }));
-        setMessages(messagesWithStatus);
-        messagesLengthRef.current = messagesWithStatus.length;
-      } else {
-        // Reload from DB to get merged data (includes sync_status)
-        // FIX: Don't merge with prev state - DB is source of truth after sync
-        const mergedMessages = await loadMessagesFromDb(MESSAGES_PER_PAGE, 0);
-        
-        if (mergedMessages.length > 0) {
-          const sorted = mergedMessages.sort((a, b) => 
-            new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
-          );
-          
-          // FIX: Only get truly pending messages from prev state (not synced ones)
-          setMessages(prev => {
-            // Get ONLY pending messages that don't have server_id yet
-            const trulyPendingMessages = prev.filter(msg => 
-              msg.sync_status === 'pending' && 
-              typeof msg.id === 'number' && 
-              msg.id > 1000000000000 && // tempLocalId is timestamp-based
-              !sorted.some(dbMsg => {
-                // Check if this pending message matches a DB message by content+sender
-                // This handles tempLocalId -> server_id mapping
-                const timeDiff = Math.abs(
-                  new Date(dbMsg.created_at).getTime() - new Date(msg.created_at).getTime()
-                );
-                const messageMatch = (dbMsg.message || '') === (msg.message || '');
-                const senderMatch = dbMsg.sender_id === msg.sender_id;
-                
-                return messageMatch && senderMatch && timeDiff < 10000; // 10 second window
-              })
-            );
-            
-            // Combine DB messages with truly pending messages
-            const allMessages = [...sorted, ...trulyPendingMessages];
-            const sortedAll = allMessages.sort((a, b) => 
-              new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
-            );
-            
-            // CRITICAL: Deduplicate by server_id first, then by content+timestamp
-            const deduplicated = deduplicateMessages(sortedAll);
-            messagesLengthRef.current = deduplicated.length;
-            return deduplicated;
-          });
-        } else {
-          // No DB messages, but preserve pending messages
-          setMessages(prev => {
-            const pendingMessages = prev.filter(msg => 
-              msg.sync_status === 'pending' || 
-              (msg.sync_status !== 'synced' && typeof msg.id === 'number' && msg.id > 1000000000000)
-            );
-            if (pendingMessages.length > 0) {
-              messagesLengthRef.current = pendingMessages.length;
-              return pendingMessages;
-            }
-            return prev;
-          });
-        }
-      } // Update ref
-      
-      // Update latest message ID for sync detection
-      // Get current messages state for this
-      setMessages(current => {
-        if (current.length > 0) {
-          const latestMsg = current[current.length - 1];
-          latestMessageIdRef.current = latestMsg.id;
-        }
-        return current; // Don't modify state, just use it for side effects
-      });
-      
+      // Set group info
       setGroupInfo(response.data.selectedConversation);
       
-      // Set loading to false - scroll will happen after content is rendered
-      if (showLoading) {
-        setLoading(false);
-      }
-      
-      // Reset scroll flag to allow initial scroll
-      setHasScrolledToBottom(false);
-      
-      // Mark messages as read when user opens group conversation
+      // Mark messages as read
       const groupId = Number(id);
       if (ENABLE_MARK_AS_READ) {
         try {
           await groupsAPI.markMessagesAsRead(groupId);
-          // Update unread count to 0 for this group - this will update badge
           updateUnreadCount(groupId, 0);
         } catch (error: any) {
-          // Handle errors gracefully - don't show to user
           const statusCode = error?.response?.status;
-          
-          // 429 = Too Many Requests (rate limit) - expected, handled gracefully
-          // 422 = Validation error - expected in some cases
-          // 404 = Not found - endpoint might not exist yet
-          // Only log unexpected errors in development
           if (statusCode !== 429 && statusCode !== 422 && statusCode !== 404) {
             if (__DEV__) {
               console.log('markMessagesAsRead failed for group:', statusCode || error?.message || error);
             }
           }
-          // Silently ignore rate limit and validation errors
         }
       }
-      
-      // Scroll will be handled by useEffect and onContentSizeChange after images render
       
       // Successfully fetched - reset retry attempts
       retryAttemptRef.current = 0;
@@ -727,30 +646,96 @@ export default function GroupChatScreen() {
         retryTimeoutRef.current = null;
       }
     } catch (error: any) {
-      // Preserve existing messages - don't clear them on error
-      // Only clear messages if this is the initial load and we have no messages
-      // Use ref to get current messages length (avoids stale closure issues)
-      const hasExistingMessages = messagesLengthRef.current > 0;
+      apiError = error;
+      console.error('[GroupChat] API fetch failed:', error);
+    }
+    
+    // STEP 2: Handle API result or fallback to SQLite
+    if (apiSuccess) {
+      // ✅ API succeeded - use API data (even if empty, it's the truth)
+      setMessages(apiMessages);
+      messagesLengthRef.current = apiMessages.length;
+      setLoadedMessagesCount(apiMessages.length);
+      
+      if (apiMessages.length > 0) {
+        const latestMsg = apiMessages[apiMessages.length - 1];
+        latestMessageIdRef.current = latestMsg.id;
+      }
       
       if (showLoading) {
         setLoading(false);
       }
       
+      setHasScrolledToBottom(false);
+    } else {
+      // ❌ API failed - fallback to SQLite
+      if (dbInitialized) {
+        try {
+          const sqliteMessages = await loadMessagesFromDb(MESSAGES_PER_PAGE, 0);
+          
+          if (sqliteMessages.length > 0) {
+            // ✅ SQLite has data - use it
+            const sortedMessages = sqliteMessages.sort((a, b) => 
+              new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
+            );
+            const uniqueMessages = deduplicateMessages(sortedMessages);
+            setMessages(uniqueMessages);
+            messagesLengthRef.current = uniqueMessages.length;
+            setLoadedMessagesCount(uniqueMessages.length);
+            
+            if (uniqueMessages.length > 0) {
+              const latestMsg = uniqueMessages[uniqueMessages.length - 1];
+              latestMessageIdRef.current = latestMsg.id;
+            }
+            
+            if (showLoading) {
+              setLoading(false);
+            }
+            
+            setHasScrolledToBottom(false);
+          } else {
+            // ❌ Both API and SQLite are empty - show empty state
+            setMessages([]);
+            messagesLengthRef.current = 0;
+            setLoadedMessagesCount(0);
+            
+            if (showLoading) {
+              setLoading(false);
+            }
+          }
+        } catch (sqliteError) {
+          console.error('[GroupChat] Error loading from SQLite fallback:', sqliteError);
+          // ❌ Both API and SQLite failed - show empty state
+          setMessages([]);
+          messagesLengthRef.current = 0;
+          
+          if (showLoading) {
+            setLoading(false);
+          }
+        }
+      } else {
+        // ❌ API failed and no database - show empty state
+        setMessages([]);
+        messagesLengthRef.current = 0;
+        
+        if (showLoading) {
+          setLoading(false);
+        }
+      }
+      
       // Check if this is a network-related error that we should retry
       const isNetworkError = 
-        !error.response || // No response (network error)
-        error.code === 'ECONNABORTED' || // Timeout
-        error.message?.includes('Network Error') ||
-        error.message?.includes('timeout') ||
-        error.response?.status >= 500; // Server errors (500, 502, 503, etc.)
+        !apiError?.response ||
+        apiError?.code === 'ECONNABORTED' ||
+        apiError?.message?.includes('Network Error') ||
+        apiError?.message?.includes('timeout') ||
+        apiError?.response?.status >= 500;
       
-      // Only retry network errors, not auth errors (401) or client errors (400, 404)
       const shouldRetry = isNetworkError && 
                          retryAttemptRef.current < MAX_RETRY_ATTEMPTS &&
-                         !showLoading; // Don't retry if user is waiting for initial load
+                         !showLoading;
       
       if (shouldRetry) {
-        // Calculate exponential backoff delay: 1s, 2s, 4s, 8s, 16s
         const delay = INITIAL_RETRY_DELAY * Math.pow(2, retryAttemptRef.current);
         retryAttemptRef.current += 1;
         
@@ -758,32 +743,14 @@ export default function GroupChatScreen() {
           console.log(`[GroupChat] Retrying fetchMessages (attempt ${retryAttemptRef.current}/${MAX_RETRY_ATTEMPTS}) in ${delay}ms`);
         }
         
-        // Retry in background without showing loading spinner
         retryTimeoutRef.current = setTimeout(() => {
-          fetchMessages(false); // Don't show loading spinner for retries
+          fetchMessages(false);
         }, delay);
       } else {
-        // Max retries reached or non-retryable error
         if (retryAttemptRef.current >= MAX_RETRY_ATTEMPTS) {
           if (__DEV__) {
             console.warn('[GroupChat] Max retry attempts reached. Stopping background retries.');
           }
-        }
-        
-        // Only show alert and clear messages if this was initial load and we have no existing messages
-        if (!hasExistingMessages && showLoading) {
-          Alert.alert('Error', 'Failed to load messages');
-          setMessages([]);
-        }
-        
-        // Log error for debugging (only in dev mode)
-        if (__DEV__) {
-          console.error('[GroupChat] Failed to fetch messages:', {
-            error: error.message,
-            status: error.response?.status,
-            retryAttempts: retryAttemptRef.current,
-            hasExistingMessages
-          });
         }
       }
     }
@@ -807,14 +774,20 @@ export default function GroupChatScreen() {
     // 3. User is sending a message
     // 4. No latest message ID tracked yet
     // 5. Database not initialized
+    // 6. ✅ CRITICAL FIX: Don't sync if there are messages currently being sent (prevent race conditions)
+    const messagesBeingSent = getMessagesBeingSent();
     if (
       isPollingRef.current ||
       loadingMore ||
       isPaginatingRef.current ||
       sending ||
       !latestMessageIdRef.current ||
-      !dbInitialized
+      !dbInitialized ||
+      messagesBeingSent.size > 0
     ) {
+      if (messagesBeingSent.size > 0 && __DEV__) {
+        console.log(`[GroupChat] ⏸️ Skipping sync - ${messagesBeingSent.size} message(s) being sent`);
+      }
       return;
     }
 
@@ -851,19 +824,186 @@ export default function GroupChatScreen() {
         );
         
         if (newMessages.length > 0) {
+          // ✅ CRITICAL FIX: Merge with pending messages from SQLite before updating UI
+          // This prevents pending messages from disappearing when sync runs
+          let pendingMessages: Message[] = [];
+          if (dbInitialized) {
+            try {
+              const { getPendingMessages } = await import('@/services/database');
+              const pending = await getPendingMessages(Number(id), 'group');
+              
+              // ✅ DEBUG LOGGING: Log all pending messages found
+              console.log(`[GroupChat] 📋 Sync: Found ${pending.length} pending messages in SQLite:`, 
+                pending.map(m => ({ id: m.id, message: m.message?.substring(0, 30), sync_status: m.sync_status }))
+              );
+              
+              // Filter out messages that are currently being sent (they're already in UI)
+              const messagesBeingSent = getMessagesBeingSent();
+              console.log(`[GroupChat] 📋 Sync: ${messagesBeingSent.size} message(s) currently being sent:`, 
+                Array.from(messagesBeingSent)
+              );
+              
+              pendingMessages = pending.filter(msg => 
+                msg.id != null && !messagesBeingSent.has(msg.id)
+              );
+              
+              console.log(`[GroupChat] 📋 Sync: After filtering, ${pendingMessages.length} pending messages to merge`);
+              
+              if (pendingMessages.length > 0) {
+                console.log(`[GroupChat] 📋 Sync: Pending messages to merge:`, 
+                  pendingMessages.map(m => ({ id: m.id, message: m.message?.substring(0, 30) }))
+                );
+              }
+            } catch (dbError) {
+              console.error('[GroupChat] Error fetching pending messages during sync:', dbError);
+            }
+          }
+          
           // Update UI with all messages from SQLite (ensures consistency)
           setMessages(prev => {
-            // Merge with existing messages, ensuring no duplicates
-            const existingIds = new Set(prev.map(m => m.id));
+            // ✅ DEBUG LOGGING: Log state before sync update
+            console.log(`[GroupChat] 🔄 Sync: Before update - ${prev.length} messages in UI:`, 
+              prev.map(m => ({ id: m.id, message: m.message?.substring(0, 30), sync_status: m.sync_status }))
+            );
+            
+            console.log(`[GroupChat] 🔄 Sync: ${newMessages.length} new synced messages:`, 
+              newMessages.map(m => ({ id: m.id, message: m.message?.substring(0, 30) }))
+            );
+            
+            console.log(`[GroupChat] 🔄 Sync: ${pendingMessages.length} pending messages to merge:`, 
+              pendingMessages.map(m => ({ id: m.id, message: m.message?.substring(0, 30) }))
+            );
+            
+            // CRITICAL FIX: Use comprehensive duplicate check (ID + content+sender+timestamp)
+            const existingIds = new Set(prev.map(m => m.id).filter(id => id != null));
+            const existingMessagesMap = new Map<number | string, Message>();
+            prev.forEach(m => {
+              if (m.id != null) {
+                existingMessagesMap.set(m.id, m);
+              }
+            });
+            
+            // ✅ CRITICAL FIX: Merge pending messages with new synced messages
+            // Combine pending messages with new synced messages before deduplication
+            const allNewMessages = [...newMessages, ...pendingMessages];
+            
+            console.log(`[GroupChat] 🔄 Sync: Combined ${allNewMessages.length} messages (${newMessages.length} synced + ${pendingMessages.length} pending)`);
+            
+            // ✅ CRITICAL FIX: Improved deduplication - match by server_id, content+sender+timestamp, or ID
+            // ✅ CRITICAL FIX: Prefer synced messages over pending ones when they match
+            const uniqueNewMessages = allNewMessages.filter(newMsg => {
+              // Check 1: Same ID
+              if (newMsg.id != null && existingIds.has(newMsg.id)) {
+                console.log(`[GroupChat] 🔄 Sync: Filtering out duplicate by ID: ${newMsg.id}`);
+                return false; // Duplicate by ID
+              }
+              
+              // Check 2: Match by server_id if message has server_id
+              // This handles the case where UI has tempLocalId but API returns server_id
+              if (newMsg.id != null) {
+                const hasMatchingServerId = prev.some(existing => {
+                  // If existing message has same server_id (stored in id field after sync)
+                  // or if they're the same message with different IDs
+                  return existing.id === newMsg.id;
+                });
+                
+                if (hasMatchingServerId) {
+                  console.log(`[GroupChat] 🔄 Sync: Filtering out duplicate by server_id: ${newMsg.id}`);
+                  return false; // Duplicate by server_id
+                }
+              }
+              
+              // Check 3: Same content + sender + timestamp (within 2 seconds) - exact duplicate
+              // ✅ CRITICAL FIX: Prefer synced messages over pending ones
+              const matchingExisting = prev.find(existing => {
+                if (existing.id === newMsg.id) return true; // Already checked above
+                
+                const timeDiff = Math.abs(
+                  new Date(existing.created_at).getTime() - new Date(newMsg.created_at).getTime()
+                );
+                const contentMatch = (existing.message || '') === (newMsg.message || '');
+                const senderMatch = existing.sender_id === newMsg.sender_id;
+                
+                // If same content, sender, and timestamp within 2 seconds, it's a match
+                return contentMatch && senderMatch && timeDiff < 2000;
+              });
+              
+              if (matchingExisting) {
+                // ✅ CRITICAL FIX: If existing is pending and new is synced, prefer synced (keep new, remove existing from prev)
+                // If existing is synced and new is pending, prefer synced (filter out pending)
+                if (matchingExisting.sync_status === 'pending' && newMsg.sync_status === 'synced') {
+                  console.log(`[GroupChat] 🔄 Sync: Found pending message ${matchingExisting.id} matching synced ${newMsg.id}, will replace pending with synced`);
+                  // Keep the synced message, the pending one will be replaced in the merge
+                  return true; // Keep synced message
+                }
+                if (matchingExisting.sync_status === 'synced' && newMsg.sync_status === 'pending') {
+                  console.log(`[GroupChat] 🔄 Sync: Found synced message ${matchingExisting.id} matching pending ${newMsg.id}, filtering out pending`);
+                  return false; // Filter out pending, keep synced
+                }
+                // Both same status - it's a duplicate
+                console.log(`[GroupChat] 🔄 Sync: Filtering out duplicate (same status): existing=${matchingExisting.id} (${matchingExisting.sync_status}), new=${newMsg.id} (${newMsg.sync_status})`);
+                return false;
+              }
+              
+              return true; // Not a duplicate, keep it
+            });
+            
+            console.log(`[GroupChat] 🔄 Sync: After deduplication, ${uniqueNewMessages.length} unique new messages`);
+            
+            if (uniqueNewMessages.length === 0) {
+              console.log(`[GroupChat] 🔄 Sync: No new unique messages, keeping existing ${prev.length} messages`);
+              return prev; // No new unique messages
+            }
+            
+            // ✅ CRITICAL FIX: Merge with existing messages, but remove pending messages that match synced ones
+            // BUT: Don't remove pending messages that are currently being sent (handleSend is processing them)
+            // First, remove pending messages from prev that match synced messages in uniqueNewMessages
+            const messagesBeingSent = getMessagesBeingSent();
+            const prevWithoutDuplicates = prev.filter(existing => {
+              // If existing is pending, check if there's a synced version in uniqueNewMessages
+              if (existing.sync_status === 'pending') {
+                // ✅ CRITICAL FIX: Don't remove pending messages that are currently being sent
+                // handleSend needs to update them first
+                if (existing.id != null && messagesBeingSent.has(existing.id)) {
+                  console.log(`[GroupChat] 🔄 Sync: Keeping pending message ${existing.id} (currently being sent by handleSend)`);
+                  return true; // Keep it, handleSend will update it
+                }
+                
+                const hasSyncedVersion = uniqueNewMessages.some(newMsg => {
+                  if (newMsg.sync_status !== 'synced') return false;
+                  
+                  const timeDiff = Math.abs(
+                    new Date(existing.created_at).getTime() - new Date(newMsg.created_at).getTime()
+                  );
+                  const contentMatch = (existing.message || '') === (newMsg.message || '');
+                  const senderMatch = existing.sender_id === newMsg.sender_id;
+                  
+                  return contentMatch && senderMatch && timeDiff < 2000;
+                });
+                
+                if (hasSyncedVersion) {
+                  console.log(`[GroupChat] 🔄 Sync: Removing pending message ${existing.id} (replaced by synced version)`);
+                  return false; // Remove pending, keep synced
+                }
+              }
+              return true; // Keep this message
+            });
+            
+            // Merge with existing messages (after removing duplicate pending ones)
             const allUniqueMessages = [
-              ...prev.filter(msg => !newMessages.some(nm => nm.id === msg.id)), // Keep existing that aren't in new
-              ...newMessages // Add new messages
+              ...prevWithoutDuplicates,
+              ...uniqueNewMessages
             ].sort((a: Message, b: Message) => 
               new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
             );
             
-            // Deduplicate to be safe
+            // CRITICAL: Always deduplicate (defense in depth)
             const deduplicated = deduplicateMessages(allUniqueMessages);
+            
+            // ✅ DEBUG LOGGING: Log final state after sync update
+            console.log(`[GroupChat] ✅ Sync: After update - ${deduplicated.length} messages in UI:`, 
+              deduplicated.map(m => ({ id: m.id, message: m.message?.substring(0, 30), sync_status: m.sync_status }))
+            );
             
             // Update latest message ID
             if (deduplicated.length > 0) {
@@ -878,13 +1018,11 @@ export default function GroupChatScreen() {
           // Auto-scroll to bottom when receiving new messages
           // Only scroll if user is near bottom (hasn't manually scrolled up)
           // Prevent during initial load - onLayout handles initial scroll
-          if (shouldAutoScrollRef.current && !userScrolledRef.current && hasAttemptedInitialScrollRef.current) {
-            // Small delay to let state update complete
-            requestAnimationFrame(() => {
-              setTimeout(() => {
-                scrollToBottom(false, 0, false); // animated = false, delay = 0, force = false
-              }, 100);
-            });
+          // Auto-scroll to bottom when receiving new messages (only if user is at bottom)
+          // Position maintenance will be handled by onContentSizeChange
+          if (isAtBottomRef.current && !isInitialLoadRef.current) {
+            shouldMaintainPositionRef.current = true;
+            // onContentSizeChange will handle the scroll adjustment
           }
           
           if (__DEV__) {
@@ -931,7 +1069,7 @@ export default function GroupChatScreen() {
         pollingIntervalRef.current = null;
       }
     };
-  }, [id, loadingMore, sending, messages.length, dbInitialized, syncForNewMessages]);
+  }, [id, loadingMore, sending, dbInitialized, syncForNewMessages]); // CRITICAL FIX: Removed 'messages.length' to prevent stale closure
   
   // Start retry service on mount
   useEffect(() => {
@@ -953,6 +1091,7 @@ export default function GroupChatScreen() {
     lastFocusTimeRef.current = 0; // Reset focus time
     latestMessageIdRef.current = null; // Reset latest message ID
     isPollingRef.current = false; // Reset sync flag
+    initialScrollCompleteRef.current = false; // Reset initial scroll flag
     
     // Clear sync interval
     if (pollingIntervalRef.current) {
@@ -984,26 +1123,10 @@ export default function GroupChatScreen() {
     };
   }, []);
 
-  // Improved scroll to bottom function that uses content size to scroll to absolute bottom
+  // Simplified scroll to bottom function - maintainVisibleContentPosition handles most cases
   const scrollToBottom = useCallback((animated = false, delay = 0, force = false) => {
-    // Prevent scroll during initial load unless forced (onLayout handles initial scroll)
-    if (!force && !hasAttemptedInitialScrollRef.current) {
-      return;
-    }
-    
-    // Check if we should auto-scroll (unless forced)
-    if (!force && !shouldAutoScrollRef.current) {
-      return;
-    }
-    
     if (!flatListRef.current || messages.length === 0) {
       return;
-    }
-    
-    // Clear any pending scroll to prevent multiple rapid scrolls
-    if (scrollTimeoutRef.current) {
-      clearTimeout(scrollTimeoutRef.current);
-      scrollTimeoutRef.current = null;
     }
     
     const performScroll = () => {
@@ -1012,25 +1135,14 @@ export default function GroupChatScreen() {
       }
       
       try {
-        // If we have content size and viewport size, use scrollToOffset for precise positioning
-        if (contentSizeRef.current && viewportSizeRef.current) {
-          const contentHeight = contentSizeRef.current.height;
-          const viewportHeight = viewportSizeRef.current.height;
-          const targetOffset = Math.max(0, contentHeight - viewportHeight);
-          
-          (flatListRef.current as any).scrollToOffset({ 
-            offset: targetOffset, 
-            animated 
-          });
-          setHasScrolledToBottom(true);
-        } else {
-          // Fallback to scrollToEnd if sizes aren't available yet
-          (flatListRef.current as any).scrollToEnd({ animated });
-          setHasScrolledToBottom(true);
-        }
+        // Simply scroll to end - maintainVisibleContentPosition will handle position maintenance
+        (flatListRef.current as any).scrollToEnd({ animated });
+        setHasScrolledToBottom(true);
+        isAtBottomRef.current = true;
         
-        if (!force) {
-          shouldAutoScrollRef.current = false; // Reset after successful scroll
+        // Update anchor message when scrolling to bottom
+        if (messages.length > 0) {
+          lastVisibleMessageIdRef.current = messages[messages.length - 1].id;
         }
       } catch (error) {
         console.warn('Scroll failed:', error);
@@ -1038,25 +1150,26 @@ export default function GroupChatScreen() {
     };
     
     if (delay > 0) {
-      scrollTimeoutRef.current = setTimeout(performScroll, delay);
+      setTimeout(performScroll, delay);
     } else {
       requestAnimationFrame(performScroll);
     }
   }, [messages.length]);
 
-  // Scroll to bottom when messages are loaded or conversation changes
+  // Reset scroll state when conversation changes
   useEffect(() => {
-    // Reset scroll flag when conversation changes
     if (hasScrolledForThisConversation.current !== id) {
       hasScrolledForThisConversation.current = id as string;
       setHasScrolledToBottom(false);
       isInitialLoadRef.current = true;
-      userScrolledRef.current = false;
-      shouldAutoScrollRef.current = true;
+      isAtBottomRef.current = true;
+      shouldMaintainPositionRef.current = false; // Reset on conversation change
       lastScrollOffsetRef.current = 0;
-      hasAttemptedInitialScrollRef.current = false;
-      contentSizeRef.current = null;
-      viewportSizeRef.current = null;
+      lastVisibleMessageIdRef.current = null;
+      viewportHeightRef.current = 0;
+      lastMessageHeightRef.current = 0;
+      lastMessageYPositionRef.current = 0;
+      messageHeightsRef.current.clear(); // Clear message heights cache
     }
   }, [id]);
 
@@ -1103,17 +1216,42 @@ export default function GroupChatScreen() {
       // Don't show loading spinner if messages already exist (to avoid flickering)
       const hasExistingMessages = messages.length > 0;
       
-      // Reset scroll flag so we scroll to bottom after refresh
-      setHasScrolledToBottom(false);
+      // CRITICAL FIX: Don't reset scroll flags if user is viewing old messages
+      // Only reset if we're at the bottom or it's a fresh conversation
+      const shouldResetScroll = !loadingMore && !isPaginatingRef.current && currentPage === 1;
+      
+      if (shouldResetScroll) {
+        // Reset scroll flag on focus if at bottom or initial load
+        setHasScrolledToBottom(false);
+        isAtBottomRef.current = true;
+      } else {
+        // User is viewing old messages, don't auto-scroll
+        isAtBottomRef.current = false;
+      }
       
       fetchMessages(!hasExistingMessages);
-      
-      // Enable auto-scroll when conversation is focused
-      // Scroll will be handled by onContentSizeChange and onLayout
-      shouldAutoScrollRef.current = true;
 
       const markGroupMessagesAsRead = async () => {
         if (!ENABLE_MARK_AS_READ || !id || !user) return;
+        
+        // CRITICAL FIX: Check network connectivity before making API call
+        try {
+          const netInfo = await NetInfo.fetch();
+          if (!netInfo.isConnected) {
+            if (__DEV__) {
+              console.log('[GroupChat] Skipping mark as read - no network connection');
+            }
+            needsMarkAsReadRef.current = true; // Set flag to retry when network comes back
+            return; // Don't make API call if offline
+          }
+        } catch (netError) {
+          // If NetInfo fails, assume offline to be safe
+          if (__DEV__) {
+            console.warn('[GroupChat] Could not check network status:', netError);
+          }
+          needsMarkAsReadRef.current = true; // Set flag to retry when network comes back
+          return;
+        }
         
         try {
           // Mark all unread messages in this group as read
@@ -1121,14 +1259,26 @@ export default function GroupChatScreen() {
           
           // Update unread count to 0 for this group
           updateUnreadCount(Number(id), 0);
+          needsMarkAsReadRef.current = false; // Reset flag on success
           
           if (__DEV__) {
             console.log('Group messages marked as read');
           }
         } catch (error: any) {
-          // Handle errors gracefully - don't show to user
+          // Handle errors gracefully
           const statusCode = error?.response?.status;
+          const isNetworkError = 
+            error?.code === 'ERR_NETWORK' ||
+            error?.message?.includes('Network Error') ||
+            !error?.response;
           
+          if (isNetworkError) {
+            // Network error - set flag to retry when network comes back
+            needsMarkAsReadRef.current = true;
+            if (__DEV__) {
+              console.log('[GroupChat] Mark as read failed - network error, will retry when online');
+            }
+          } else {
           // 429 = Too Many Requests (rate limit) - expected, handled gracefully
           // 422 = Validation error - expected in some cases
           // 404 = Not found - endpoint might not exist yet
@@ -1138,7 +1288,7 @@ export default function GroupChatScreen() {
               console.error('Error marking group messages as read:', statusCode || error?.message || error);
             }
           }
-          // Silently ignore rate limit and validation errors
+          }
         }
       };
 
@@ -1155,10 +1305,62 @@ export default function GroupChatScreen() {
     }, [id, user, ENABLE_MARK_AS_READ, updateUnreadCount, setActiveConversation, clearActiveConversation, fetchMessages, messages.length, scrollToBottom, loadingMore, currentPage])
   );
 
+  // CRITICAL FIX: Network listener to retry mark-read when network comes back
+  useEffect(() => {
+    if (!ENABLE_MARK_AS_READ || !id || !user) return;
+    
+    // Set up network listener
+    const unsubscribe = NetInfo.addEventListener(state => {
+      const isConnected = state.isConnected ?? false;
+      
+      if (isConnected && needsMarkAsReadRef.current) {
+        // Network came back and we need to retry mark-read
+        const retryMarkAsRead = async () => {
+          try {
+            await groupsAPI.markMessagesAsRead(Number(id));
+            
+            updateUnreadCount(Number(id), 0);
+            needsMarkAsReadRef.current = false; // Reset flag
+            
+            if (__DEV__) {
+              console.log('[GroupChat] Mark as read retried successfully after network reconnect');
+            }
+          } catch (error: any) {
+            // If it still fails, check if it's a network error
+            const isNetworkError = 
+              error?.code === 'ERR_NETWORK' ||
+              error?.message?.includes('Network Error') ||
+              !error?.response;
+            
+            if (!isNetworkError) {
+              // Non-network error - reset flag to avoid infinite retries
+              needsMarkAsReadRef.current = false;
+            }
+            
+            if (__DEV__) {
+              console.error('[GroupChat] Mark as read retry failed:', error);
+            }
+          }
+        };
+        
+        // Small delay to ensure network is stable
+        setTimeout(retryMarkAsRead, 500);
+      }
+    });
+    
+    return () => {
+      unsubscribe();
+    };
+  }, [id, user, ENABLE_MARK_AS_READ, updateUnreadCount]);
+
   // Load more messages function
   const loadMoreMessages = async () => {
     if (loadingMore || !hasMoreMessages) return;
     
+    // CRITICAL FIX: Disable auto-scroll when loading older messages
+    // User wants to stay at the top viewing old messages
+    isAtBottomRef.current = false;
+    shouldMaintainPositionRef.current = false; // Don't maintain position when loading older messages
     isPaginatingRef.current = true; // Mark that we're paginating
     setLoadingMore(true);
     try {
@@ -1276,17 +1478,17 @@ export default function GroupChatScreen() {
     }
     
     setSending(true);
-    
+      
     // Prepare message text
-    let messageText = input.trim();
-    if (attachment && !messageText) {
-      if (attachment.type?.startsWith('image/') || attachment.isImage) {
-        messageText = '[IMAGE]';
-      } else {
-        messageText = '[FILE]';
+      let messageText = input.trim();
+      if (attachment && !messageText) {
+        if (attachment.type?.startsWith('image/') || attachment.isImage) {
+          messageText = '[IMAGE]';
+        } else {
+          messageText = '[FILE]';
+        }
       }
-    }
-    
+      
     if (voiceRecording) {
       const voiceMessage = `[VOICE_MESSAGE:${voiceRecording.duration}]`;
       messageText = messageText ? `${messageText} ${voiceMessage}` : voiceMessage;
@@ -1344,11 +1546,17 @@ export default function GroupChatScreen() {
     };
     
     try {
+      // ✅ CRITICAL FIX: Mark message as sending BEFORE saving to SQLite
+      // This prevents retry service from picking it up before handleSend sends it
+      console.log(`[GroupChat] 🔒 Marking message ${tempLocalId} as sending BEFORE SQLite save | Content: "${messageText?.substring(0, 50)}"`);
+      markMessageAsSending(tempLocalId);
+      
       // STEP 1: Save to SQLite first with pending status (instant local storage)
+      let actualMessageId = tempLocalId; // Will be updated if SQLite assigns different ID
       if (dbInitialized) {
         try {
           await saveDbMessages([{
-            id: tempLocalId,
+            id: tempLocalId, // ✅ CRITICAL: Provide tempLocalId so saveMessages uses it
             conversation_id: Number(id),
             conversation_type: 'group',
             sender_id: Number(user?.id || 0),
@@ -1362,23 +1570,80 @@ export default function GroupChatScreen() {
             attachments: localMessage.attachments,
           }]);
           
-          if (__DEV__) {
-            console.log('[GroupChat] Saved message to SQLite with pending status:', tempLocalId);
+          // ✅ CRITICAL FIX: Verify the message was saved with the correct ID
+          // If saveMessages used auto-increment, we need to get the actual ID
+          try {
+            const database = await getDb();
+            if (database) {
+              const savedMessage = await database.getFirstAsync<{ id: number }>(
+                `SELECT id FROM messages 
+                 WHERE conversation_id = ? 
+                 AND sender_id = ? 
+                 AND message = ? 
+                 AND created_at = ? 
+                 AND sync_status = 'pending'
+                 ORDER BY id DESC
+                 LIMIT 1`,
+                [Number(id), Number(user?.id || 0), messageText || null, now]
+              );
+              
+              if (savedMessage) {
+                actualMessageId = savedMessage.id;
+                if (actualMessageId !== tempLocalId) {
+                  console.log(`[GroupChat] ⚠️ ID MISMATCH: tempLocalId=${tempLocalId}, SQLite ID=${actualMessageId}. Marking BOTH as sending.`);
+                  // ✅ CRITICAL FIX: Keep BOTH IDs marked as sending
+                  // UI message has tempLocalId, but database has actualMessageId
+                  // Sync needs to preserve the message regardless of which ID it checks
+                  markMessageAsSending(actualMessageId);
+                  // Don't unmark tempLocalId - keep it marked so sync preserves the UI message
+                } else {
+                  console.log(`[GroupChat] ✅ Message saved with tempLocalId: ${tempLocalId}`);
+                }
+              }
+            }
+          } catch (idCheckError) {
+            console.warn(`[GroupChat] Could not verify SQLite ID, using tempLocalId:`, idCheckError);
           }
-        } catch (dbError) {
-          console.error('[GroupChat] Error saving to SQLite:', dbError);
+          
+          if (__DEV__ || process.env.EXPO_PUBLIC_DEBUG_API === 'true') {
+            console.log('[GroupChat] Saved message to SQLite with pending status:', {
+              tempLocalId,
+              actualMessageId,
+              message: messageText?.substring(0, 50),
+              groupId: Number(id),
+              timestamp: now,
+            });
+          }
+        } catch (dbError: any) {
+          // ✅ CRITICAL: Log detailed error information for debugging
+          console.error('[GroupChat] Error saving to SQLite:', {
+            error: dbError?.message || String(dbError),
+            tempLocalId,
+            message: messageText?.substring(0, 50),
+            groupId: Number(id),
+            stack: dbError?.stack,
+          });
           // Continue anyway - we'll still try to send to API
+          // But the message won't persist if DB save fails
         }
       }
       
       // STEP 2: Show message immediately in UI (optimistic update)
       setMessages(prev => {
+        // ✅ DEBUG LOGGING: Track message addition
+        console.log(`[GroupChat] ➕ Adding message to UI:`, {
+          tempLocalId,
+          actualMessageId,
+          message: messageText?.substring(0, 30),
+          sync_status: 'pending',
+          currentMessagesCount: prev.length,
+          existingMessageIds: prev.map(m => ({ id: m.id, status: m.sync_status, message: m.message?.substring(0, 20) })),
+        });
+        
         // Check if message with this tempLocalId already exists (prevent duplicates)
         const existingIds = new Set(prev.map(m => m.id));
         if (existingIds.has(tempLocalId)) {
-          if (__DEV__) {
-            console.warn('[GroupChat] Message with tempLocalId already exists, skipping:', tempLocalId);
-          }
+          console.warn(`[GroupChat] ⚠️ Message ${tempLocalId} already exists in UI, skipping add`);
           return prev; // Don't add duplicate
         }
         
@@ -1390,14 +1655,24 @@ export default function GroupChatScreen() {
         
         const uniqueMessages = deduplicateMessages(updatedMessages);
         
+        // ✅ DEBUG LOGGING: Log final state after adding
+        console.log(`[GroupChat] ✅ Added message to UI - Total: ${uniqueMessages.length} messages:`, 
+          uniqueMessages.map(m => ({ id: m.id, message: m.message?.substring(0, 30), sync_status: m.sync_status }))
+        );
+        
         if (uniqueMessages.length > 0) {
           const latestMsg = uniqueMessages[uniqueMessages.length - 1];
+          const previousLatestId = latestMessageIdRef.current;
           latestMessageIdRef.current = latestMsg.id;
+          console.log(`[GroupChat] 📌 Updated latestMessageIdRef from ${previousLatestId} to ${latestMessageIdRef.current} (tempLocalId: ${tempLocalId})`);
         }
         
-        // Scroll to bottom
-        shouldAutoScrollRef.current = true;
-        userScrolledRef.current = false;
+        // Scroll to bottom after sending
+        isAtBottomRef.current = true;
+        shouldMaintainPositionRef.current = true;
+        if (uniqueMessages.length > 0) {
+          lastVisibleMessageIdRef.current = uniqueMessages[uniqueMessages.length - 1].id;
+        }
         requestAnimationFrame(() => {
           setTimeout(() => {
             if (flatListRef.current) {
@@ -1421,23 +1696,30 @@ export default function GroupChatScreen() {
       setShowEmoji(false);
       setSending(false); // Reset sending state - API call happens in background
       
+      // CRITICAL FIX: Dismiss keyboard after sending to prevent extra space
+      Keyboard.dismiss();
+      
       // STEP 3: Send to API in background (non-blocking)
       (async () => {
         try {
+          // ✅ CRITICAL FIX: Message is already marked as sending (done before SQLite save)
+          // No need to mark again here
+          
           // Check if message already has server_id (already synced) before sending
           // This prevents duplicate sends if retry service already sent it
           if (dbInitialized) {
             try {
               const database = await getDb();
               if (database) {
+                // Check both tempLocalId and actualMessageId
                 const existingMessage = await database.getFirstAsync<{ server_id?: number; created_at?: string }>(
-                  `SELECT server_id, created_at FROM messages WHERE id = ?`,
-                  [tempLocalId]
+                  `SELECT server_id, created_at FROM messages WHERE id = ? OR id = ?`,
+                  [tempLocalId, actualMessageId]
                 );
                 
                 if (existingMessage?.server_id) {
                   if (__DEV__) {
-                    console.log(`[GroupChat] Message ${tempLocalId} already has server_id ${existingMessage.server_id}, skipping API call`);
+                    console.log(`[GroupChat] Message ${actualMessageId} (tempLocalId: ${tempLocalId}) already has server_id ${existingMessage.server_id}, skipping API call`);
                   }
                   // Update UI with server ID and server timestamp, but first check for duplicates
                   setMessages(prev => {
@@ -1449,11 +1731,11 @@ export default function GroupChatScreen() {
                     let updatedMessages;
                     if (existingServerMessage) {
                       // Remove the temp message and keep the server one (which is more complete)
-                      updatedMessages = prev.filter(msg => msg.id !== tempLocalId);
+                      updatedMessages = prev.filter(msg => msg.id !== tempLocalId && msg.id !== actualMessageId);
                     } else {
                       // Update temp message to server ID AND update timestamp to match server
                       updatedMessages = prev.map(msg => 
-                        msg.id === tempLocalId 
+                        (msg.id === tempLocalId || msg.id === actualMessageId)
                           ? { 
                               ...msg, 
                               id: serverId, 
@@ -1466,6 +1748,8 @@ export default function GroupChatScreen() {
                     // Ensure no duplicates remain
                     return deduplicateMessages(updatedMessages);
                   });
+                  unmarkMessageAsSending(tempLocalId);
+                  unmarkMessageAsSending(actualMessageId); // ✅ Unmark before returning
                   return; // Don't send again
                 }
               }
@@ -1478,85 +1762,244 @@ export default function GroupChatScreen() {
           }
           
           let formData = new FormData();
-          formData.append('group_id', id as string);
-          
-          if (replyingTo) {
-            formData.append('reply_to_id', replyingTo.id.toString());
-          }
-          
-          if (attachment) {
-            formData.append('attachments[]', {
-              uri: attachment.uri,
-              name: attachment.name,
-              type: attachment.type,
-            } as any);
-          }
-          
-          if (messageText && !voiceRecording) {
+      formData.append('group_id', id as string);
+      
+      if (replyingTo) {
+        formData.append('reply_to_id', replyingTo.id.toString());
+      }
+      
+      if (attachment) {
+        formData.append('attachments[]', {
+          uri: attachment.uri,
+          name: attachment.name,
+          type: attachment.type,
+        } as any);
+      }
+      
+      if (messageText && !voiceRecording) {
+        formData.append('message', messageText);
+      }
+      
+      if (voiceRecording) {
             formData.append('message', messageText);
-          }
-          
-          if (voiceRecording) {
-            formData.append('message', messageText);
-            formData.append('attachments[]', {
-              uri: voiceRecording.uri,
-              name: 'voice_message.m4a',
-              type: 'audio/m4a',
-            } as any);
-            formData.append('voice_duration', voiceRecording.duration.toString());
-            formData.append('is_voice_message', 'true');
-          }
-          
-          // Send to API
-          const res = await messagesAPI.sendMessage(formData);
-          
-          // STEP 4: Update SQLite with server response (change status to synced, update server_id and timestamp)
-          if (res.data && res.data.id && dbInitialized) {
-            try {
-              // Update with server timestamp to prevent duplicates with different timestamps
-              const serverCreatedAt = res.data.created_at;
-              await updateMessageStatus(tempLocalId, res.data.id, 'synced', serverCreatedAt);
+        formData.append('attachments[]', {
+          uri: voiceRecording.uri,
+          name: 'voice_message.m4a',
+          type: 'audio/m4a',
+        } as any);
+        formData.append('voice_duration', voiceRecording.duration.toString());
+        formData.append('is_voice_message', 'true');
+      }
+      
+          // ✅ SIMPLIFIED: Send once, let retry service handle failures and verification
+          try {
+            // ✅ CRITICAL: Double-check message is still marked as sending before API call
+            // Check both tempLocalId and actualMessageId
+            const isMarked = isMessageBeingSent(tempLocalId) || isMessageBeingSent(actualMessageId);
+            if (!isMarked) {
+              console.warn(`[GroupChat] ⚠️ Message ${actualMessageId} (tempLocalId: ${tempLocalId}) was unmarked before send - marking again`);
+              markMessageAsSending(actualMessageId);
+            }
+            
+            // ✅ LOGGING: Log API send attempt
+            const sendStartTime = Date.now();
+            console.log(`[GroupChat] 📤 SENDING message ${actualMessageId} (tempLocalId: ${tempLocalId}) to API | Content: "${messageText?.substring(0, 50)}" | Marked as sending: ${isMarked}`);
+            
+            // Send to API (single attempt - no retries)
+            const res = await messagesAPI.sendMessage(formData);
+            
+            const sendDuration = Date.now() - sendStartTime;
+            console.log(`[GroupChat] 📥 API RESPONSE for message ${actualMessageId} (tempLocalId: ${tempLocalId}) | Status: ${res.status} | Duration: ${sendDuration}ms`);
+            
+            // Check if status indicates success
+            if (res.status >= 200 && res.status < 300) {
+              console.log(`[GroupChat] ✅ API SEND SUCCESS for message ${actualMessageId} (tempLocalId: ${tempLocalId}) | Status: ${res.status}`);
               
-              // Update UI message with server ID and server timestamp, checking for duplicates
-              setMessages(prev => {
-                const serverId = res.data.id;
-                // Check if message with server ID already exists (from a sync)
-                const existingIds = new Set(prev.map(m => m.id));
-                const serverIdExists = existingIds.has(serverId);
-                
-                if (serverIdExists) {
-                  // Server ID already exists, remove the tempLocalId message to avoid duplication
-                  if (__DEV__) {
-                    console.log('[GroupChat] Server ID already exists, removing tempLocalId message:', tempLocalId);
-                  }
-                  const filtered = prev.filter(msg => msg.id !== tempLocalId);
-                  // Ensure deduplication after filtering
-                  return deduplicateMessages(filtered);
-                } else {
-                  // Update the tempLocalId to server ID AND update timestamp to match server
-                  const updated = prev.map(msg => 
-                    msg.id === tempLocalId 
-                      ? { 
-                          ...msg, 
-                          id: serverId, 
-                          sync_status: 'synced',
-                          created_at: serverCreatedAt || msg.created_at // Use server timestamp
-                        }
-                      : msg
-                  );
-                  // Ensure deduplication after update
-                  return deduplicateMessages(updated);
+              // Try to extract message ID from response
+              let messageId: number | undefined;
+              let serverCreatedAt: string | undefined;
+              
+              if (res.data) {
+                if (res.data.id) {
+                  messageId = res.data.id;
+                  serverCreatedAt = res.data.created_at;
+                } else if (res.data.data?.id) {
+                  messageId = res.data.data.id;
+                  serverCreatedAt = res.data.data.created_at;
+                } else if (res.data.message?.id) {
+                  messageId = res.data.message.id;
+                  serverCreatedAt = res.data.message.created_at;
+                } else if (res.data.message_id) {
+                  messageId = res.data.message_id;
+                  serverCreatedAt = res.data.created_at || res.data.message_created_at;
+                } else if (res.data.result?.id) {
+                  messageId = res.data.result.id;
+                  serverCreatedAt = res.data.result.created_at;
                 }
-              });
-              
-              // Update latest message ID
-              latestMessageIdRef.current = res.data.id;
-              
-              if (__DEV__) {
-                console.log('[GroupChat] Message synced successfully:', tempLocalId, '->', res.data.id, 'with timestamp:', serverCreatedAt);
               }
-            } catch (updateError) {
-              console.error('[GroupChat] Error updating message status:', updateError);
+              
+              if (messageId) {
+                console.log(`[GroupChat] 📋 Extracted server_id ${messageId} from API response for message ${actualMessageId} (tempLocalId: ${tempLocalId})`);
+              } else {
+                console.warn(`[GroupChat] ⚠️ No messageId found in API response for message ${actualMessageId} | Response structure:`, JSON.stringify(res.data).substring(0, 200));
+              }
+              
+              // ✅ If we got messageId from response, update immediately
+              if (messageId && dbInitialized) {
+                try {
+                  // ✅ CRITICAL FIX: Use actualMessageId (SQLite ID) instead of tempLocalId
+                  const messageIdToUpdate = actualMessageId;
+                  
+                  // Check for duplicate before updating
+                  const database = await getDb();
+                  if (database) {
+                    const existingByServerId = await database.getFirstAsync<{ id: number }>(
+                      `SELECT id FROM messages WHERE server_id = ? AND id != ?`,
+                      [messageId, messageIdToUpdate]
+                    );
+                    
+                    if (existingByServerId) {
+                      // Duplicate exists - remove messageIdToUpdate message
+                      await database.runAsync(`DELETE FROM messages WHERE id = ?`, [messageIdToUpdate]);
+                      setMessages(prev => prev.filter(msg => msg.id !== tempLocalId && msg.id !== messageIdToUpdate));
+                      unmarkMessageAsSending(tempLocalId);
+                      unmarkMessageAsSending(messageIdToUpdate);
+                      return;
+                    }
+                  }
+                  
+                  // ✅ CRITICAL FIX: Wait for updateMessageStatus to complete and check return value
+                  console.log(`[GroupChat] 💾 Updating message ${messageIdToUpdate} (tempLocalId: ${tempLocalId}) status to synced with server_id ${messageId}`);
+                  const updateStartTime = Date.now();
+                  
+                  const updateSucceeded = await updateMessageStatus(messageIdToUpdate, messageId, 'synced', serverCreatedAt);
+                  const updateDuration = Date.now() - updateStartTime;
+                  
+                  if (updateSucceeded) {
+                    console.log(`[GroupChat] ✅ DATABASE UPDATE SUCCESS for message ${messageIdToUpdate} | server_id: ${messageId} | Duration: ${updateDuration}ms`);
+                    // Update UI message with server ID
+                    setMessages(prev => {
+                      // ✅ DEBUG LOGGING: Log state before update
+                      console.log(`[GroupChat] 🔄 handleSend update: Before - ${prev.length} messages:`, 
+                        prev.map(m => ({ id: m.id, message: m.message?.substring(0, 30), sync_status: m.sync_status }))
+                      );
+                      
+                      const existingIds = new Set(prev.map(m => m.id));
+                      const serverIdExists = existingIds.has(messageId);
+                      
+                      // ✅ CRITICAL FIX: Find message by both tempLocalId AND actualMessageId
+                      const messageToUpdate = prev.find(msg => 
+                        msg.id === tempLocalId || msg.id === actualMessageId
+                      );
+                      
+                      console.log(`[GroupChat] 🔄 handleSend update: Looking for message with tempLocalId=${tempLocalId} or actualMessageId=${actualMessageId}`);
+                      console.log(`[GroupChat] 🔄 handleSend update: Found message:`, messageToUpdate ? { id: messageToUpdate.id, message: messageToUpdate.message?.substring(0, 30) } : 'NOT FOUND');
+                      console.log(`[GroupChat] 🔄 handleSend update: Server ID ${messageId} exists in UI:`, serverIdExists);
+                      
+                      if (serverIdExists && messageToUpdate) {
+                        // Server ID already exists (from sync), remove tempLocalId/actualMessageId to avoid duplication
+                        console.log(`[GroupChat] 🔄 Server ID ${messageId} already exists in UI, removing tempLocalId ${tempLocalId} and actualMessageId ${actualMessageId}`);
+                        const filtered = prev.filter(msg => 
+                          msg.id !== tempLocalId && msg.id !== actualMessageId
+                        );
+                        console.log(`[GroupChat] 🔄 handleSend update: After removal - ${filtered.length} messages`);
+                        return deduplicateMessages(filtered);
+                      } else if (messageToUpdate) {
+                        // Update tempLocalId/actualMessageId to server ID
+                        console.log(`[GroupChat] 🔄 Updating message ${tempLocalId}/${actualMessageId} to server_id ${messageId}`);
+                        const updated = prev.map(msg => 
+                          (msg.id === tempLocalId || msg.id === actualMessageId)
+                            ? { 
+                                ...msg, 
+                                id: messageId, 
+                                sync_status: 'synced',
+                                created_at: serverCreatedAt || msg.created_at
+                              }
+                            : msg
+                        );
+                        console.log(`[GroupChat] 🔄 handleSend update: After update - ${updated.length} messages`);
+                        return deduplicateMessages(updated);
+                      } else {
+                        // Message not found in UI (might have been removed by sync)
+                        // Add it back with server_id
+                        console.log(`[GroupChat] ⚠️ Message ${tempLocalId}/${actualMessageId} not found in UI, adding with server_id ${messageId}`);
+                        const newMessage: Message = {
+                          id: messageId,
+                          message: messageText || null,
+                          sender_id: Number(user?.id || 0),
+                          group_id: Number(id),
+                          created_at: serverCreatedAt || now,
+                          sync_status: 'synced',
+                          attachments: localMessage.attachments || [],
+                        };
+                        const updated = [...prev, newMessage].sort((a, b) => 
+                          new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
+                        );
+                        console.log(`[GroupChat] 🔄 handleSend update: After add - ${updated.length} messages`);
+                        return deduplicateMessages(updated);
+                      }
+                    });
+                    
+                    latestMessageIdRef.current = messageId;
+                  } else {
+                    console.warn(`[GroupChat] ⚠️ Failed to update message ${tempLocalId} status - will be retried by retry service`);
+                  }
+                  
+                  // ✅ CRITICAL FIX: Only unmark AFTER updateMessageStatus completes
+                  // This prevents retry service from picking it up before status is updated
+                  unmarkMessageAsSending(tempLocalId);
+                  if (actualMessageId !== tempLocalId) {
+                    unmarkMessageAsSending(actualMessageId);
+                  }
+                } catch (updateError) {
+                  console.error('[GroupChat] Error updating message status:', updateError);
+                  // ✅ Unmark even on error so retry service can handle it
+                  unmarkMessageAsSending(tempLocalId);
+                  if (actualMessageId !== tempLocalId) {
+                    unmarkMessageAsSending(actualMessageId);
+                  }
+                }
+              } else {
+                // No messageId in response - leave as pending, retry service will verify and update
+                // ✅ CRITICAL FIX: Keep marked as sending until retry service handles it
+                // Don't unmark here - let retry service unmark after it verifies/updates
+                // Actually, we should unmark here since we're not updating status
+                unmarkMessageAsSending(tempLocalId);
+                if (actualMessageId !== tempLocalId) {
+                  unmarkMessageAsSending(actualMessageId);
+                }
+              }
+            } else {
+              // Non-success status - leave as pending, retry service will retry
+              unmarkMessageAsSending(tempLocalId); // ✅ Unmark so retry service can retry
+              if (actualMessageId !== tempLocalId) {
+                unmarkMessageAsSending(actualMessageId);
+              }
+            }
+          } catch (apiError: any) {
+            // Check if it's a client error (4xx) - mark as failed
+            const isClientError = apiError.response?.status >= 400 && apiError.response?.status < 500;
+            
+            if (isClientError) {
+              // Client error (4xx) - mark as failed immediately
+              if (dbInitialized) {
+                await updateMessageStatus(tempLocalId, undefined, 'failed');
+                setMessages(prev => prev.map(msg => 
+                  msg.id === tempLocalId 
+                    ? { ...msg, sync_status: 'failed' }
+                    : msg
+                ));
+              }
+              unmarkMessageAsSending(tempLocalId); // ✅ Unmark
+              if (actualMessageId !== tempLocalId) {
+                unmarkMessageAsSending(actualMessageId);
+              }
+            } else {
+              // Network error or other - leave as pending, retry service will retry
+              unmarkMessageAsSending(tempLocalId); // ✅ Unmark so retry service can retry
+              if (actualMessageId !== tempLocalId) {
+                unmarkMessageAsSending(actualMessageId);
+              }
             }
           }
           
@@ -1567,48 +2010,22 @@ export default function GroupChatScreen() {
             // Silently fail
           }
           
-        } catch (apiError: any) {
-          // STEP 5: Handle API failure gracefully
-          console.error('[GroupChat] Error sending message to API:', apiError);
+        } catch (e: unknown) {
+          const error = e as any;
+          console.error('[GroupChat] Unexpected error in handleSend:', error);
           
-          // Check if it's a network error (retryable) or permanent error
-          const isNetworkError = 
-            apiError.message === 'Network Error' || 
-            !apiError.response ||
-            apiError.code === 'ECONNABORTED' ||
-            apiError.message?.includes('timeout');
-          
+          // Ensure message is kept as pending for retry
           if (dbInitialized) {
-            if (!isNetworkError && apiError.response?.status >= 400 && apiError.response?.status < 500) {
-              // Client error (4xx) - mark as failed
-              await updateMessageStatus(tempLocalId, undefined, 'failed');
-              
-              // Update UI to show failed status
-              setMessages(prev => prev.map(msg => 
-                msg.id === tempLocalId 
-                  ? { ...msg, sync_status: 'failed' }
-                  : msg
-              ));
-              
-              if (__DEV__) {
-                console.log('[GroupChat] Message marked as failed:', tempLocalId);
-              }
-            } else {
-              // Network/server error - keep as pending for retry
-              // Retry service will handle it
-              if (__DEV__) {
-                console.log('[GroupChat] Message kept as pending for retry:', tempLocalId);
-              }
-            }
+            await updateMessageStatus(tempLocalId, undefined, 'pending');
+            setMessages(prev => prev.map(msg => 
+              msg.id === tempLocalId 
+                ? { ...msg, sync_status: 'pending' }
+                : msg
+            ));
           }
-          
-          // Show user-friendly error (non-blocking)
-          if (!isNetworkError) {
-            Alert.alert(
-              'Message Pending',
-              'Your message was saved locally but couldn\'t be sent. It will be retried automatically.',
-              [{ text: 'OK' }]
-            );
+          unmarkMessageAsSending(tempLocalId); // ✅ Unmark so retry service can pick it up
+          if (actualMessageId !== tempLocalId) {
+            unmarkMessageAsSending(actualMessageId);
           }
         }
       })();
@@ -1618,11 +2035,11 @@ export default function GroupChatScreen() {
       console.error('[GroupChat] Error in handleSend:', error);
       setSending(false);
       
-      Alert.alert(
+          Alert.alert(
         'Error',
         'Failed to save message. Please try again.',
-        [{ text: 'OK' }]
-      );
+            [{ text: 'OK' }]
+          );
     }
   };
 
@@ -1967,6 +2384,7 @@ export default function GroupChatScreen() {
     const isMine = senderId === currentUserId && senderId !== 0;
     const previousMessage = index > 0 ? messages[index - 1] : null;
     const showDateSeparator = shouldShowDateSeparator(item, previousMessage);
+    const isLastMessage = index === messages.length - 1; // Track if this is the last message
     
     const timestamp = formatMessageTime(item.created_at);
 
@@ -2176,7 +2594,7 @@ export default function GroupChatScreen() {
             senderName={!isMine && item.sender ? item.sender.name : undefined}
             textPart={voiceMessageData.textPart}
             readAt={item.read_at}
-            syncStatus={item.sync_status || 'synced'}
+            syncStatus={item.sync_status || 'pending'}
           />
         </TouchableOpacity>
       );
@@ -2230,6 +2648,37 @@ export default function GroupChatScreen() {
           activeOpacity={0.8}
         >
           <View
+            onLayout={(event) => {
+              // Measure message height for precise scroll calculations
+              const { height, y } = event.nativeEvent.layout;
+              messageHeightsRef.current.set(item.id, height);
+              
+              // If this is the last message, track its position and height
+              if (isLastMessage) {
+                lastMessageHeightRef.current = height;
+                lastMessageYPositionRef.current = y;
+                
+                // Calculate target scroll offset to keep message at fixed position from bottom
+                if (viewportHeightRef.current > 0 && shouldMaintainPositionRef.current) {
+                  // Calculate the exact offset needed to keep last message at targetBottomOffsetRef from bottom
+                  const targetScrollOffset = y + height + targetBottomOffsetRef.current - viewportHeightRef.current;
+                  
+                  // Apply scroll offset after a small delay to ensure layout is complete
+                  setTimeout(() => {
+                    if (flatListRef.current && shouldMaintainPositionRef.current) {
+                      try {
+                        flatListRef.current.scrollToOffset({
+                          offset: Math.max(0, targetScrollOffset),
+                          animated: false
+                        });
+                      } catch (error) {
+                        // Silently handle - scroll might not be ready yet
+                      }
+                    }
+                  }, 10);
+                }
+              }
+            }}
             style={{
               backgroundColor: isMine ? '#25D366' : (isDark ? '#374151' : '#E5E7EB'),
               borderRadius: 18,
@@ -2829,8 +3278,9 @@ export default function GroupChatScreen() {
 
       <KeyboardAvoidingView
         style={{ flex: 1 }}
-        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-        keyboardVerticalOffset={0}
+        behavior={Platform.OS === 'ios' ? 'padding' : 'height'} // ✅ Re-enable for Android with 'height' behavior
+        keyboardVerticalOffset={Platform.OS === 'ios' ? 0 : 0}
+        enabled={true} // ✅ Enable for both platforms
       >
         <View style={{ 
           flex: 1,
@@ -2850,21 +3300,17 @@ export default function GroupChatScreen() {
               style={{ flex: 1 }}
             >
               <FlatList
-              ref={flatListRef}
-              data={messages}
-              renderItem={renderItem}
+                ref={flatListRef}
+                data={messages}
+                renderItem={renderItem}
               initialNumToRender={30}
               windowSize={10}
               maxToRenderPerBatch={15}
               removeClippedSubviews={true}
               updateCellsBatchingPeriod={50}
-              onEndReached={() => {
-                if (hasMoreMessages && !loadingMore) {
-                  loadMoreMessages();
-                }
-              }}
-              onEndReachedThreshold={0.1}
-                extraData={messages.length} // Force re-render when messages array changes
+              // REMOVED: onEndReached - it fires at bottom (newest messages) but we want to load at top (oldest)
+              // Loading more messages is handled by onScroll handler when user scrolls to top
+              extraData={messages.length} // Force re-render when messages array changes
                 keyExtractor={(item, index) => {
                   // Create a unique key that handles temporary IDs and prevents duplicates
                   // Always include index as a fallback to ensure uniqueness even with duplicate IDs
@@ -2892,43 +3338,44 @@ export default function GroupChatScreen() {
                   padding: 16, 
                   paddingBottom: 0, // Let KeyboardAvoidingView handle spacing
                 }}
-                inverted={false} // Make sure it's not inverted
+                inverted={false} // Normal scrolling - scroll down to see older messages
                 keyboardShouldPersistTaps="handled"
                 keyboardDismissMode={Platform.OS === 'ios' ? 'interactive' : 'on-drag'}
+              // CRITICAL: Maintain scroll position relative to last visible message
+              // This handles image loading, polling refetch, and content changes automatically
+              maintainVisibleContentPosition={
+                initialScrollCompleteRef.current ? {
+                  minIndexForVisible: 0, // Start maintaining from first item
+                  autoscrollToTopThreshold: 10, // Auto-scroll to top if less than 10 items visible
+                } : undefined
+              }
               onScroll={({ nativeEvent }) => {
                 const { contentOffset, contentSize, layoutMeasurement } = nativeEvent;
                 
-                // Track content and viewport sizes for precise scrolling
-                contentSizeRef.current = { width: contentSize.width, height: contentSize.height };
-                viewportSizeRef.current = { width: layoutMeasurement.width, height: layoutMeasurement.height };
+                // Track viewport height for precise calculations
+                viewportHeightRef.current = layoutMeasurement.height;
                 
-                // Detect user scrolling to manage auto-scroll
+                // Track scroll offset for pagination
                 const currentOffset = contentOffset.y;
-                const contentHeight = contentSize.height;
-                const viewportHeight = layoutMeasurement.height;
-                const previousOffset = lastScrollOffsetRef.current;
-                
-                // Check if user is near bottom (within 100 pixels)
-                const distanceFromBottom = contentHeight - (currentOffset + viewportHeight);
-                const isNearBottom = distanceFromBottom < 100;
-                
-                // Detect if this is a user-initiated scroll (not programmatic)
-                // If offset changed significantly and we're not near bottom, user scrolled
-                if (previousOffset !== 0 && Math.abs(currentOffset - previousOffset) > 10) {
-                  if (!isNearBottom) {
-                    // User scrolled away from bottom
-                    userScrolledRef.current = true;
-                    shouldAutoScrollRef.current = false;
-                  } else {
-                    // User scrolled back to bottom
-                    userScrolledRef.current = false;
-                    shouldAutoScrollRef.current = true;
-                  }
-                }
-                
                 lastScrollOffsetRef.current = currentOffset;
                 
-                // Load more messages when at top (existing functionality)
+                // Calculate if user is at bottom (within 50px threshold)
+                const contentHeight = contentSize.height;
+                const viewportHeight = layoutMeasurement.height;
+                const distanceFromBottom = contentHeight - (currentOffset + viewportHeight);
+                const isAtBottom = distanceFromBottom <= 50;
+                
+                // Update anchor message and position maintenance flag when user is at bottom
+                if (isAtBottom && messages.length > 0) {
+                  isAtBottomRef.current = true;
+                  shouldMaintainPositionRef.current = true;
+                  lastVisibleMessageIdRef.current = messages[messages.length - 1].id;
+                } else {
+                  isAtBottomRef.current = false;
+                  shouldMaintainPositionRef.current = false;
+                }
+                
+                // Load more messages when at top (pagination)
                 const isAtTop = contentOffset.y <= 50;
                 const now = Date.now();
                 if (isAtTop && hasMoreMessages && !loadingMore && (now - lastScrollTrigger > 2000)) {
@@ -2959,94 +3406,61 @@ export default function GroupChatScreen() {
                 ) : null
               }
               onContentSizeChange={(contentWidth, contentHeight) => {
-                // Track content size for precise scrolling
-                contentSizeRef.current = { width: contentWidth, height: contentHeight };
-                
-                // Scroll to bottom when content size changes (e.g., images load)
-                // Only scroll if initial scroll has already happened (onLayout handles initial scroll)
-                // This prevents duplicate scrolls on initial load
-                // Also check isInitialLoadRef to prevent scrolling during initial load period
-                if (!loading && messages.length > 0 && !isInitialLoadRef.current && shouldAutoScrollRef.current && !userScrolledRef.current && hasAttemptedInitialScrollRef.current) {
-                  // Clear any pending scroll
-                  if (scrollTimeoutRef.current) {
-                    clearTimeout(scrollTimeoutRef.current);
-                  }
+                // Maintain fixed position of last message when content changes (polling, refetch, image loading)
+                if (shouldMaintainPositionRef.current && 
+                    !isInitialLoadRef.current && 
+                    initialScrollCompleteRef.current &&
+                    lastMessageHeightRef.current > 0 && 
+                    viewportHeightRef.current > 0 &&
+                    messages.length > 0) {
                   
-                  // Wait for viewport size to be available, then scroll to absolute bottom
-                  scrollTimeoutRef.current = setTimeout(() => {
-                    if (flatListRef.current && messages.length > 0 && shouldAutoScrollRef.current && !userScrolledRef.current) {
+                  // Calculate exact scroll offset to keep last message at fixed position from bottom
+                  // Formula: contentHeight - viewportHeight - targetBottomOffset
+                  const targetScrollOffset = contentHeight - viewportHeightRef.current - targetBottomOffsetRef.current;
+                  
+                  setTimeout(() => {
+                    if (flatListRef.current && shouldMaintainPositionRef.current) {
                       try {
-                        // Use scrollToOffset for precise positioning if we have viewport size
-                        if (viewportSizeRef.current && contentSizeRef.current) {
-                          const targetOffset = Math.max(0, contentSizeRef.current.height - viewportSizeRef.current.height);
-                          (flatListRef.current as any).scrollToOffset({
-                            offset: targetOffset,
-                            animated: false
-                          });
-                        } else {
-                          // Fallback to scrollToEnd
-                          (flatListRef.current as any).scrollToEnd({ animated: false });
-                        }
-                        setHasScrolledToBottom(true);
-                        // Note: Don't set hasAttemptedInitialScrollRef here - onLayout handles initial scroll
+                        flatListRef.current.scrollToOffset({
+                          offset: Math.max(0, targetScrollOffset),
+                          animated: false
+                        });
                       } catch (error) {
-                        console.warn('Scroll failed:', error);
+                        // Silently handle - might be during layout
                       }
                     }
-                  }, 150);
+                  }, 50); // Small delay to ensure layout is complete
+                }
+                
+                // Initial scroll to bottom on first load - scroll to show latest message at bottom
+                if (isInitialLoadRef.current && !loading && messages.length > 0 && !initialScrollCompleteRef.current) {
+                  setTimeout(() => {
+                    if (flatListRef.current && messages.length > 0) {
+                      try {
+                        // Scroll to end to show latest message at bottom (before input)
+                        flatListRef.current.scrollToEnd({ animated: false });
+                        
+                        initialScrollCompleteRef.current = true;
+                        isInitialLoadRef.current = false;
+                        setHasScrolledToBottom(true);
+                        isAtBottomRef.current = true;
+                        shouldMaintainPositionRef.current = true;
+                        if (messages.length > 0) {
+                          lastVisibleMessageIdRef.current = messages[messages.length - 1].id;
+                        }
+                      } catch (error) {
+                        // Mark as complete even if scroll fails
+                        initialScrollCompleteRef.current = true;
+                        isInitialLoadRef.current = false;
+                      }
+                    }
+                  }, 100);
                 }
               }}
               onLayout={(event) => {
-                // Track viewport size when layout is ready
-                const { width, height } = event.nativeEvent.layout;
-                viewportSizeRef.current = { width, height };
-                
-                // Scroll to bottom when layout is ready (only on initial load, once)
-                if (!loading && messages.length > 0 && isInitialLoadRef.current && shouldAutoScrollRef.current && !hasAttemptedInitialScrollRef.current) {
-                  // Set flag immediately to block onContentSizeChange from scrolling during initial load
-                  hasAttemptedInitialScrollRef.current = true;
-                  
-                  // Clear any pending scroll
-                  if (scrollTimeoutRef.current) {
-                    clearTimeout(scrollTimeoutRef.current);
-                  }
-                  
-                  // Wait for content to be measured, then scroll to absolute bottom
-                  scrollTimeoutRef.current = setTimeout(() => {
-                    if (flatListRef.current && messages.length > 0 && isInitialLoadRef.current) {
-                      try {
-                        // Use scrollToOffset for precise positioning if we have both sizes
-                        if (viewportSizeRef.current && contentSizeRef.current) {
-                          const targetOffset = Math.max(0, contentSizeRef.current.height - viewportSizeRef.current.height);
-                          (flatListRef.current as any).scrollToOffset({ 
-                            offset: targetOffset, 
-                            animated: false 
-                          });
-                        } else {
-                          // Fallback: try scrollToEnd, or scroll to last index
-                          try {
-                            (flatListRef.current as any).scrollToEnd({ animated: false });
-                          } catch (e) {
-                            // Last resort: scroll to last message index
-                            const lastIndex = messages.length - 1;
-                            if (lastIndex >= 0) {
-                              (flatListRef.current as any).scrollToIndex({ 
-                                index: lastIndex, 
-                                animated: false,
-                                viewPosition: 1
-                              });
-                            }
-                          }
-                        }
-                        setHasScrolledToBottom(true);
-                        isInitialLoadRef.current = false;
-                        // Note: hasAttemptedInitialScrollRef was set earlier to block competing scrolls
-                      } catch (error) {
-                        console.warn('Initial scroll failed:', error);
-                      }
-                    }
-                  }, 400);
-                }
+                // Track viewport height when layout changes
+                const { height } = event.nativeEvent.layout;
+                viewportHeightRef.current = height;
               }}
             />
           </TouchableOpacity>
@@ -3077,8 +3491,8 @@ export default function GroupChatScreen() {
                   <MaterialCommunityIcons name="close-circle" size={24} color="#6B7280" />
                 </TouchableOpacity>
               </View>
-            )}
-            
+        )}
+        
             {/* Reply Preview */}
             {replyingTo && !editingMessage && (
               <ReplyPreview
@@ -3145,8 +3559,8 @@ export default function GroupChatScreen() {
                 paddingHorizontal: 16,
                 paddingVertical: 8,
                 paddingBottom: Platform.OS === 'android' 
-                  ? (keyboardHeight > 0 ? 0 : insets.bottom) // ✅ No padding when keyboard open, safe area padding when dismissed
-                  : Math.max(insets.bottom + 8, keyboardHeight > 0 ? 8 : 16),
+              ? (keyboardHeight > 0 ? 0 : Math.max(insets.bottom, 8)) // ✅ No padding when keyboard is open - KeyboardAvoidingView handles it
+              : (keyboardHeight > 0 ? 8 : Math.max(insets.bottom, 16)), // ✅ iOS keeps keyboard-aware padding
                 borderTopWidth: 1,
                 borderTopColor: isDark ? '#374151' : '#E5E7EB',
               }}
@@ -3164,19 +3578,19 @@ export default function GroupChatScreen() {
               >
                 {/* Emoji Button - Hide when editing */}
                 {!editingMessage && (
-                  <TouchableOpacity 
-                    onPress={() => setShowEmoji(v => !v)} 
-                    style={{ 
-                      width: 42, 
-                      height: 42, 
-                      borderRadius: 21, 
-                      alignItems: 'center', 
-                      justifyContent: 'center',
-                      marginRight: 4,
-                    }}
-                  >
-                    <MaterialCommunityIcons name="emoticon-outline" size={24} color="#6B7280" />
-                  </TouchableOpacity>
+                <TouchableOpacity 
+                  onPress={() => setShowEmoji(v => !v)} 
+                  style={{ 
+                    width: 42, 
+                    height: 42, 
+                    borderRadius: 21, 
+                    alignItems: 'center', 
+                    justifyContent: 'center',
+                    marginRight: 4,
+                  }}
+                >
+                  <MaterialCommunityIcons name="emoticon-outline" size={24} color="#6B7280" />
+                </TouchableOpacity>
                 )}
 
                 {/* Text Input */}
@@ -3205,36 +3619,36 @@ export default function GroupChatScreen() {
 
                 {/* Gallery Button - Hide when editing */}
                 {!editingMessage && (
-                  <TouchableOpacity 
-                    onPress={pickImage} 
-                    style={{ 
-                      width: 42,
-                      height: 42,
-                      borderRadius: 21,
-                      alignItems: 'center',
-                      justifyContent: 'center',
-                      marginRight: 4,
-                    }}
-                  >
-                    <MaterialCommunityIcons name="image" size={24} color="#6B7280" />
-                  </TouchableOpacity>
+                <TouchableOpacity 
+                  onPress={pickImage} 
+                  style={{ 
+                    width: 42,
+                    height: 42,
+                    borderRadius: 21,
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    marginRight: 4,
+                  }}
+                >
+                  <MaterialCommunityIcons name="image" size={24} color="#6B7280" />
+                </TouchableOpacity>
                 )}
 
                 {/* Attachment Button - Hide when editing */}
                 {!editingMessage && (
-                  <TouchableOpacity 
-                    onPress={pickFile} 
-                    style={{ 
-                      width: 42, 
-                      height: 42, 
-                      borderRadius: 21, 
-                      alignItems: 'center', 
-                      justifyContent: 'center',
-                      marginRight: 4,
-                    }}
-                  >
-                    <MaterialCommunityIcons name="paperclip" size={24} color="#6B7280" />
-                  </TouchableOpacity>
+                <TouchableOpacity 
+                  onPress={pickFile} 
+                  style={{ 
+                    width: 42, 
+                    height: 42, 
+                    borderRadius: 21, 
+                    alignItems: 'center', 
+                    justifyContent: 'center',
+                    marginRight: 4,
+                  }}
+                >
+                  <MaterialCommunityIcons name="paperclip" size={24} color="#6B7280" />
+                </TouchableOpacity>
                 )}
 
                 {/* Send/Mic/Edit Button */}

@@ -1,6 +1,6 @@
 import * as SQLite from 'expo-sqlite';
 
-export const DB_VERSION = 1;
+export const DB_VERSION = 3;
 
 export async function runMigrations(db: SQLite.SQLiteDatabase): Promise<void> {
   const result = await db.getFirstAsync<{ user_version: number }>(
@@ -10,6 +10,14 @@ export async function runMigrations(db: SQLite.SQLiteDatabase): Promise<void> {
 
   if (currentVersion < 1) {
     await migrateToVersion1(db);
+  }
+  
+  if (currentVersion < 2) {
+    await migrateToVersion2(db);
+  }
+  
+  if (currentVersion < 3) {
+    await migrateToVersion3(db);
   }
 }
 
@@ -84,6 +92,18 @@ async function migrateToVersion1(db: SQLite.SQLiteDatabase): Promise<void> {
   `);
 
   await db.execAsync(`
+    CREATE TABLE IF NOT EXISTS users (
+      id INTEGER PRIMARY KEY,
+      name TEXT NOT NULL,
+      email TEXT NOT NULL,
+      avatar_url TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      last_synced_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+  `);
+
+  await db.execAsync(`
     CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, conversation_type);
     CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_messages_sync_status ON messages(sync_status);
@@ -92,6 +112,55 @@ async function migrateToVersion1(db: SQLite.SQLiteDatabase): Promise<void> {
     CREATE INDEX IF NOT EXISTS idx_conversations_updated_at ON conversations(updated_at DESC);
     CREATE INDEX IF NOT EXISTS idx_attachments_message_id ON attachments(message_id);
     CREATE INDEX IF NOT EXISTS idx_sync_state_conversation ON sync_state(conversation_id, conversation_type);
+    CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+  `);
+
+  await db.execAsync(`PRAGMA user_version = 1`);
+}
+
+async function migrateToVersion2(db: SQLite.SQLiteDatabase): Promise<void> {
+  // Add users table for caching user list
+  await db.execAsync(`
+    CREATE TABLE IF NOT EXISTS users (
+      id INTEGER PRIMARY KEY,
+      name TEXT NOT NULL,
+      email TEXT NOT NULL,
+      avatar_url TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      last_synced_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+  `);
+
+  await db.execAsync(`
+    CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+  `);
+
+  await db.execAsync(`PRAGMA user_version = 2`);
+}
+
+async function migrateToVersion3(db: SQLite.SQLiteDatabase): Promise<void> {
+  // Add dedicated groups table for caching group list with all fields
+  await db.execAsync(`
+    CREATE TABLE IF NOT EXISTS groups (
+      id INTEGER PRIMARY KEY,
+      name TEXT NOT NULL,
+      description TEXT,
+      owner_id INTEGER,
+      avatar_url TEXT,
+      member_count INTEGER DEFAULT 0,
+      last_message TEXT,
+      last_message_date TEXT,
+      unread_count INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      last_synced_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+  `);
+
+  await db.execAsync(`
+    CREATE INDEX IF NOT EXISTS idx_groups_updated_at ON groups(updated_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_groups_owner_id ON groups(owner_id);
   `);
 
   await db.execAsync(`PRAGMA user_version = ${DB_VERSION}`);
