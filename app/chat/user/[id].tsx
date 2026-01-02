@@ -740,46 +740,83 @@ export default function UserChatScreen() {
     // STEP 2: Handle API result or fallback to SQLite
     // ✅ CRITICAL FIX: Use the captured isActuallyInitialLoad from the start of the function
     if (apiSuccess) {
-      // ✅ API succeeded - use API data (even if empty, it's the truth)
+      // ✅ API succeeded - merge with existing pending messages instead of replacing
       console.log(`[UserChat] 📥 fetchMessages API success:`, {
         messageCount: apiMessages.length,
         isInitialLoad: isActuallyInitialLoad,
         INITIAL_VISIBLE_MESSAGES,
       });
       
-      setMessages(apiMessages);
-      messagesLengthRef.current = apiMessages.length;
-      
-      if (apiMessages.length > 0) {
-        const latestMsg = apiMessages[apiMessages.length - 1];
-        latestMessageIdRef.current = latestMsg.id;
-        console.log(`[UserChat] 📌 Latest message ID set to: ${latestMsg.id}`);
-        
-        // ✅ DEBUG LOGGING: Log initial message state
-        console.log(`[UserChat] 📊 Initial message state after setMessages:`, {
-          totalMessages: apiMessages.length,
-          firstMessage: {
-            id: apiMessages[0].id,
-            content: apiMessages[0].message?.substring(0, 30),
-            created_at: apiMessages[0].created_at,
-          },
-          lastMessage: {
-            id: latestMsg.id,
-            content: latestMsg.message?.substring(0, 30),
-            created_at: latestMsg.created_at,
-          },
-          isInitialLoad: isInitialLoadRef.current,
-          visibleMessagesStartIndex: visibleMessagesStartIndex,
-          note: 'FlatList will render these messages. With inverted=false, latest messages appear at bottom (need to scroll to bottom).',
+      // ✅ CRITICAL FIX: Merge API messages with existing pending messages instead of replacing
+      // This prevents messages from disappearing when fetchMessages runs after sending
+      setMessages(prev => {
+        // Protect messages that are pending or being sent
+        const messagesBeingSent = getMessagesBeingSent();
+        const pendingMessages = prev.filter(msg => {
+          // Keep pending/failed messages that are being sent
+          if (messagesBeingSent.has(msg.id as number)) {
+            return true;
+          }
+          // Keep pending/failed messages that don't have a server_id yet
+          if ((msg.sync_status === 'pending' || msg.sync_status === 'failed') && 
+              !apiMessages.some(apiMsg => apiMsg.id === msg.id)) {
+            return true;
+          }
+          return false;
         });
-      }
+        
+        // Combine API messages with protected pending messages
+        const allMessages = [...apiMessages, ...pendingMessages];
+        
+        // Deduplicate (prefer API messages over pending if same ID)
+        const uniqueMessages = deduplicateMessages(allMessages);
+        
+        // Sort by created_at
+        const sortedMessages = uniqueMessages.sort((a, b) => 
+          new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
+        );
+        
+        if (__DEV__ && pendingMessages.length > 0) {
+          console.log(`[UserChat] 🔄 fetchMessages: Merged ${pendingMessages.length} pending messages with ${apiMessages.length} API messages`);
+        }
+        
+        // Update refs with merged messages
+        messagesLengthRef.current = sortedMessages.length;
+        
+        if (sortedMessages.length > 0) {
+          const latestMsg = sortedMessages[sortedMessages.length - 1];
+          latestMessageIdRef.current = latestMsg.id;
+          console.log(`[UserChat] 📌 Latest message ID set to: ${latestMsg.id}`);
+          
+          // ✅ DEBUG LOGGING: Log initial message state
+          console.log(`[UserChat] 📊 Initial message state after setMessages:`, {
+            totalMessages: sortedMessages.length,
+            firstMessage: sortedMessages[0] ? {
+              id: sortedMessages[0].id,
+              content: sortedMessages[0].message?.substring(0, 30),
+              created_at: sortedMessages[0].created_at,
+            } : null,
+            lastMessage: {
+              id: latestMsg.id,
+              content: latestMsg.message?.substring(0, 30),
+              created_at: latestMsg.created_at,
+            },
+            isInitialLoad: isInitialLoadRef.current,
+            visibleMessagesStartIndex: visibleMessagesStartIndex,
+            note: 'FlatList will render these messages. With inverted=false, latest messages appear at bottom (need to scroll to bottom).',
+          });
+        }
+        
+        return sortedMessages;
+      });
       
       // ✅ CRITICAL FIX: Use captured isActuallyInitialLoad
       // Initially show only last N messages (latest at bottom)
-      if (isActuallyInitialLoad && apiMessages.length > INITIAL_VISIBLE_MESSAGES) {
-        const startIndex = apiMessages.length - INITIAL_VISIBLE_MESSAGES;
+      // Use messagesLengthRef which now has the merged count
+      if (isActuallyInitialLoad && messagesLengthRef.current > INITIAL_VISIBLE_MESSAGES) {
+        const startIndex = messagesLengthRef.current - INITIAL_VISIBLE_MESSAGES;
         console.log(`[UserChat] 🎯 Setting visibleMessagesStartIndex:`, {
-          totalMessages: apiMessages.length,
+          totalMessages: messagesLengthRef.current,
           INITIAL_VISIBLE_MESSAGES,
           startIndex,
           willShowMessagesFrom: startIndex,
@@ -801,7 +838,7 @@ export default function UserChatScreen() {
       // This is correct - visibleMessages useMemo will show all messages
       // But initialScrollIndex will still be set to ensure FlatList starts at the bottom
       
-      setLoadedMessagesCount(apiMessages.length);
+      setLoadedMessagesCount(messagesLengthRef.current);
       
       if (showLoading) {
         setLoading(false);
@@ -1378,10 +1415,15 @@ export default function UserChatScreen() {
       // 1. User is currently loading more messages (paginating)
       // 2. User just focused (within 2 seconds) - likely a false trigger
       // 3. We're on a page > 1 (user has paginated) - don't reset their pagination
+      // 4. User is currently sending a message - prevent refresh that would remove pending message
+      // 5. Messages are being sent - protect pending messages from being removed
+      const messagesBeingSent = getMessagesBeingSent();
       const shouldSkipRefresh = 
         loadingMore || 
         isPaginatingRef.current || 
         currentPage > 1 ||
+        sending || // ✅ Don't refresh if sending
+        messagesBeingSent.size > 0 || // ✅ Don't refresh if messages are being sent
         (timeSinceLastFocus < 2000 && messages.length > 0);
 
       if (shouldSkipRefresh) {
@@ -1727,6 +1769,56 @@ export default function UserChatScreen() {
     }
   };
 
+  // Helper function to send message with 3 immediate retries
+  const sendMessageWithRetries = async (
+    formData: FormData,
+    maxRetries: number = 3,
+    initialDelay: number = 1000
+  ): Promise<{ success: boolean; response?: any; error?: any; attempt: number }> => {
+    let lastError: any = null;
+    
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        console.log(`[UserChat] 📤 Retry attempt ${attempt}/${maxRetries} for message`);
+        
+        const res = await messagesAPI.sendMessage(formData);
+        
+        // Check if status indicates success
+        if (res.status >= 200 && res.status < 300) {
+          console.log(`[UserChat] ✅ API SEND SUCCESS on attempt ${attempt}/${maxRetries}`);
+          return { success: true, response: res, attempt };
+        } else {
+          // Non-success status
+          lastError = new Error(`API returned status ${res.status}`);
+          console.warn(`[UserChat] ⚠️ API returned non-success status ${res.status} on attempt ${attempt}/${maxRetries}`);
+        }
+      } catch (apiError: any) {
+        lastError = apiError;
+        const isClientError = apiError.response?.status >= 400 && apiError.response?.status < 500;
+        
+        console.warn(`[UserChat] ⚠️ API SEND FAILED on attempt ${attempt}/${maxRetries}: ${apiError.message}`);
+        
+        // If it's a client error (4xx), don't retry - it's a permanent failure
+        if (isClientError) {
+          console.log(`[UserChat] 🚫 Client error (4xx) detected, stopping retries`);
+          return { success: false, error: apiError, attempt };
+        }
+        
+        // If this is not the last attempt, wait before retrying
+        if (attempt < maxRetries) {
+          // Exponential backoff: 1s, 2s, 4s
+          const delay = initialDelay * Math.pow(2, attempt - 1);
+          console.log(`[UserChat] ⏳ Waiting ${delay}ms before retry ${attempt + 1}/${maxRetries}`);
+          await new Promise(resolve => setTimeout(resolve, delay));
+        }
+      }
+    }
+    
+    // All retries failed
+    console.error(`[UserChat] ❌ All ${maxRetries} retry attempts failed`);
+    return { success: false, error: lastError, attempt: maxRetries };
+  };
+
   // Send message
   const handleSend = async () => {
     // Don't send if there's no content at all
@@ -2017,7 +2109,7 @@ export default function UserChatScreen() {
             formData.append('is_voice_message', 'true');
           }
 
-          // ✅ SIMPLIFIED: Send once, let retry service handle failures and verification
+          // ✅ IMPROVED: Send with 3 immediate retries before falling back to SQLite retry service
           try {
             // ✅ CRITICAL: Double-check message is still marked as sending before API call
             // Check both tempLocalId and actualMessageId
@@ -2029,17 +2121,20 @@ export default function UserChatScreen() {
             
             // ✅ LOGGING: Log API send attempt
             const sendStartTime = Date.now();
-            console.log(`[UserChat] 📤 SENDING message ${actualMessageId} (tempLocalId: ${tempLocalId}) to API | Content: "${messageText?.substring(0, 50)}" | Marked as sending: ${isMarked}`);
+            console.log(`[UserChat] 📤 SENDING message ${actualMessageId} (tempLocalId: ${tempLocalId}) to API with 3 retries | Content: "${messageText?.substring(0, 50)}"`);
             
-            // Send to API (single attempt - no retries)
-            const res = await messagesAPI.sendMessage(formData);
+            // Send to API with 3 retries (1s, 2s, 4s delays)
+            const retryResult = await sendMessageWithRetries(formData, 3, 1000);
             
             const sendDuration = Date.now() - sendStartTime;
-            console.log(`[UserChat] 📥 API RESPONSE for message ${actualMessageId} (tempLocalId: ${tempLocalId}) | Status: ${res.status} | Duration: ${sendDuration}ms`);
+            console.log(`[UserChat] 📥 API RESULT for message ${actualMessageId} (tempLocalId: ${tempLocalId}) | Success: ${retryResult.success} | Attempt: ${retryResult.attempt} | Duration: ${sendDuration}ms`);
             
-            // Check if status indicates success
-            if (res.status >= 200 && res.status < 300) {
-              console.log(`[UserChat] ✅ API SEND SUCCESS for message ${actualMessageId} (tempLocalId: ${tempLocalId}) | Status: ${res.status}`);
+            if (retryResult.success && retryResult.response) {
+              const res = retryResult.response;
+              console.log(`[UserChat] ✅ API SEND SUCCESS for message ${actualMessageId} (tempLocalId: ${tempLocalId}) after ${retryResult.attempt} attempt(s) | Status: ${res.status}`);
+              
+              // Check if status indicates success
+              if (res.status >= 200 && res.status < 300) {
               
               // Try to extract message ID from response
               let messageId: number | undefined;
@@ -2188,37 +2283,57 @@ export default function UserChatScreen() {
                 unmarkMessageAsSending(tempLocalId);
                 unmarkMessageAsSending(actualMessageId);
               }
-            } else {
-              // Non-success status - leave as pending, retry service will retry
-              console.error(`[UserChat] ❌ API SEND FAILED for message ${actualMessageId} (tempLocalId: ${tempLocalId}) | Status: ${res.status} | Leaving as pending for retry service`);
-              unmarkMessageAsSending(tempLocalId);
-              unmarkMessageAsSending(actualMessageId); // ✅ Unmark so retry service can retry
-            }
-          } catch (apiError: any) {
-            // Check if it's a client error (4xx) - mark as failed
-            const isClientError = apiError.response?.status >= 400 && apiError.response?.status < 500;
-            
-            console.error(`[UserChat] ❌ API SEND EXCEPTION for message ${actualMessageId} (tempLocalId: ${tempLocalId}) | Error: ${apiError.message} | Status: ${apiError.response?.status} | IsClientError: ${isClientError}`);
-            
-            if (isClientError) {
-              // Client error (4xx) - mark as failed immediately
-              console.log(`[UserChat] 🚫 Marking message ${actualMessageId} as failed (4xx error)`);
-              if (dbInitialized) {
-                await updateMessageStatus(actualMessageId, undefined, 'failed');
-                setMessages(prev => prev.map(msg => 
-                  (msg.id === tempLocalId || msg.id === actualMessageId)
-                    ? { ...msg, sync_status: 'failed' }
-                    : msg
-                ));
               }
-              unmarkMessageAsSending(tempLocalId);
-              unmarkMessageAsSending(actualMessageId); // ✅ Unmark
             } else {
-              // Network error or other - leave as pending, retry service will retry
-              console.log(`[UserChat] 🔄 Leaving message ${actualMessageId} as pending (network error, will retry)`);
-              unmarkMessageAsSending(tempLocalId);
-              unmarkMessageAsSending(actualMessageId); // ✅ Unmark so retry service can retry
+              // All 3 retries failed - now fall back to SQLite retry service
+              const apiError = retryResult.error;
+              const isClientError = apiError?.response?.status >= 400 && apiError?.response?.status < 500;
+              
+              console.error(`[UserChat] ❌ All 3 immediate retries failed for message ${actualMessageId} (tempLocalId: ${tempLocalId}) | Error: ${apiError?.message || 'Unknown'} | Status: ${apiError?.response?.status} | Falling back to SQLite retry service`);
+              
+              if (isClientError) {
+                // Client error (4xx) - mark as failed immediately (don't retry)
+                console.log(`[UserChat] 🚫 Marking message ${actualMessageId} as failed (4xx error - permanent failure)`);
+                if (dbInitialized) {
+                  await updateMessageStatus(actualMessageId, undefined, 'failed');
+                  setMessages(prev => prev.map(msg => 
+                    (msg.id === tempLocalId || msg.id === actualMessageId)
+                      ? { ...msg, sync_status: 'failed' }
+                      : msg
+                  ));
+                }
+                unmarkMessageAsSending(tempLocalId);
+                unmarkMessageAsSending(actualMessageId);
+              } else {
+                // Network error or other - mark as pending, SQLite retry service will handle it
+                console.log(`[UserChat] 🔄 Marking message ${actualMessageId} as pending (will be handled by SQLite retry service)`);
+                if (dbInitialized) {
+                  await updateMessageStatus(actualMessageId, undefined, 'pending');
+                  setMessages(prev => prev.map(msg => 
+                    (msg.id === tempLocalId || msg.id === actualMessageId)
+                      ? { ...msg, sync_status: 'pending' }
+                      : msg
+                  ));
+                }
+                unmarkMessageAsSending(tempLocalId);
+                unmarkMessageAsSending(actualMessageId); // Unmark so retry service can retry
+              }
             }
+          } catch (e: unknown) {
+            const error = e as any;
+            console.error('[UserChat] Unexpected error in handleSend API call:', error);
+            
+            // Ensure message is kept as pending for retry
+            if (dbInitialized) {
+              await updateMessageStatus(actualMessageId, undefined, 'pending');
+              setMessages(prev => prev.map(msg => 
+                (msg.id === tempLocalId || msg.id === actualMessageId)
+                  ? { ...msg, sync_status: 'pending' }
+                  : msg
+              ));
+            }
+            unmarkMessageAsSending(tempLocalId);
+            unmarkMessageAsSending(actualMessageId);
           }
           
           // Update last_seen_at

@@ -5,7 +5,7 @@ import { useNotifications } from '@/context/NotificationContext';
 import { useTheme } from '@/context/ThemeContext';
 import { conversationsAPI } from '@/services/api';
 import { getConversations as getDbConversations, initDatabase, isDatabaseEmpty, saveConversations as saveDbConversations } from '@/services/database';
-import { syncConversations } from '@/services/syncService';
+import { syncConversations, startBackgroundBulkSync } from '@/services/syncService';
 import { runAsyncStorageMigration } from '@/utils/migrateAsyncStorage';
 import { MaterialCommunityIcons } from '@expo/vector-icons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -399,9 +399,19 @@ export default function ConversationsScreen() {
       const wasOffline = !isOnline;
       setIsOnline(connected);
       
-      // If we just came back online, refresh conversations
+      // If we just came back online, refresh conversations and start bulk sync
       if (connected && wasOffline && user) {
         loadConversations(true);
+        
+        // Start background bulk sync when network comes back (non-blocking)
+        // This ensures any missing messages are synced
+        if (dbInitialized && user.id) {
+          console.log('[Conversations] Network came back, starting background bulk sync...');
+          startBackgroundBulkSync(user.id, {
+            onlyIfEmpty: false, // Always sync when network comes back
+            maxConversations: undefined // Sync all conversations
+          });
+        }
       }
     });
 

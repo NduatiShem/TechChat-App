@@ -3,6 +3,7 @@ import { conversationsAPI, messagesAPI } from './api';
 import {
     deleteMessage,
     getDb,
+    getConversations,
     saveConversations,
     saveMessages,
     updateSyncState,
@@ -429,6 +430,181 @@ export async function backgroundSync(activeConversationId?: number, activeConver
     console.error('[Sync] Error in background sync:', error);
   }
 }
+
+/**
+ * Bulk sync all messages for all conversations
+ * This ensures SQLite has all messages from API, not just opened conversations
+ * Uses pagination to sync ALL messages, not just first 50
+ */
+export async function bulkSyncAllMessages(
+  currentUserId: number,
+  onProgress?: (progress: { conversationIndex: number; totalConversations: number; conversationName: string; messagesSynced: number }) => void
+): Promise<{ success: boolean; totalSynced: number; errors: string[] }> {
+  const errors: string[] = [];
+  let totalSynced = 0;
+  
+  try {
+    // Step 1: Get all conversations from SQLite (or sync conversations first if empty)
+    let conversations = await getConversations();
+    
+    if (conversations.length === 0) {
+      // No conversations in SQLite, sync conversations first
+      console.log('[BulkSync] No conversations in SQLite, syncing conversations first...');
+      const syncResult = await syncConversations();
+      if (syncResult.success) {
+        conversations = await getConversations();
+        console.log(`[BulkSync] Synced ${conversations.length} conversations`);
+      } else {
+        return { success: false, totalSynced: 0, errors: ['Failed to sync conversations'] };
+      }
+    }
+    
+    if (conversations.length === 0) {
+      console.log('[BulkSync] No conversations to sync');
+      return { success: true, totalSynced: 0, errors: [] };
+    }
+    
+    console.log(`[BulkSync] Starting bulk sync for ${conversations.length} conversations`);
+    
+    // Step 2: Sync messages for each conversation with pagination
+    for (let i = 0; i < conversations.length; i++) {
+      const conv = conversations[i];
+      let conversationMessageCount = 0;
+      
+      try {
+        // Sync all pages of messages for this conversation
+        let page = 1;
+        let hasMore = true;
+        const maxPages = 100; // Safety limit: max 100 pages (5000 messages per conversation)
+        
+        while (hasMore && page <= maxPages) {
+          const result = await syncOlderMessages(
+            conv.conversation_id,
+            conv.conversation_type,
+            page,
+            50, // 50 messages per page
+            currentUserId
+          );
+          
+          if (result.success) {
+            conversationMessageCount += result.messagesCount;
+            hasMore = result.hasMore;
+            page++;
+            
+            // Report progress
+            if (onProgress) {
+              onProgress({
+                conversationIndex: i + 1,
+                totalConversations: conversations.length,
+                conversationName: conv.name,
+                messagesSynced: conversationMessageCount
+              });
+            }
+            
+            // Small delay to prevent overwhelming the API
+            if (hasMore) {
+              await new Promise(resolve => setTimeout(resolve, 100));
+            }
+          } else {
+            errors.push(`Failed to sync ${conv.name} (page ${page}): ${result.error}`);
+            hasMore = false;
+          }
+        }
+        
+        totalSynced += conversationMessageCount;
+        
+        if (__DEV__) {
+          console.log(`[BulkSync] Synced ${conversationMessageCount} messages for ${conv.name} (${i + 1}/${conversations.length})`);
+        }
+        
+        // Delay between conversations to prevent overwhelming
+        if (i < conversations.length - 1) {
+          await new Promise(resolve => setTimeout(resolve, 200));
+        }
+        
+      } catch (error: any) {
+        const errorMsg = `Error syncing ${conv.name}: ${error.message}`;
+        errors.push(errorMsg);
+        console.error(`[BulkSync] ${errorMsg}`);
+      }
+    }
+    
+    console.log(`[BulkSync] Completed: ${totalSynced} messages synced, ${errors.length} errors`);
+    
+    return {
+      success: errors.length === 0,
+      totalSynced,
+      errors
+    };
+    
+  } catch (error: any) {
+    console.error('[BulkSync] Fatal error:', error);
+    return {
+      success: false,
+      totalSynced,
+      errors: [...errors, `Fatal error: ${error.message}`]
+    };
+  }
+}
+
+/**
+ * Background bulk sync - runs when app starts or network comes back
+ * Syncs in background without blocking UI
+ * 
+ * @param currentUserId - Current user ID
+ * @param options - Sync options
+ */
+export async function startBackgroundBulkSync(
+  currentUserId: number,
+  options: {
+    onlyIfEmpty?: boolean; // Only sync if SQLite is mostly empty
+    maxConversations?: number; // Limit number of conversations to sync (for testing)
+  } = {}
+): Promise<void> {
+  try {
+    // Check if we should skip (if SQLite already has data)
+    if (options.onlyIfEmpty) {
+      const conversations = await getConversations();
+      if (conversations.length > 0) {
+        // Check if we have messages for at least some conversations
+        const database = await getDb();
+        if (database) {
+          const messageCount = await database.getFirstAsync<{ count: number }>(
+            `SELECT COUNT(*) as count FROM messages WHERE sync_status = 'synced'`
+          );
+          
+          // If we already have a reasonable amount of messages, skip bulk sync
+          if (messageCount && messageCount.count > 100) {
+            if (__DEV__) {
+              console.log(`[BulkSync] Skipping - already have ${messageCount.count} synced messages`);
+            }
+            return;
+          }
+        }
+      }
+    }
+    
+    // Run bulk sync in background (non-blocking)
+    bulkSyncAllMessages(currentUserId, (progress) => {
+      if (__DEV__) {
+        console.log(`[BulkSync] Progress: ${progress.conversationIndex}/${progress.totalConversations} - ${progress.conversationName} (${progress.messagesSynced} messages)`);
+      }
+    }).then(result => {
+      if (result.success) {
+        console.log(`[BulkSync] ✅ Background sync completed: ${result.totalSynced} messages synced`);
+      } else {
+        console.warn(`[BulkSync] ⚠️ Background sync completed with ${result.errors.length} errors: ${result.errors.slice(0, 3).join(', ')}${result.errors.length > 3 ? '...' : ''}`);
+      }
+    }).catch(error => {
+      console.error('[BulkSync] ❌ Background sync failed:', error);
+    });
+    
+  } catch (error) {
+    console.error('[BulkSync] Error starting background bulk sync:', error);
+  }
+}
+
+
 
 
 

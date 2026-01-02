@@ -9,7 +9,7 @@ export const AppConfig = {
     development: {
       ios: 'http://127.0.0.1:8000/api',        // For iOS Simulator
       android: 'http://10.0.2.2:8000/api',     // For Android Emulator
-      physical: 'http://192.168.100.65:8000/api', // For physical devices (your computer's IP)
+      physical: 'http://192.168.100.38:8000/api', // For physical devices (your computer's IP)
     },
     production: 'https://healthclassique.tech-bridge.app/api',
   },

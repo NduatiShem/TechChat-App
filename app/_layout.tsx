@@ -15,6 +15,8 @@ import { useBackgroundUpdateCheck } from "@/hooks/useBackgroundUpdateCheck";
 import { UpdateNotification } from "@/components/UpdateNotification";
 import { startRetryService, retryPendingMessages } from "@/services/messageRetryService";
 import { initDatabase } from "@/services/database";
+import { startBackgroundBulkSync } from "@/services/syncService";
+import NetInfo from '@react-native-community/netinfo';
 import "../global.css";
 
 // Prevent splash screen from auto-hiding
@@ -23,7 +25,7 @@ SplashScreen.preventAutoHideAsync();
 function AppTabsLayout() {
   const { currentTheme } = useTheme();
   const { groupUnreadCount, updateGroupUnreadCount, updateUnreadCount } = useNotifications();
-  const { isAuthenticated } = useAuth();
+  const { isAuthenticated, user } = useAuth();
   const pathname = usePathname();
   const isDark = currentTheme === 'dark';
   const lastSeenIntervalRef = useRef<NodeJS.Timeout | null>(null);
@@ -132,6 +134,29 @@ function AppTabsLayout() {
               });
             }, 1000); // Wait 1 second after service starts
           }, 800); // 800ms delay for retry service (after screens start loading)
+          
+          // ✅ BULK SYNC: Start background bulk sync after database is initialized
+          // Check network status first, then start sync if online
+          setTimeout(async () => {
+            try {
+              const netState = await NetInfo.fetch();
+              const isOnline = netState.isConnected ?? false;
+              
+              if (isOnline && user?.id) {
+                console.log('[AppTabsLayout] Starting background bulk sync...');
+                // Start bulk sync in background (non-blocking)
+                // Only sync if SQLite is mostly empty (first time setup)
+                startBackgroundBulkSync(user.id, {
+                  onlyIfEmpty: true, // Only sync if SQLite has < 100 messages
+                  maxConversations: undefined // Sync all conversations
+                });
+              } else {
+                console.log('[AppTabsLayout] Skipping bulk sync - offline or no user');
+              }
+            } catch (error) {
+              console.error('[AppTabsLayout] Error starting bulk sync:', error);
+            }
+          }, 2000); // Wait 2 seconds after database init to start bulk sync
         } else {
           console.error('[AppTabsLayout] Database initialization failed after retries, retry service not started');
         }
@@ -141,7 +166,7 @@ function AppTabsLayout() {
     };
     
     initializeServices();
-  }, [isAuthenticated]);
+  }, [isAuthenticated, user?.id]);
 
   // Handle app state changes for badge management and last_seen updates
   useEffect(() => {
@@ -163,6 +188,23 @@ function AppTabsLayout() {
           if (retryServiceStartedRef.current) {
             retryPendingMessages().catch(err => {
               console.error('[AppTabsLayout] Error retrying messages on foreground:', err);
+            });
+          }
+          
+          // ✅ BULK SYNC: Start background bulk sync when app comes to foreground (if online)
+          // This ensures any missing messages are synced when user returns to app
+          if (user?.id) {
+            NetInfo.fetch().then(netState => {
+              const isOnline = netState.isConnected ?? false;
+              if (isOnline) {
+                console.log('[AppTabsLayout] App came to foreground, starting background bulk sync...');
+                startBackgroundBulkSync(user.id, {
+                  onlyIfEmpty: false, // Always sync when app comes to foreground
+                  maxConversations: undefined // Sync all conversations
+                });
+              }
+            }).catch(err => {
+              console.error('[AppTabsLayout] Error checking network for bulk sync:', err);
             });
           }
           
