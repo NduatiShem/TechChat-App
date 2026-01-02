@@ -1,5 +1,6 @@
 import type { DatabaseAttachment, DatabaseMessage } from '@/types/database';
 import { AppState, AppStateStatus } from 'react-native';
+import NetInfo from '@react-native-community/netinfo';
 import { messagesAPI } from './api';
 import { getDb, getPendingMessages, updateMessageStatus, writeQueue, retryWithBackoff, validateDatabase } from './database';
 
@@ -8,6 +9,7 @@ let isRetrying = false;
 let appState: AppStateStatus = 'active';
 let backgroundRetryTimeout: NodeJS.Timeout | null = null;
 let appStateSubscription: any = null;
+let networkStateSubscription: any = null;
 
 /**
  * Retry sending pending/failed messages
@@ -743,6 +745,25 @@ export function startRetryService(intervalMs: number = 30000): void {
     }
   });
   
+  // ✅ CRITICAL FIX: Add network state listener to retry immediately when network comes back
+  if (networkStateSubscription) {
+    networkStateSubscription();
+  }
+  
+  networkStateSubscription = NetInfo.addEventListener(state => {
+    const isConnected = state.isConnected ?? false;
+    
+    if (isConnected) {
+      console.log('[MessageRetry] 🌐 Network came back online, retrying pending messages immediately...');
+      // Retry immediately when network comes back
+      retryPendingMessages().catch(error => {
+        console.error('[MessageRetry] Network reconnect retry error:', error);
+      });
+    } else {
+      console.log('[MessageRetry] 🌐 Network went offline');
+    }
+  });
+  
   // Initial delay before first retry to avoid immediate retries
   setTimeout(() => {
     // Start interval-based retry for active state
@@ -764,7 +785,7 @@ export function startRetryService(intervalMs: number = 30000): void {
   }, 2000); // 2 second delay before first retry
   
   if (__DEV__) {
-    console.log(`[MessageRetry] Started global retry service (interval: ${intervalMs}ms, background: 2min, foreground: 10s)`);
+    console.log(`[MessageRetry] Started global retry service (interval: ${intervalMs}ms, background: 2min, foreground: 10s, network-aware)`);
   }
 }
 
@@ -783,6 +804,11 @@ export function stopRetryService(): void {
   if (appStateSubscription) {
     appStateSubscription.remove();
     appStateSubscription = null;
+  }
+  // ✅ CRITICAL FIX: Clean up network state listener
+  if (networkStateSubscription) {
+    networkStateSubscription();
+    networkStateSubscription = null;
   }
   if (__DEV__) {
     console.log('[MessageRetry] Stopped retry service');
@@ -826,6 +852,7 @@ export async function retryFailedMessage(localMessageId: number): Promise<boolea
     return false;
   }
 }
+
 
 
 

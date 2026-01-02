@@ -1769,34 +1769,38 @@ export default function UserChatScreen() {
     }
   };
 
-  // Helper function to send message with 3 immediate retries
+  // ✅ IMPROVED: Helper function with 3 immediate retries + persistent retries while network is available
   const sendMessageWithRetries = async (
     formData: FormData,
-    maxRetries: number = 3,
-    initialDelay: number = 1000
+    messageId: number,
+    maxImmediateRetries: number = 3,
+    initialDelay: number = 1000,
+    persistentRetryInterval: number = 5000, // 5 seconds between persistent retries
+    persistentRetryTimeout: number = 30000 // 30 seconds total for persistent retries
   ): Promise<{ success: boolean; response?: any; error?: any; attempt: number }> => {
     let lastError: any = null;
     
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    // STEP 1: 3 immediate retries with exponential backoff (1s, 2s, 4s)
+    for (let attempt = 1; attempt <= maxImmediateRetries; attempt++) {
       try {
-        console.log(`[UserChat] 📤 Retry attempt ${attempt}/${maxRetries} for message`);
+        console.log(`[UserChat] 📤 Immediate retry attempt ${attempt}/${maxImmediateRetries} for message ${messageId}`);
         
         const res = await messagesAPI.sendMessage(formData);
         
         // Check if status indicates success
         if (res.status >= 200 && res.status < 300) {
-          console.log(`[UserChat] ✅ API SEND SUCCESS on attempt ${attempt}/${maxRetries}`);
+          console.log(`[UserChat] ✅ API SEND SUCCESS on immediate attempt ${attempt}/${maxImmediateRetries}`);
           return { success: true, response: res, attempt };
         } else {
           // Non-success status
           lastError = new Error(`API returned status ${res.status}`);
-          console.warn(`[UserChat] ⚠️ API returned non-success status ${res.status} on attempt ${attempt}/${maxRetries}`);
+          console.warn(`[UserChat] ⚠️ API returned non-success status ${res.status} on attempt ${attempt}/${maxImmediateRetries}`);
         }
       } catch (apiError: any) {
         lastError = apiError;
         const isClientError = apiError.response?.status >= 400 && apiError.response?.status < 500;
         
-        console.warn(`[UserChat] ⚠️ API SEND FAILED on attempt ${attempt}/${maxRetries}: ${apiError.message}`);
+        console.warn(`[UserChat] ⚠️ API SEND FAILED on immediate attempt ${attempt}/${maxImmediateRetries}: ${apiError.message}`);
         
         // If it's a client error (4xx), don't retry - it's a permanent failure
         if (isClientError) {
@@ -1805,18 +1809,66 @@ export default function UserChatScreen() {
         }
         
         // If this is not the last attempt, wait before retrying
-        if (attempt < maxRetries) {
+        if (attempt < maxImmediateRetries) {
           // Exponential backoff: 1s, 2s, 4s
           const delay = initialDelay * Math.pow(2, attempt - 1);
-          console.log(`[UserChat] ⏳ Waiting ${delay}ms before retry ${attempt + 1}/${maxRetries}`);
+          console.log(`[UserChat] ⏳ Waiting ${delay}ms before immediate retry ${attempt + 1}/${maxImmediateRetries}`);
           await new Promise(resolve => setTimeout(resolve, delay));
         }
       }
     }
     
-    // All retries failed
-    console.error(`[UserChat] ❌ All ${maxRetries} retry attempts failed`);
-    return { success: false, error: lastError, attempt: maxRetries };
+    // STEP 2: Persistent retries while network is available (up to timeout)
+    console.log(`[UserChat] 🔄 Starting persistent retries for message ${messageId} (while network available, max ${persistentRetryTimeout}ms)`);
+    const persistentRetryStartTime = Date.now();
+    let persistentAttempt = maxImmediateRetries + 1;
+    
+    while (Date.now() - persistentRetryStartTime < persistentRetryTimeout) {
+      // Check network before each persistent retry
+      try {
+        const netState = await NetInfo.fetch();
+        if (!netState.isConnected) {
+          console.log(`[UserChat] 🌐 Network offline, stopping persistent retries for message ${messageId}`);
+          break; // Network gone, fall back to SQLite retry service
+        }
+      } catch (netError) {
+        console.warn(`[UserChat] ⚠️ Error checking network status: ${netError}`);
+        // Continue retrying if network check fails (optimistic)
+      }
+      
+      try {
+        console.log(`[UserChat] 📤 Persistent retry attempt ${persistentAttempt} for message ${messageId}`);
+        const res = await messagesAPI.sendMessage(formData);
+        
+        if (res.status >= 200 && res.status < 300) {
+          console.log(`[UserChat] ✅ API SEND SUCCESS on persistent retry ${persistentAttempt}`);
+          return { success: true, response: res, attempt: persistentAttempt };
+        } else {
+          lastError = new Error(`API returned status ${res.status}`);
+          console.warn(`[UserChat] ⚠️ API returned non-success status ${res.status} on persistent retry ${persistentAttempt}`);
+        }
+      } catch (apiError: any) {
+        lastError = apiError;
+        const isClientError = apiError.response?.status >= 400 && apiError.response?.status < 500;
+        
+        if (isClientError) {
+          console.log(`[UserChat] 🚫 Client error (4xx) on persistent retry ${persistentAttempt}, stopping`);
+          return { success: false, error: apiError, attempt: persistentAttempt };
+        }
+        
+        // Log but continue retrying
+        console.warn(`[UserChat] ⚠️ Persistent retry ${persistentAttempt} failed: ${apiError.message}`);
+      }
+      
+      // Wait before next persistent retry
+      await new Promise(resolve => setTimeout(resolve, persistentRetryInterval));
+      persistentAttempt++;
+    }
+    
+    // All retries exhausted - fall back to SQLite retry service
+    const totalAttempts = persistentAttempt - 1;
+    console.log(`[UserChat] ⏱️ Persistent retry timeout reached for message ${messageId} (${totalAttempts} total attempts), falling back to SQLite retry service`);
+    return { success: false, error: lastError, attempt: totalAttempts };
   };
 
   // Send message
@@ -2109,7 +2161,7 @@ export default function UserChatScreen() {
             formData.append('is_voice_message', 'true');
           }
 
-          // ✅ IMPROVED: Send with 3 immediate retries before falling back to SQLite retry service
+          // ✅ IMPROVED: Send with 3 immediate retries + persistent retries (while network available) before falling back to SQLite retry service
           try {
             // ✅ CRITICAL: Double-check message is still marked as sending before API call
             // Check both tempLocalId and actualMessageId
@@ -2121,10 +2173,10 @@ export default function UserChatScreen() {
             
             // ✅ LOGGING: Log API send attempt
             const sendStartTime = Date.now();
-            console.log(`[UserChat] 📤 SENDING message ${actualMessageId} (tempLocalId: ${tempLocalId}) to API with 3 retries | Content: "${messageText?.substring(0, 50)}"`);
+            console.log(`[UserChat] 📤 SENDING message ${actualMessageId} (tempLocalId: ${tempLocalId}) to API with persistent retries | Content: "${messageText?.substring(0, 50)}"`);
             
-            // Send to API with 3 retries (1s, 2s, 4s delays)
-            const retryResult = await sendMessageWithRetries(formData, 3, 1000);
+            // Send to API with 3 immediate retries + persistent retries while network available
+            const retryResult = await sendMessageWithRetries(formData, actualMessageId, 3, 1000);
             
             const sendDuration = Date.now() - sendStartTime;
             console.log(`[UserChat] 📥 API RESULT for message ${actualMessageId} (tempLocalId: ${tempLocalId}) | Success: ${retryResult.success} | Attempt: ${retryResult.attempt} | Duration: ${sendDuration}ms`);
@@ -2285,11 +2337,11 @@ export default function UserChatScreen() {
               }
               }
             } else {
-              // All 3 retries failed - now fall back to SQLite retry service
+              // All retries (immediate + persistent) failed - now fall back to SQLite retry service
               const apiError = retryResult.error;
               const isClientError = apiError?.response?.status >= 400 && apiError?.response?.status < 500;
               
-              console.error(`[UserChat] ❌ All 3 immediate retries failed for message ${actualMessageId} (tempLocalId: ${tempLocalId}) | Error: ${apiError?.message || 'Unknown'} | Status: ${apiError?.response?.status} | Falling back to SQLite retry service`);
+              console.error(`[UserChat] ❌ All retries failed for message ${actualMessageId} (tempLocalId: ${tempLocalId}) | Total attempts: ${retryResult.attempt} | Error: ${apiError?.message || 'Unknown'} | Status: ${apiError?.response?.status} | Falling back to SQLite retry service`);
               
               if (isClientError) {
                 // Client error (4xx) - mark as failed immediately (don't retry)
