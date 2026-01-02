@@ -582,11 +582,38 @@ export async function saveMessages(
           let messageId: number;
 
           if (existingMessage) {
+            // ✅ CRITICAL FIX: Protect pending/failed messages from being overwritten
+            // Only update sync_status if:
+            // 1. Server IDs match (message was actually sent and synced)
+            // 2. Pending message got server_id from sync (retry service or sync found it on server)
+            // 3. Never overwrite pending/failed status unless we have proof it was sent (server_id match)
+            
+            const hasMatchingServerId = msg.server_id && existingMessage.server_id === msg.server_id;
+            const pendingGotServerId = !existingMessage.server_id && msg.server_id && 
+                                      (existingMessage.sync_status === 'pending' || existingMessage.sync_status === 'failed');
+            
+            // Determine new sync_status
+            let newSyncStatus: string;
+            if (hasMatchingServerId) {
+              // Server IDs match - message was sent, safe to mark as synced
+              newSyncStatus = 'synced';
+            } else if (pendingGotServerId) {
+              // Pending message got server_id from sync - it was found on server, mark as synced
+              newSyncStatus = 'synced';
+            } else if (existingMessage.sync_status === 'pending' || existingMessage.sync_status === 'failed') {
+              // Keep pending/failed status - don't overwrite!
+              newSyncStatus = existingMessage.sync_status;
+            } else {
+              // Existing message is synced or other status - use new status or default
+              newSyncStatus = (msg.sync_status ?? existingMessage.sync_status) || 'synced';
+            }
+            
             // If message has server_id, update created_at to match server timestamp
             // This prevents duplicates with different timestamps
             if (msg.server_id && msg.created_at) {
               await validDb.runAsync(
                 `UPDATE messages SET
+                  server_id = ?,
                   message = ?,
                   created_at = ?,
                   read_at = ?,
@@ -595,11 +622,12 @@ export async function saveMessages(
                   updated_at = datetime('now')
                 WHERE id = ?`,
                 [
+                  msg.server_id ?? existingMessage.server_id, // Update server_id if provided
                   (msg.message ?? existingMessage.message) || null,
                   msg.created_at, // Use server timestamp
                   (msg.read_at ?? existingMessage.read_at) || null,
                   (msg.edited_at ?? existingMessage.edited_at) || null,
-                  (msg.sync_status ?? existingMessage.sync_status) || 'synced',
+                  newSyncStatus, // Use protected status
                   existingMessage.id,
                 ]
               );
@@ -617,7 +645,7 @@ export async function saveMessages(
                   (msg.message ?? existingMessage.message) || null,
                   (msg.read_at ?? existingMessage.read_at) || null,
                   (msg.edited_at ?? existingMessage.edited_at) || null,
-                  (msg.sync_status ?? existingMessage.sync_status) || 'synced',
+                  newSyncStatus, // Use protected status
                   existingMessage.id,
                 ]
               );
