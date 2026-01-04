@@ -13,7 +13,7 @@ import { ActivityIndicator, AppState, View } from "react-native";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 import { useBackgroundUpdateCheck } from "@/hooks/useBackgroundUpdateCheck";
 import { UpdateNotification } from "@/components/UpdateNotification";
-import { startRetryService, retryPendingMessages } from "@/services/messageRetryService";
+// ✅ NEW: Retry service removed - users can manually retry failed messages from UI
 import { initDatabase } from "@/services/database";
 import { startBackgroundBulkSync } from "@/services/syncService";
 import NetInfo from '@react-native-community/netinfo';
@@ -119,34 +119,8 @@ function AppTabsLayout() {
         }
         
         if (db) {
-          console.log('[AppTabsLayout] Database initialized, starting retry service');
-          // ✅ STAGGERED LOADING: Delay retry service to prevent concurrent database access
-          setTimeout(() => {
-          // Start retry service globally - this ensures pending messages are retried
-          // even when user is not in a chat screen
-          startRetryService(30000); // Retry every 30 seconds
-          retryServiceStartedRef.current = true;
-          
-          // ✅ CRITICAL FIX: Retry immediately on startup with network check
-          // This ensures pending messages from previous session are sent right away
-          NetInfo.fetch().then(netState => {
-            const isOnline = netState.isConnected ?? false;
-            if (isOnline) {
-              console.log('[AppTabsLayout] Network available on startup, retrying pending messages immediately...');
-              retryPendingMessages().catch(err => {
-                console.error('[AppTabsLayout] Error in initial retry:', err);
-              });
-            } else {
-              console.log('[AppTabsLayout] Network offline on startup, will retry when network comes back');
-            }
-          }).catch(err => {
-            console.error('[AppTabsLayout] Error checking network for initial retry:', err);
-            // Try anyway if network check fails
-            retryPendingMessages().catch(retryErr => {
-              console.error('[AppTabsLayout] Error in initial retry:', retryErr);
-            });
-          });
-          }, 800); // 800ms delay for retry service (after screens start loading)
+          console.log('[AppTabsLayout] Database initialized');
+          // ✅ NEW: Retry service removed - users can manually retry failed messages from UI
           
           // ✅ BULK SYNC: Start background bulk sync after database is initialized
           // Check network status first, then start sync if online
@@ -196,26 +170,7 @@ function AppTabsLayout() {
           // Load groups to update group counter when app becomes active
           loadGroupsForCounter().catch(err => console.error('loadGroupsForCounter error:', err));
           
-          // ✅ CRITICAL FIX: Retry pending messages immediately when app comes to foreground
-          // Check network first, then retry if online
-          // This works even if retry service wasn't fully initialized yet (cold start)
-          NetInfo.fetch().then(netState => {
-            const isOnline = netState.isConnected ?? false;
-            if (isOnline) {
-              console.log('[AppTabsLayout] App came to foreground with network, retrying pending messages...');
-              retryPendingMessages().catch(err => {
-                console.error('[AppTabsLayout] Error retrying messages on foreground:', err);
-              });
-            } else {
-              console.log('[AppTabsLayout] App came to foreground but network offline, will retry when network comes back');
-            }
-          }).catch(err => {
-            console.error('[AppTabsLayout] Error checking network on foreground:', err);
-            // Try anyway if network check fails
-            retryPendingMessages().catch(retryErr => {
-              console.error('[AppTabsLayout] Error retrying messages on foreground:', retryErr);
-            });
-          });
+          // ✅ NEW: Retry service removed - users can manually retry failed messages from UI
           
           // ✅ BULK SYNC: Start background bulk sync when app comes to foreground (if online)
           // This ensures any missing messages are synced when user returns to app
@@ -275,32 +230,7 @@ function AppTabsLayout() {
 
     const subscription = AppState.addEventListener('change', handleAppStateChange);
     
-    // ✅ CRITICAL FIX: Also check on initial mount if app is already active
-    // This handles the case when app is opened fresh (cold start)
-    if (AppState.currentState === 'active') {
-      NetInfo.fetch().then(netState => {
-        const isOnline = netState.isConnected ?? false;
-        if (isOnline) {
-          // Small delay to ensure database is initialized
-          setTimeout(() => {
-            console.log('[AppTabsLayout] App started active with network, retrying pending messages...');
-            retryPendingMessages().catch(err => {
-              console.error('[AppTabsLayout] Error retrying messages on initial active state:', err);
-            });
-          }, 1000);
-        } else {
-          console.log('[AppTabsLayout] App started active but network offline, will retry when network comes back');
-        }
-      }).catch(err => {
-        console.error('[AppTabsLayout] Error checking network on initial active state:', err);
-        // Try anyway if network check fails (with delay)
-        setTimeout(() => {
-          retryPendingMessages().catch(retryErr => {
-            console.error('[AppTabsLayout] Error retrying messages on initial active state:', retryErr);
-          });
-        }, 1000);
-      });
-    }
+    // ✅ NEW: Retry service removed - users can manually retry failed messages from UI
     
     return () => {
       try {

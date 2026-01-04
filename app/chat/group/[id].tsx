@@ -13,7 +13,7 @@ import { useNotifications } from '@/context/NotificationContext';
 import { useTheme } from '@/context/ThemeContext';
 import { groupsAPI, messagesAPI, usersAPI } from '@/services/api';
 import { deleteMessage as deleteDbMessage, getDb, getMessages as getDbMessages, hasMessagesForConversation, initDatabase, saveMessages as saveDbMessages, updateMessageByServerId, updateMessageStatus } from '@/services/database';
-import { startRetryService, retryPendingMessages, markMessageAsSending, unmarkMessageAsSending, isMessageBeingSent, getMessagesBeingSent } from '@/services/messageRetryService';
+import { markMessageAsSending, unmarkMessageAsSending, isMessageBeingSent, getMessagesBeingSent } from '@/services/messageRetryService';
 import { syncConversationMessages } from '@/services/syncService';
 import { isVideoAttachment } from '@/utils/textUtils';
 import { MaterialCommunityIcons, MaterialIcons } from '@expo/vector-icons';
@@ -1107,16 +1107,7 @@ export default function GroupChatScreen() {
     };
   }, [id, loadingMore, sending, dbInitialized, syncForNewMessages]); // CRITICAL FIX: Removed 'messages.length' to prevent stale closure
   
-  // Start retry service on mount
-  useEffect(() => {
-    if (dbInitialized) {
-      startRetryService(30000); // Retry every 30 seconds
-    }
-    
-    return () => {
-      // Cleanup handled by stopRetryService if needed
-    };
-  }, [dbInitialized]);
+  // ✅ NEW: Retry service removed - users can manually retry failed messages from UI
   
   // Initial fetch on mount
   useEffect(() => {
@@ -2117,42 +2108,25 @@ export default function GroupChatScreen() {
               }
               }
             } else {
-              // All retries (immediate + persistent) failed - now fall back to SQLite retry service
+              // ✅ NEW: All retries (immediate + persistent) failed - mark as failed
+              // User can manually retry from UI with retry button
               const apiError = retryResult.error;
-              const isClientError = apiError?.response?.status >= 400 && apiError?.response?.status < 500;
               
-              console.error(`[GroupChat] ❌ All retries failed for message ${actualMessageId} (tempLocalId: ${tempLocalId}) | Total attempts: ${retryResult.attempt} | Error: ${apiError?.message || 'Unknown'} | Status: ${apiError?.response?.status} | Falling back to SQLite retry service`);
+              console.error(`[GroupChat] ❌ All retries failed for message ${actualMessageId} (tempLocalId: ${tempLocalId}) | Total attempts: ${retryResult.attempt} | Error: ${apiError?.message || 'Unknown'} | Status: ${apiError?.response?.status} | Marking as failed - user can retry from UI`);
               
-              if (isClientError) {
-                // Client error (4xx) - mark as failed immediately (don't retry)
-                console.log(`[GroupChat] 🚫 Marking message ${actualMessageId} as failed (4xx error - permanent failure)`);
-                if (dbInitialized) {
-                  await updateMessageStatus(actualMessageId, undefined, 'failed');
-                  setMessages(prev => prev.map(msg => 
-                    (msg.id === tempLocalId || msg.id === actualMessageId)
-                      ? { ...msg, sync_status: 'failed' }
-                      : msg
-                  ));
-                }
-                unmarkMessageAsSending(tempLocalId);
-                if (actualMessageId !== tempLocalId) {
-                  unmarkMessageAsSending(actualMessageId);
-                }
-              } else {
-                // Network error or other - mark as pending, SQLite retry service will handle it
-                console.log(`[GroupChat] 🔄 Marking message ${actualMessageId} as pending (will be handled by SQLite retry service)`);
-                if (dbInitialized) {
-                  await updateMessageStatus(actualMessageId, undefined, 'pending');
-                  setMessages(prev => prev.map(msg => 
-                    (msg.id === tempLocalId || msg.id === actualMessageId)
-                      ? { ...msg, sync_status: 'pending' }
-                      : msg
-                  ));
-                }
-                unmarkMessageAsSending(tempLocalId);
-                if (actualMessageId !== tempLocalId) {
-                  unmarkMessageAsSending(actualMessageId);
-                }
+              // Mark ALL failures as 'failed' (not just 4xx) - user can manually retry
+              console.log(`[GroupChat] 🚫 Marking message ${actualMessageId} as failed (all retries exhausted - user can retry from UI)`);
+              if (dbInitialized) {
+                await updateMessageStatus(actualMessageId, undefined, 'failed');
+                setMessages(prev => prev.map(msg => 
+                  (msg.id === tempLocalId || msg.id === actualMessageId)
+                    ? { ...msg, sync_status: 'failed' }
+                    : msg
+                ));
+              }
+              unmarkMessageAsSending(tempLocalId);
+              if (actualMessageId !== tempLocalId) {
+                unmarkMessageAsSending(actualMessageId);
               }
             }
           } catch (e: unknown) {
@@ -2185,16 +2159,16 @@ export default function GroupChatScreen() {
           const error = e as any;
           console.error('[GroupChat] Unexpected error in handleSend:', error);
           
-          // Ensure message is kept as pending for retry
+          // ✅ NEW: Mark as failed on unexpected error - user can retry from UI
           if (dbInitialized) {
-            await updateMessageStatus(tempLocalId, undefined, 'pending');
+            await updateMessageStatus(actualMessageId, undefined, 'failed');
             setMessages(prev => prev.map(msg => 
-              msg.id === tempLocalId 
-                ? { ...msg, sync_status: 'pending' }
+              (msg.id === tempLocalId || msg.id === actualMessageId)
+                ? { ...msg, sync_status: 'failed' }
                 : msg
             ));
           }
-          unmarkMessageAsSending(tempLocalId); // ✅ Unmark so retry service can pick it up
+          unmarkMessageAsSending(tempLocalId);
           if (actualMessageId !== tempLocalId) {
             unmarkMessageAsSending(actualMessageId);
           }
@@ -2211,6 +2185,131 @@ export default function GroupChatScreen() {
         'Failed to save message. Please try again.',
             [{ text: 'OK' }]
           );
+    }
+  };
+
+  // ✅ NEW: Retry sending a failed message
+  const retryFailedMessage = async (messageId: number) => {
+    try {
+      // Find the message in state
+      const message = messages.find(m => m.id === messageId);
+      if (!message || message.sync_status !== 'failed') {
+        console.warn(`[GroupChat] Cannot retry message ${messageId} - not found or not failed`);
+        return;
+      }
+      
+      console.log(`[GroupChat] 🔄 Retrying failed message ${messageId}`);
+      
+      // Mark as pending and update UI
+      if (dbInitialized) {
+        await updateMessageStatus(messageId, undefined, 'pending');
+      }
+      
+      // Update UI to pending
+      setMessages(prev => prev.map(msg => 
+        msg.id === messageId ? { ...msg, sync_status: 'pending' } : msg
+      ));
+      
+      // Reconstruct FormData
+      const formData = new FormData();
+      formData.append('group_id', String(id));
+      
+      if (message.message) {
+        formData.append('message', message.message);
+      }
+      
+      if (message.reply_to_id) {
+        formData.append('reply_to_id', String(message.reply_to_id));
+      }
+      
+      // Add attachments if any
+      if (message.attachments && message.attachments.length > 0) {
+        for (const att of message.attachments) {
+          if (att.local_path || (att.url && !att.url.startsWith('http'))) {
+            try {
+              formData.append('attachments[]', {
+                uri: att.local_path || att.url,
+                name: att.name || 'attachment',
+                type: att.mime || 'application/octet-stream',
+              } as any);
+            } catch (attachError) {
+              console.warn('[GroupChat] Error adding attachment to retry:', attachError);
+            }
+          }
+        }
+      }
+      
+      // Mark as sending
+      markMessageAsSending(messageId);
+      
+      // Retry sending with persistent retries
+      const retryResult = await sendMessageWithRetries(formData, messageId, 3, 1000);
+      
+      if (retryResult.success && retryResult.response) {
+        const res = retryResult.response;
+        
+        // Extract message ID from response
+        let serverMessageId: number | undefined;
+        let serverCreatedAt: string | undefined;
+        
+        if (res.data) {
+          if (res.data.id) {
+            serverMessageId = res.data.id;
+            serverCreatedAt = res.data.created_at;
+          } else if (res.data.data?.id) {
+            serverMessageId = res.data.data.id;
+            serverCreatedAt = res.data.data.created_at;
+          } else if (res.data.message?.id) {
+            serverMessageId = res.data.message.id;
+            serverCreatedAt = res.data.message.created_at;
+          }
+        }
+        
+        if (serverMessageId && dbInitialized) {
+          await updateMessageStatus(messageId, serverMessageId, 'synced', serverCreatedAt);
+          setMessages(prev => prev.map(msg => 
+            msg.id === messageId 
+              ? { ...msg, id: serverMessageId!, sync_status: 'synced', created_at: serverCreatedAt || msg.created_at }
+              : msg
+          ));
+          console.log(`[GroupChat] ✅ Retry successful for message ${messageId}, now has server_id ${serverMessageId}`);
+        }
+      } else {
+        // Failed again - mark as failed
+        console.error(`[GroupChat] ❌ Retry failed for message ${messageId}`);
+        if (dbInitialized) {
+          await updateMessageStatus(messageId, undefined, 'failed');
+        }
+        setMessages(prev => prev.map(msg => 
+          msg.id === messageId ? { ...msg, sync_status: 'failed' } : msg
+        ));
+      }
+      
+      unmarkMessageAsSending(messageId);
+    } catch (error) {
+      console.error('[GroupChat] Error retrying failed message:', error);
+      if (dbInitialized) {
+        await updateMessageStatus(messageId, undefined, 'failed');
+      }
+      setMessages(prev => prev.map(msg => 
+        msg.id === messageId ? { ...msg, sync_status: 'failed' } : msg
+      ));
+      unmarkMessageAsSending(messageId);
+    }
+  };
+
+  // ✅ NEW: Dismiss a failed message (remove it)
+  const dismissFailedMessage = async (messageId: number) => {
+    try {
+      console.log(`[GroupChat] 🗑️ Dismissing failed message ${messageId}`);
+      
+      if (dbInitialized) {
+        await deleteDbMessage(messageId);
+      }
+      
+      setMessages(prev => prev.filter(msg => msg.id !== messageId));
+    } catch (error) {
+      console.error('[GroupChat] Error dismissing failed message:', error);
     }
   };
 
@@ -2753,21 +2852,77 @@ export default function GroupChatScreen() {
       }
       
       return (
-        <TouchableOpacity
-          onLongPress={() => handleMessageLongPress(item)}
-          activeOpacity={0.8}
-        >
-          <VoiceMessageBubble
-            uri={voiceMessageData.url}
-            duration={voiceMessageData.duration}
-            isMine={isMine}
-            timestamp={timestamp}
-            senderName={!isMine && item.sender ? item.sender.name : undefined}
-            textPart={voiceMessageData.textPart}
-            readAt={item.read_at}
-            syncStatus={item.sync_status || 'pending'}
-          />
-        </TouchableOpacity>
+        <View>
+          <TouchableOpacity
+            onLongPress={() => handleMessageLongPress(item)}
+            activeOpacity={0.8}
+          >
+            <VoiceMessageBubble
+              uri={voiceMessageData.url}
+              duration={voiceMessageData.duration}
+              isMine={isMine}
+              timestamp={timestamp}
+              senderName={!isMine && item.sender ? item.sender.name : undefined}
+              textPart={voiceMessageData.textPart}
+              readAt={item.read_at}
+              syncStatus={item.sync_status || 'pending'}
+            />
+          </TouchableOpacity>
+          
+          {/* ✅ NEW: Retry/Dismiss buttons for failed voice messages */}
+          {isMine && item.sync_status === 'failed' && (
+            <View style={{
+              flexDirection: 'row',
+              alignItems: 'center',
+              justifyContent: 'flex-end',
+              marginTop: 8,
+              gap: 8,
+              paddingHorizontal: 12,
+            }}>
+              <Text style={{
+                fontSize: 11,
+                color: '#FFE5E5',
+                marginRight: 'auto',
+              }}>
+                Failed to send
+              </Text>
+              <TouchableOpacity
+                onPress={() => retryFailedMessage(item.id)}
+                style={{
+                  backgroundColor: 'rgba(255, 255, 255, 0.2)',
+                  paddingHorizontal: 12,
+                  paddingVertical: 6,
+                  borderRadius: 12,
+                }}
+              >
+                <Text style={{
+                  fontSize: 12,
+                  color: '#fff',
+                  fontWeight: '600',
+                }}>
+                  Retry
+                </Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                onPress={() => dismissFailedMessage(item.id)}
+                style={{
+                  backgroundColor: 'rgba(255, 255, 255, 0.15)',
+                  paddingHorizontal: 12,
+                  paddingVertical: 6,
+                  borderRadius: 12,
+                }}
+              >
+                <Text style={{
+                  fontSize: 12,
+                  color: '#FFE5E5',
+                  fontWeight: '500',
+                }}>
+                  Dismiss
+                </Text>
+              </TouchableOpacity>
+            </View>
+          )}
+        </View>
       );
     }
 
@@ -3149,6 +3304,62 @@ export default function GroupChatScreen() {
                   return null;
                 })()
               ) : null
+            )}
+            
+            {/* ✅ NEW: Retry/Dismiss buttons for failed messages */}
+            {isMine && item.sync_status === 'failed' && (
+              <View style={{
+                flexDirection: 'row',
+                alignItems: 'center',
+                justifyContent: 'flex-end',
+                marginTop: 8,
+                gap: 8,
+                paddingTop: 8,
+                borderTopWidth: 1,
+                borderTopColor: isMine ? 'rgba(255, 255, 255, 0.2)' : 'rgba(0, 0, 0, 0.1)',
+              }}>
+                <Text style={{
+                  fontSize: 11,
+                  color: isMine ? '#FFE5E5' : '#DC2626',
+                  marginRight: 'auto',
+                }}>
+                  Failed to send
+                </Text>
+                <TouchableOpacity
+                  onPress={() => retryFailedMessage(item.id)}
+                  style={{
+                    backgroundColor: isMine ? 'rgba(255, 255, 255, 0.2)' : 'rgba(0, 0, 0, 0.1)',
+                    paddingHorizontal: 12,
+                    paddingVertical: 6,
+                    borderRadius: 12,
+                  }}
+                >
+                  <Text style={{
+                    fontSize: 12,
+                    color: isMine ? '#fff' : (isDark ? '#fff' : '#111827'),
+                    fontWeight: '600',
+                  }}>
+                    Retry
+                  </Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  onPress={() => dismissFailedMessage(item.id)}
+                  style={{
+                    backgroundColor: isMine ? 'rgba(255, 255, 255, 0.15)' : 'rgba(0, 0, 0, 0.08)',
+                    paddingHorizontal: 12,
+                    paddingVertical: 6,
+                    borderRadius: 12,
+                  }}
+                >
+                  <Text style={{
+                    fontSize: 12,
+                    color: isMine ? '#FFE5E5' : '#9CA3AF',
+                    fontWeight: '500',
+                  }}>
+                    Dismiss
+                  </Text>
+                </TouchableOpacity>
+              </View>
             )}
           </View>
         </View>
