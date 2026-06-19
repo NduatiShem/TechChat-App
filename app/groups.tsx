@@ -186,14 +186,12 @@ export default function GroupsScreen() {
       apiGroups = safeGroupsData;
       
       // Sync unread counts from backend to notification context
-      if (safeGroupsData.length > 0) {
-        let totalGroupUnread = 0;
-        safeGroupsData.forEach((group) => {
-          const unreadCount = group.unread_count || 0;
-          totalGroupUnread += unreadCount;
-        });
-        updateGroupUnreadCount(totalGroupUnread);
-      }
+      let totalGroupUnread = 0;
+      safeGroupsData.forEach((group) => {
+        const unreadCount = group.unread_count || 0;
+        totalGroupUnread += unreadCount;
+      });
+      updateGroupUnreadCount(totalGroupUnread);
       
       // Save to both AsyncStorage (fast) and SQLite (persistent)
       await saveAsyncStorageGroups(safeGroupsData);
@@ -355,9 +353,28 @@ export default function GroupsScreen() {
     }
   };
 
+  const openGroupAndClearUnread = (groupId: number) => {
+    setGroups(prev => {
+      const next = prev.map(group =>
+        group.id === groupId ? { ...group, unread_count: 0 } : group
+      );
+      const totalUnread = next.reduce((sum, group) => sum + (group.unread_count ?? 0), 0);
+      updateGroupUnreadCount(totalUnread);
+      return next;
+    });
+
+    setFilteredGroups(prev =>
+      prev.map(group =>
+        group.id === groupId ? { ...group, unread_count: 0 } : group
+      )
+    );
+
+    router.push(`/chat/group/${groupId}`);
+  };
+
   const renderGroup = ({ item }: { item: Group }) => (
     <TouchableOpacity
-      onPress={() => router.push(`/chat/group/${item.id}`)}
+      onPress={() => openGroupAndClearUnread(item.id)}
       onLongPress={() => {
         const groupData = encodeURIComponent(JSON.stringify(item));
         router.push(`/group-info?id=${item.id}&groupData=${groupData}`);

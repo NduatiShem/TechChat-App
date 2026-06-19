@@ -20,6 +20,7 @@ interface VoiceMessageBubbleProps {
   textPart?: string; // Optional text part for voice messages with text
   readAt?: string | null; // Read receipt timestamp
   syncStatus?: 'synced' | 'pending' | 'failed'; // Message sync status
+  embedded?: boolean; // When true, parent row handles left/right alignment
 }
 
 export default function VoiceMessageBubble({ 
@@ -30,7 +31,8 @@ export default function VoiceMessageBubble({
   senderName,
   textPart,
   readAt,
-  syncStatus = 'synced'
+  syncStatus = 'synced',
+  embedded = false,
 }: VoiceMessageBubbleProps) {
   const [sound, setSound] = useState<Audio.Sound | null>(null);
   const [isPlaying, setIsPlaying] = useState(false);
@@ -291,13 +293,16 @@ export default function VoiceMessageBubble({
     );
   };
 
+  const bubbleStyle = [
+    styles.container,
+    isMine ? styles.myMessage : styles.otherMessage,
+    embedded && styles.embedded,
+    { backgroundColor: isMine ? '#25D366' : (isDark ? '#374151' : '#E5E7EB') },
+  ];
+
   if (isLoading) {
     return (
-      <View style={[
-        styles.container,
-        isMine ? styles.myMessage : styles.otherMessage,
-        { backgroundColor: isMine ? '#25D366' : (isDark ? '#374151' : '#E5E7EB') }
-      ]}>
+      <View style={bubbleStyle}>
         <MaterialCommunityIcons 
           name="loading" 
           size={20} 
@@ -308,11 +313,7 @@ export default function VoiceMessageBubble({
   }
 
   return (
-    <View style={[
-      styles.container,
-      isMine ? styles.myMessage : styles.otherMessage,
-      { backgroundColor: isMine ? '#25D366' : (isDark ? '#374151' : '#E5E7EB') }
-    ]}>
+    <View style={bubbleStyle}>
       {/* Sender name for group messages */}
       {!isMine && senderName && (
         <Text style={[styles.senderName, { color: isMine ? '#E0E7FF' : '#6B7280' }]}>
@@ -426,6 +427,12 @@ const styles = StyleSheet.create({
     borderTopLeftRadius: 4,
     marginLeft: 0,
     marginRight: 40,
+  },
+  embedded: {
+    alignSelf: 'stretch',
+    marginLeft: 0,
+    marginRight: 0,
+    maxWidth: '100%',
   },
   senderName: {
     fontSize: 12,

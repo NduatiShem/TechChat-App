@@ -40,4 +40,13 @@ yarn-error.*
 *-firebase-adminsdk-*.json
 firebase-service-account.json
 
+# Encoded secrets / temp credential dumps
+temp*.b64
+*.b64
+
+# Local env
+.env
+.env.local
+.env.*.local
+
 app-example

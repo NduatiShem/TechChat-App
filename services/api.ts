@@ -1,8 +1,15 @@
+import { logger } from '@/utils/logger';
 import { secureStorage } from '@/utils/secureStore';
 import axios from 'axios';
 import { router } from 'expo-router';
 import { Platform } from 'react-native';
 import { AppConfig } from '../config/app.config';
+
+const shouldLogApiConfig = __DEV__ || process.env.EXPO_PUBLIC_DEBUG_API === 'true';
+
+const apiLog = (...args: unknown[]) => {
+  if (shouldLogApiConfig) logger.debugApi(...args);
+};
 
 // API Base URL - Configured for TechChat app
 // Use the configuration from AppConfig
@@ -19,7 +26,9 @@ const getApiBaseUrl = () => {
   // If production URL is explicitly set via environment variable, use it
   if (process.env.EXPO_PUBLIC_API_URL && process.env.EXPO_PUBLIC_API_URL !== 'production') {
     const envUrl = process.env.EXPO_PUBLIC_API_URL;
-    console.log('[API] Using API URL from environment variable:', envUrl);
+    if (shouldLogApiConfig) {
+      apiLog('[API] Using API URL from environment variable:', envUrl);
+    }
     return envUrl;
   }
   
@@ -28,28 +37,38 @@ const getApiBaseUrl = () => {
     // This is because Expo Go on physical devices needs your computer's network IP
     if (Platform.OS === 'android') {
       const url = AppConfig.api.development.physical;
-      console.log('[API] Development mode - Using Android URL:', url);
+      if (shouldLogApiConfig) {
+        apiLog('[API] Development mode - Using Android URL:', url);
+      }
       return url;
     } else if (Platform.OS === 'ios') {
       const url = AppConfig.api.development.ios;
-      console.log('[API] Development mode - Using iOS URL:', url);
+      if (shouldLogApiConfig) {
+        apiLog('[API] Development mode - Using iOS URL:', url);
+      }
       return url;
     }
   }
   
   // In production, use the production URL
   const productionUrl = AppConfig.api.production;
-  console.log('[API] Production mode - Using production URL:', productionUrl);
+  if (shouldLogApiConfig) {
+    apiLog('[API] Production mode - Using production URL:', productionUrl);
+  }
   return productionUrl;
 };
 
 const API_BASE_URL = getApiBaseUrl();
 
+export { getApiBaseUrl };
+
 // Always log the API base URL being used (for debugging)
-console.log('[API] Base URL configured:', API_BASE_URL);
-console.log('[API] __DEV__ flag:', __DEV__);
-console.log('[API] Force Production:', process.env.EXPO_PUBLIC_FORCE_PRODUCTION);
-console.log('[API] Platform:', Platform.OS);
+if (shouldLogApiConfig) {
+  apiLog('[API] Base URL configured:', API_BASE_URL);
+  apiLog('[API] __DEV__ flag:', __DEV__);
+  apiLog('[API] Force Production:', process.env.EXPO_PUBLIC_FORCE_PRODUCTION);
+  apiLog('[API] Platform:', Platform.OS);
+}
 
 // Create axios instance
 const api = axios.create({
@@ -58,39 +77,8 @@ const api = axios.create({
     'Accept': 'application/json',
   },
   timeout: 30000,
-  transformResponse: [function (data) {
-    // Ensure proper JSON parsing
-    if (typeof data === 'string') {
-      try {
-        const parsed = JSON.parse(data);
-        return parsed;
-      } catch (e) {
-        // Try to fix common truncation issues
-        if (data.includes('[') && !data.endsWith(']')) {
-          try {
-            const fixedData = data + ']';
-            const parsed = JSON.parse(fixedData);
-            return parsed;
-          } catch (fixError) {
-            // Silent fail
-          }
-        }
-        
-        if (data.includes('{') && !data.endsWith('}')) {
-          try {
-            const fixedData = data + '}';
-            const parsed = JSON.parse(fixedData);
-            return parsed;
-          } catch (fixError) {
-            // Silent fail
-          }
-        }
-        
-        return data;
-      }
-    }
-    return data;
-  }],
+  maxContentLength: Infinity,
+  maxBodyLength: Infinity,
 });
 
 // API Base URL configured
@@ -110,35 +98,9 @@ api.interceptors.request.use(
   }
 );
 
-// Response interceptor to handle auth errors and JSON parsing
+// Response interceptor to handle auth errors
 api.interceptors.response.use(
   (response) => {
-    // Handle case where response.data is a JSON string instead of parsed object
-    if (typeof response.data === 'string') {
-      try {
-        response.data = JSON.parse(response.data);
-      } catch (parseError) {
-        // Try to fix common truncation issues
-        if (response.data.includes('[') && !response.data.endsWith(']')) {
-          try {
-            const fixedData = response.data + ']';
-            response.data = JSON.parse(fixedData);
-          } catch (fixError) {
-            // Silent fail
-          }
-        }
-        
-        if (response.data.includes('{') && !response.data.endsWith('}')) {
-          try {
-            const fixedData = response.data + '}';
-            response.data = JSON.parse(fixedData);
-          } catch (fixError) {
-            // Silent fail
-          }
-        }
-      }
-    }
-    
     // Handle Laravel API response structure
     // Some endpoints return: { status: "success", data: {...} }
     // Others return data directly: { token: "...", user: {...} }
@@ -154,6 +116,16 @@ api.interceptors.response.use(
     // Enhanced error logging - always log in development, or if debug is enabled
     if (__DEV__ || process.env.EXPO_PUBLIC_DEBUG_API === 'true') {
       if (error.response) {
+        const status = error.response.status;
+        const url = error.config?.url ?? '';
+        const isMarkReadRequest =
+          url.includes('mark-read') || url.includes('mark-group-read');
+
+        // 429 on mark-read is expected when throttled; don't spam the console
+        if (status === 429 && isMarkReadRequest) {
+          return Promise.reject(error);
+        }
+
         // Server responded with error status
         console.error('[API Error] Response Error:', {
           status: error.response.status,
@@ -251,9 +223,29 @@ export const messagesAPI = {
   
   getByUser: (userId: number, page: number = 1, perPage: number = 10) => 
     api.get(`/messages/user/${userId}?page=${page}&per_page=${perPage}`),
+
+  getByUserSince: (userId: number, since?: string, afterId?: number, perPage: number = 50) =>
+    api.get(`/messages/user/${userId}`, {
+      params: {
+        page: 1,
+        per_page: perPage,
+        ...(since ? { since } : {}),
+        ...(afterId != null ? { after_id: afterId } : {}),
+      },
+    }),
   
   getByGroup: (groupId: number, page: number = 1, perPage: number = 10) => 
     api.get(`/messages/group/${groupId}?page=${page}&per_page=${perPage}`),
+
+  getByGroupSince: (groupId: number, since?: string, afterId?: number, perPage: number = 50) =>
+    api.get(`/messages/group/${groupId}`, {
+      params: {
+        page: 1,
+        per_page: perPage,
+        ...(since ? { since } : {}),
+        ...(afterId != null ? { after_id: afterId } : {}),
+      },
+    }),
   
   sendMessage: (data: FormData | {
     message?: string;

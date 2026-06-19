@@ -15,12 +15,15 @@ import { useBackgroundUpdateCheck } from "@/hooks/useBackgroundUpdateCheck";
 import { UpdateNotification } from "@/components/UpdateNotification";
 // ✅ NEW: Retry service removed - users can manually retry failed messages from UI
 import { initDatabase } from "@/services/database";
+import { initSentry, Sentry } from "@/services/sentry";
 import { startBackgroundBulkSync } from "@/services/syncService";
 import NetInfo from '@react-native-community/netinfo';
 import "../global.css";
 
 // Prevent splash screen from auto-hiding
 SplashScreen.preventAutoHideAsync();
+
+initSentry();
 
 function AppTabsLayout() {
   const { currentTheme } = useTheme();
@@ -120,7 +123,10 @@ function AppTabsLayout() {
         
         if (db) {
           console.log('[AppTabsLayout] Database initialized');
-          // ✅ NEW: Retry service removed - users can manually retry failed messages from UI
+          const { startOutboxWorker } = await import('@/services/outboxService');
+          startOutboxWorker();
+          const { initRealtimeService } = await import('@/services/realtimeService');
+          initRealtimeService();
           
           // ✅ BULK SYNC: Start background bulk sync after database is initialized
           // Check network status first, then start sync if online
@@ -478,7 +484,7 @@ function AppLayout() {
   );
 }
 
-export default function RootLayout() {
+function RootLayout() {
   // Ensure splash screen hides even if there's an error
   useEffect(() => {
     // CRITICAL: Multiple aggressive fallbacks to ensure splash screen ALWAYS hides
@@ -546,3 +552,5 @@ export default function RootLayout() {
     </ErrorBoundary>
   );
 }
+
+export default Sentry.wrap(RootLayout);

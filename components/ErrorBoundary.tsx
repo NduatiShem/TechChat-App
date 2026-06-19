@@ -1,3 +1,4 @@
+import { captureException } from '@/services/sentry';
 import React, { Component, ErrorInfo, ReactNode } from 'react';
 import { View, Text, TouchableOpacity, StyleSheet } from 'react-native';
 
@@ -32,6 +33,9 @@ export class ErrorBoundary extends Component<Props, State> {
   componentDidCatch(error: Error, errorInfo: ErrorInfo) {
     console.error('ErrorBoundary caught an error:', error);
     console.error('Error info:', errorInfo);
+    captureException(error, {
+      componentStack: errorInfo.componentStack ?? undefined,
+    });
     this.setState({
       error,
       errorInfo,

@@ -174,39 +174,32 @@ export default function ConversationsScreen() {
   };
 
   const loadConversations = async (forceRefresh = false) => {
-    // ✅ API-FIRST STRATEGY: Try API first, fallback to AsyncStorage/SQLite only if API fails
-    // Only show empty state if API returns empty AND all fallbacks are empty AND requests completed successfully
-    
-    // If offline and not forcing refresh, use cached data only
-    if (!isOnline && !forceRefresh) {
-      // Try AsyncStorage first
+    // Cache-first: render cached conversations immediately (stale-while-revalidate)
+    if (!forceRefresh) {
       const asyncStorageConversations = await loadAsyncStorageConversations();
       if (asyncStorageConversations.length > 0) {
         setConversations(asyncStorageConversations);
         setFilteredConversations(asyncStorageConversations);
         setIsLoading(false);
-        return;
+      } else if (dbInitialized) {
+        const sqliteConversations = await loadCachedConversations();
+        if (sqliteConversations.length > 0) {
+          const deduplicated = deduplicateConversations(sqliteConversations);
+          setConversations(deduplicated);
+          setFilteredConversations(deduplicated);
+          await saveAsyncStorageConversations(deduplicated);
+          setIsLoading(false);
+        }
       }
-      
-      // Try SQLite as fallback
-      const sqliteConversations = await loadCachedConversations();
-      if (sqliteConversations.length > 0) {
-        const deduplicated = deduplicateConversations(sqliteConversations);
-        setConversations(deduplicated);
-        setFilteredConversations(deduplicated);
-        await saveAsyncStorageConversations(deduplicated);
-        setIsLoading(false);
-        return;
-      }
-      
-      // Both empty - show empty state
-      setConversations([]);
-      setFilteredConversations([]);
+    }
+
+    // If offline and not forcing refresh, cached data already shown above
+    if (!isOnline && !forceRefresh) {
       setIsLoading(false);
       return;
     }
 
-    // STEP 1: Try API first (source of truth)
+    // Background API refresh (source of truth)
     let apiSuccess = false;
     let apiConversations: Conversation[] = [];
     let apiError: any = null;
@@ -221,22 +214,9 @@ export default function ConversationsScreen() {
           conversationsData = JSON.parse(response.data);
         } catch (parseError) {
           console.error('Failed to parse JSON string:', parseError);
-          // Try to fix common truncation issues
-          if (response.data.includes('[') && !response.data.endsWith(']')) {
-            try {
-              const fixedData = response.data + ']';
-              conversationsData = JSON.parse(fixedData);
-            } catch (fixError) {
-              console.error('Failed to parse fixed JSON array:', fixError);
-              // Don't clear conversations on parse error - keep existing data
-              setIsLoading(false);
-              return;
-            }
-          } else {
-            // Don't clear conversations on parse error - keep existing data
-            setIsLoading(false);
-            return;
-          }
+          // Don't mutate/guess malformed payloads; keep existing UI state.
+          setIsLoading(false);
+          return;
         }
       }
       
@@ -301,7 +281,7 @@ export default function ConversationsScreen() {
       try {
         const conversationsToSave = uniqueConversations.map(conv => ({
           conversation_id: conv.conversation_id || conv.id,
-          conversation_type: conv.is_group ? 'group' : 'individual',
+          conversation_type: (conv.is_group ? 'group' : 'individual') as 'individual' | 'group',
           user_id: conv.is_group ? undefined : (conv.user_id || conv.id),
           group_id: conv.is_group ? (conv.id || conv.conversation_id) : undefined,
           name: conv.name,
@@ -471,6 +451,22 @@ export default function ConversationsScreen() {
     }
   };
 
+  const clearConversationUnreadLocally = useCallback((conversationId: number) => {
+    updateUnreadCount(conversationId, 0);
+    setConversations(prev =>
+      prev.map(conv => {
+        const convId = Number(conv.conversation_id || conv.id);
+        return convId === conversationId ? { ...conv, unread_count: 0 } : conv;
+      })
+    );
+    setFilteredConversations(prev =>
+      prev.map(conv => {
+        const convId = Number(conv.conversation_id || conv.id);
+        return convId === conversationId ? { ...conv, unread_count: 0 } : conv;
+      })
+    );
+  }, [updateUnreadCount]);
+
   const renderConversation = ({ item }: { item: Conversation }) => {
     // Get avatar URL from either flat structure or nested user object
     const avatarUrl = item.avatar_url || item.user?.avatar_url;
@@ -478,6 +474,10 @@ export default function ConversationsScreen() {
     return (
       <TouchableOpacity
         onPress={() => {
+          const conversationId = Number(item.conversation_id || item.id);
+          if (conversationId) {
+            clearConversationUnreadLocally(conversationId);
+          }
           if (item.is_group) {
             router.push(`/chat/group/${item.id}`);
           } else {
@@ -514,7 +514,11 @@ export default function ConversationsScreen() {
             {/* Show unread count on the right side - like WhatsApp */}
             {(() => {
               const conversationId = item.conversation_id || item.id;
-              const unreadCount = item.unread_count || conversationCounts[conversationId] || 0;
+              const apiUnreadCount = item.unread_count ?? 0;
+              const localUnreadCount = conversationCounts[conversationId];
+              const unreadCount = localUnreadCount === 0
+                ? 0
+                : (localUnreadCount ?? apiUnreadCount);
               if (unreadCount > 0) {
                 return (
                   <View className="ml-2 min-w-[20] h-5 px-1.5 rounded-full bg-green-500 items-center justify-center">

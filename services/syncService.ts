@@ -1,4 +1,5 @@
 import type { DatabaseMessage } from '@/types/database';
+import { logger } from '@/utils/logger';
 import { conversationsAPI, messagesAPI } from './api';
 import {
     deleteMessage,
@@ -106,7 +107,7 @@ async function removeDeletedMessages(
       // (could be pagination issue, API caching, etc.)
       if (msg.sender_id === currentUserId) {
         if (__DEV__) {
-          console.log(`[Sync] Protecting user's sent message from deletion: ${msg.server_id}`);
+          logger.debug(`[Sync] Protecting user's sent message from deletion: ${msg.server_id}`);
         }
         return false; // Never delete user's sent messages
       }
@@ -116,7 +117,7 @@ async function removeDeletedMessages(
       const messageAge = now - new Date(msg.created_at).getTime();
       if (messageAge < ONE_HOUR) {
         if (__DEV__) {
-          console.log(`[Sync] Protecting recent message from deletion: ${msg.server_id} (${Math.round(messageAge / 1000 / 60)}min old)`);
+          logger.debug(`[Sync] Protecting recent message from deletion: ${msg.server_id} (${Math.round(messageAge / 1000 / 60)}min old)`);
         }
         return false; // Too recent, might be pagination issue
       }
@@ -135,7 +136,7 @@ async function removeDeletedMessages(
         await deleteMessage(msg.server_id!, msg.id);
         deletedCount++;
         if (__DEV__) {
-          console.log(`[Sync] Deleted message ${msg.server_id} (not in API, old enough, not user's)`);
+          logger.debug(`[Sync] Deleted message ${msg.server_id} (not in API, old enough, not user's)`);
         }
       } catch (error) {
         // Log but continue deleting other messages
@@ -146,7 +147,7 @@ async function removeDeletedMessages(
     }
     
     if (__DEV__ && deletedCount > 0) {
-      console.log(`[Sync] Removed ${deletedCount} deleted messages for ${conversationType} ${conversationId}`);
+      logger.debug(`[Sync] Removed ${deletedCount} deleted messages for ${conversationType} ${conversationId}`);
     }
     
     return deletedCount;
@@ -166,7 +167,7 @@ export async function syncConversationMessages(
   // Check if sync is already running for this conversation
   if (messageSyncLocks.get(syncKey) && messageSyncPromises.has(syncKey)) {
     if (__DEV__) {
-      console.log(`[Sync] Message sync already in progress for ${syncKey}, waiting...`);
+      logger.debug(`[Sync] Message sync already in progress for ${syncKey}, waiting...`);
     }
     return messageSyncPromises.get(syncKey)!;
   }
@@ -177,7 +178,7 @@ export async function syncConversationMessages(
   const timeSinceLastSync = now - lastSyncTime;
   if (timeSinceLastSync < MESSAGE_SYNC_DEBOUNCE_MS && lastSyncTime > 0) {
     if (__DEV__) {
-      console.log(`[Sync] Debouncing message sync for ${syncKey} (${timeSinceLastSync}ms since last sync)`);
+      logger.debug(`[Sync] Debouncing message sync for ${syncKey} (${timeSinceLastSync}ms since last sync)`);
     }
     // Wait for the debounce period
     await new Promise(resolve => setTimeout(resolve, MESSAGE_SYNC_DEBOUNCE_MS - timeSinceLastSync));
@@ -242,7 +243,7 @@ export async function syncConversationMessages(
       lastMessageSyncTimes.set(syncKey, Date.now());
 
       if (__DEV__) {
-        console.log(`[Sync] Synced ${messagesToSave.length} messages, removed ${deletedCount} deleted messages for ${conversationType} ${conversationId}`);
+        logger.debug(`[Sync] Synced ${messagesToSave.length} messages, removed ${deletedCount} deleted messages for ${conversationType} ${conversationId}`);
       }
 
       return { success: true, newMessagesCount: messagesToSave.length, deletedCount };
@@ -268,7 +269,7 @@ export async function syncConversations(): Promise<{ success: boolean; count: nu
   // Check if sync is already running
   if (conversationsSyncLock && conversationsSyncPromise) {
     if (__DEV__) {
-      console.log('[Sync] Conversations sync already in progress, waiting...');
+      logger.debug('[Sync] Conversations sync already in progress, waiting...');
     }
     return conversationsSyncPromise;
   }
@@ -278,7 +279,7 @@ export async function syncConversations(): Promise<{ success: boolean; count: nu
   const timeSinceLastSync = now - lastConversationsSyncTime;
   if (timeSinceLastSync < CONVERSATIONS_SYNC_DEBOUNCE_MS && lastConversationsSyncTime > 0) {
     if (__DEV__) {
-      console.log(`[Sync] Debouncing conversations sync (${timeSinceLastSync}ms since last sync)`);
+      logger.debug(`[Sync] Debouncing conversations sync (${timeSinceLastSync}ms since last sync)`);
     }
     // Wait for the debounce period
     await new Promise(resolve => setTimeout(resolve, CONVERSATIONS_SYNC_DEBOUNCE_MS - timeSinceLastSync));
@@ -335,7 +336,7 @@ export async function syncConversations(): Promise<{ success: boolean; count: nu
       lastConversationsSyncTime = Date.now();
 
       if (__DEV__) {
-        console.log(`[Sync] Synced ${conversationsToSave.length} conversations`);
+        logger.debug(`[Sync] Synced ${conversationsToSave.length} conversations`);
       }
 
       return { success: true, count: conversationsToSave.length };
@@ -408,7 +409,7 @@ export async function syncOlderMessages(
     const deletedCount = await removeDeletedMessages(conversationId, conversationType, serverIds, currentUserId);
 
     if (__DEV__) {
-      console.log(`[Sync] Synced ${messagesToSave.length} older messages, removed ${deletedCount} deleted messages for ${conversationType} ${conversationId}`);
+      logger.debug(`[Sync] Synced ${messagesToSave.length} older messages, removed ${deletedCount} deleted messages for ${conversationType} ${conversationId}`);
     }
 
     return { success: true, messagesCount: messagesToSave.length, deletedCount, hasMore };
@@ -449,22 +450,22 @@ export async function bulkSyncAllMessages(
     
     if (conversations.length === 0) {
       // No conversations in SQLite, sync conversations first
-      console.log('[BulkSync] No conversations in SQLite, syncing conversations first...');
+      logger.debug('[BulkSync] No conversations in SQLite, syncing conversations first...');
       const syncResult = await syncConversations();
       if (syncResult.success) {
         conversations = await getConversations();
-        console.log(`[BulkSync] Synced ${conversations.length} conversations`);
+        logger.debug(`[BulkSync] Synced ${conversations.length} conversations`);
       } else {
         return { success: false, totalSynced: 0, errors: ['Failed to sync conversations'] };
       }
     }
     
     if (conversations.length === 0) {
-      console.log('[BulkSync] No conversations to sync');
+      logger.debug('[BulkSync] No conversations to sync');
       return { success: true, totalSynced: 0, errors: [] };
     }
     
-    console.log(`[BulkSync] Starting bulk sync for ${conversations.length} conversations`);
+    logger.debug(`[BulkSync] Starting bulk sync for ${conversations.length} conversations`);
     
     // Step 2: Sync messages for each conversation with pagination
     for (let i = 0; i < conversations.length; i++) {
@@ -514,7 +515,7 @@ export async function bulkSyncAllMessages(
         totalSynced += conversationMessageCount;
         
         if (__DEV__) {
-          console.log(`[BulkSync] Synced ${conversationMessageCount} messages for ${conv.name} (${i + 1}/${conversations.length})`);
+          logger.debug(`[BulkSync] Synced ${conversationMessageCount} messages for ${conv.name} (${i + 1}/${conversations.length})`);
         }
         
         // Delay between conversations to prevent overwhelming
@@ -529,7 +530,7 @@ export async function bulkSyncAllMessages(
       }
     }
     
-    console.log(`[BulkSync] Completed: ${totalSynced} messages synced, ${errors.length} errors`);
+    logger.debug(`[BulkSync] Completed: ${totalSynced} messages synced, ${errors.length} errors`);
     
     return {
       success: errors.length === 0,
@@ -576,7 +577,7 @@ export async function startBackgroundBulkSync(
           // If we already have a reasonable amount of messages, skip bulk sync
           if (messageCount && messageCount.count > 100) {
             if (__DEV__) {
-              console.log(`[BulkSync] Skipping - already have ${messageCount.count} synced messages`);
+              logger.debug(`[BulkSync] Skipping - already have ${messageCount.count} synced messages`);
             }
             return;
           }
@@ -587,11 +588,11 @@ export async function startBackgroundBulkSync(
     // Run bulk sync in background (non-blocking)
     bulkSyncAllMessages(currentUserId, (progress) => {
       if (__DEV__) {
-        console.log(`[BulkSync] Progress: ${progress.conversationIndex}/${progress.totalConversations} - ${progress.conversationName} (${progress.messagesSynced} messages)`);
+        logger.debug(`[BulkSync] Progress: ${progress.conversationIndex}/${progress.totalConversations} - ${progress.conversationName} (${progress.messagesSynced} messages)`);
       }
     }).then(result => {
       if (result.success) {
-        console.log(`[BulkSync] ✅ Background sync completed: ${result.totalSynced} messages synced`);
+        logger.debug(`[BulkSync] ✅ Background sync completed: ${result.totalSynced} messages synced`);
       } else {
         console.warn(`[BulkSync] ⚠️ Background sync completed with ${result.errors.length} errors: ${result.errors.slice(0, 3).join(', ')}${result.errors.length > 3 ? '...' : ''}`);
       }

@@ -12,9 +12,33 @@ import { useAuth } from '@/context/AuthContext';
 import { useNotifications } from '@/context/NotificationContext';
 import { useTheme } from '@/context/ThemeContext';
 import { messagesAPI, usersAPI } from '@/services/api';
-import { deleteMessage as deleteDbMessage, getDb, getMessages as getDbMessages, hasMessagesForConversation, initDatabase, saveMessages as saveDbMessages, updateMessageByServerId, updateMessageStatus } from '@/services/database';
-import { markMessageAsSending, unmarkMessageAsSending, isMessageBeingSent, getMessagesBeingSent } from '@/services/messageRetryService';
-import { syncConversationMessages, syncOlderMessages } from '@/services/syncService';
+import { deleteMessage as deleteDbMessage, initDatabase, updateMessageByServerId } from '@/services/database';
+import { retryFailedMessage as retryFailedMessageViaOutbox } from '@/services/messageRetryService';
+import { enqueueOutgoingMessage } from '@/services/outboxService';
+import {
+  buildOutboxPayload,
+  loadMessagesFromCache,
+  mapApiMessages,
+  mergeMessagesWithPending,
+  mergeDeltaMessages,
+  persistApiMessages,
+  persistOutgoingMessage,
+  MESSAGES_PER_PAGE,
+  DELTA_POLL_INTERVAL_MS,
+  useOutboxSync,
+  deduplicateMessages,
+} from '@/hooks/useChatMessages';
+import { generateClientMessageId } from '@/utils/clientMessageId';
+import { getCachedAuthUserId } from '@/utils/cachedAuthUser';
+import { isLocalPending } from '@/utils/messageIdentity';
+import {
+  isOwnDirectMessage,
+  parseVoiceMessage,
+  resolveMediaUrl,
+} from '@/utils/chatMessageOwnership';
+import { markUserChatAsRead } from '@/services/markReadService';
+import { subscribeConversationChannel, onRealtimeMessage, handleRealtimeMessage, isRealtimeConnected } from '@/services/realtimeService';
+import { syncOlderMessages } from '@/services/syncService';
 import { isVideoAttachment } from '@/utils/textUtils';
 import { MaterialCommunityIcons, MaterialIcons } from '@expo/vector-icons';
 import { useFocusEffect } from '@react-navigation/native';
@@ -26,7 +50,7 @@ import * as ImagePicker from 'expo-image-picker';
 import { router, useLocalSearchParams } from 'expo-router';
 import * as Sharing from 'expo-sharing';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ActivityIndicator, Alert, BackHandler, FlatList, Image, Keyboard, KeyboardAvoidingView, Modal, Platform, StatusBar, Text, TextInput, TouchableOpacity, View } from 'react-native';
+import { ActivityIndicator, Alert, AppState, BackHandler, FlatList, Image, Keyboard, KeyboardAvoidingView, Modal, Platform, StatusBar, Text, TextInput, TouchableOpacity, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 export const options = ({ params }: { params: any }) => ({
@@ -35,6 +59,8 @@ export const options = ({ params }: { params: any }) => ({
 
 interface Message {
   id: number;
+  server_id?: number;
+  client_message_id?: string | null;
   message: string;
   sender_id: number;
   receiver_id?: number;
@@ -114,346 +140,13 @@ export default function UserChatScreen() {
   
   // Remove the navigation effect - let the AppLayout handle authentication state changes
   const isDark = currentTheme === 'dark';
+  const ENABLE_CHAT_DEBUG_LOGS = __DEV__ && process.env.EXPO_PUBLIC_DEBUG_CHAT === 'true';
   const [messages, setMessages] = useState<Message[]>([]);
-  const [visibleMessagesStartIndex, setVisibleMessagesStartIndex] = useState<number | null>(null); // Track which messages to display (null = show all, number = start index)
+  useOutboxSync(setMessages);
+
+  // Inverted FlatList data: newest first (index 0 = newest, renders at visual bottom)
+  const invertedMessages = useMemo(() => [...messages].reverse(), [messages]);
   
-  // ✅ CRITICAL FIX: Define INITIAL_VISIBLE_MESSAGES before useMemo to prevent NaN
-  const INITIAL_VISIBLE_MESSAGES = 30; // Show only last 30 messages initially (latest at bottom)
-  
-  // Compute visible messages - show only last N messages initially
-  const visibleMessages = useMemo(() => {
-    if (messages.length === 0) return [];
-    if (visibleMessagesStartIndex === null) {
-      // Initial load: show only last N messages (latest at bottom)
-      const startIndex = Math.max(0, messages.length - INITIAL_VISIBLE_MESSAGES);
-      const sliced = messages.slice(startIndex);
-      
-      // ✅ DEBUG LOGGING: Track visible messages computation
-      console.log(`[UserChat] 📋 visibleMessages computed:`, {
-        totalMessages: messages.length,
-        visibleMessagesStartIndex: null,
-        computedStartIndex: startIndex,
-        visibleCount: sliced.length,
-        firstVisibleMessage: sliced[0] ? {
-          id: sliced[0].id,
-          content: sliced[0].message?.substring(0, 30),
-          created_at: sliced[0].created_at,
-        } : null,
-        lastVisibleMessage: sliced[sliced.length - 1] ? {
-          id: sliced[sliced.length - 1].id,
-          content: sliced[sliced.length - 1].message?.substring(0, 30),
-          created_at: sliced[sliced.length - 1].created_at,
-        } : null,
-      });
-      
-      return sliced;
-    }
-    // Show messages from startIndex to end
-    const sliced = messages.slice(visibleMessagesStartIndex);
-    
-    console.log(`[UserChat] 📋 visibleMessages computed (with startIndex):`, {
-      totalMessages: messages.length,
-      visibleMessagesStartIndex,
-      visibleCount: sliced.length,
-      firstVisibleMessage: sliced[0] ? {
-        id: sliced[0].id,
-        content: sliced[0].message?.substring(0, 30),
-        created_at: sliced[0].created_at,
-      } : null,
-      lastVisibleMessage: sliced[sliced.length - 1] ? {
-        id: sliced[sliced.length - 1].id,
-        content: sliced[sliced.length - 1].message?.substring(0, 30),
-        created_at: sliced[sliced.length - 1].created_at,
-      } : null,
-    });
-    
-    return sliced;
-  }, [messages, visibleMessagesStartIndex]);
-  
-  // Robust deduplication function using composite key (ID + created_at + message content)
-  const deduplicateMessages = useCallback((messagesArray: Message[]): Message[] => {
-    // Use a Map with composite key: "id_createdAt_messageContent" for more robust deduplication
-    const seenMessages = new Map<string, Message>();
-    const seenById = new Map<number | string, Message>();
-    
-    for (const msg of messagesArray) {
-      if (!msg) continue;
-      
-      // Primary deduplication: Check by ID first
-      if (msg.id !== undefined && msg.id !== null && msg.id !== 0) {
-        const existingById = seenById.get(msg.id);
-        
-        if (existingById) {
-          // Same ID exists - check if they're truly identical (exact duplicate)
-          const isIdentical = 
-            (existingById.message || '') === (msg.message || '') &&
-            existingById.sender_id === msg.sender_id &&
-            existingById.created_at === msg.created_at;
-          
-          if (isIdentical) {
-            // Truly identical - skip this duplicate
-            continue;
-          }
-          
-          // Same ID but different content - prefer the one with synced status or more complete data
-          const existingIsBetter = 
-            (existingById.sync_status === 'synced' && msg.sync_status !== 'synced') ||
-            (existingById.attachments && !msg.attachments) ||
-            (existingById.reply_to && !msg.reply_to);
-          
-          if (!existingIsBetter) {
-            // Replace with newer/better version
-            seenById.set(msg.id, msg);
-            // Also update in seenMessages if it exists there
-            const messageKey = `${msg.id}_${msg.created_at}_${msg.message || ''}`;
-            seenMessages.set(messageKey, msg);
-          }
-          continue; // Skip to next message
-        }
-        
-        // New ID, add it
-        seenById.set(msg.id, msg);
-        // CRITICAL FIX: Also add to seenMessages immediately so content+sender check can find it
-        const messageKey = `${msg.id}_${msg.created_at}_${msg.message || ''}`;
-        seenMessages.set(messageKey, msg);
-      }
-      
-      // Secondary deduplication: Check by content+sender for messages with same content
-      // This handles cases where same message has different IDs (tempLocalId vs server_id)
-      // and different timestamps (local vs server timestamp)
-      const messageContent = msg.message || '';
-      const messageTime = new Date(msg.created_at).getTime();
-      const senderId = msg.sender_id;
-      
-      // CRITICAL FIX: Check BOTH seenById AND seenMessages for content+sender duplicates
-      // This ensures we catch duplicates even if one is in seenById and one is in seenMessages
-      let foundDuplicate = false;
-      
-      // First check seenById for duplicates (messages with IDs)
-      for (const existing of seenById.values()) {
-        if (existing.id === msg.id) continue; // Skip self
-        const existingTime = new Date(existing.created_at).getTime();
-        const timeDiff = Math.abs(existingTime - messageTime);
-        const contentMatch = (existing.message || '') === messageContent;
-        const senderMatch = existing.sender_id === senderId;
-        
-        if (contentMatch && senderMatch) {
-          const msgHasServerId = msg.id && typeof msg.id === 'number' && msg.id < 1000000000000;
-          const existingHasServerId = existing.id && typeof existing.id === 'number' && existing.id < 1000000000000;
-          
-          // Case 1: Both have server_id - match regardless of timestamp
-          if (msgHasServerId && existingHasServerId) {
-            // Prefer the one with better sync status or newer timestamp
-            if (msg.sync_status === 'synced' && existing.sync_status !== 'synced') {
-              seenById.delete(existing.id);
-              seenById.set(msg.id, msg);
-              const existingKey = `${existing.id}_${existing.created_at}_${messageContent}`;
-              const newKey = `${msg.id}_${msg.created_at}_${messageContent}`;
-              seenMessages.delete(existingKey);
-              seenMessages.set(newKey, msg);
-            } else if (messageTime > existingTime && msg.sync_status === 'synced') {
-              seenById.delete(existing.id);
-              seenById.set(msg.id, msg);
-              const existingKey = `${existing.id}_${existing.created_at}_${messageContent}`;
-              const newKey = `${msg.id}_${msg.created_at}_${messageContent}`;
-              seenMessages.delete(existingKey);
-              seenMessages.set(newKey, msg);
-            }
-            foundDuplicate = true;
-            break;
-          }
-          
-          // Case 2: One has tempLocalId, one has server_id - match if within 10 minutes
-          if ((msgHasServerId && !existingHasServerId) || (!msgHasServerId && existingHasServerId)) {
-            if (timeDiff < 600000) { // 10 minutes window
-              // Prefer the one with server_id (synced)
-              if (msg.sync_status === 'synced' && existing.sync_status !== 'synced') {
-                seenById.delete(existing.id);
-                seenById.set(msg.id, msg);
-                const existingKey = `${existing.id}_${existing.created_at}_${messageContent}`;
-                const newKey = `${msg.id}_${msg.created_at}_${messageContent}`;
-                seenMessages.delete(existingKey);
-                seenMessages.set(newKey, msg);
-              }
-              foundDuplicate = true;
-              break;
-            }
-          }
-          
-          // Case 3: Both have tempLocalId - match if within 5 seconds
-          if (!msgHasServerId && !existingHasServerId) {
-            if (timeDiff < 5000) {
-              if (msg.sync_status === 'synced' && existing.sync_status !== 'synced') {
-                seenById.delete(existing.id);
-                seenById.set(msg.id, msg);
-                const existingKey = `${existing.id}_${existing.created_at}_${messageContent}`;
-                const newKey = `${msg.id}_${msg.created_at}_${messageContent}`;
-                seenMessages.delete(existingKey);
-                seenMessages.set(newKey, msg);
-              }
-              foundDuplicate = true;
-              break;
-            }
-          }
-        }
-      }
-      
-      // Then check seenMessages for duplicates (if not found in seenById)
-      if (!foundDuplicate) {
-        for (const [key, existing] of seenMessages.entries()) {
-          const existingTime = new Date(existing.created_at).getTime();
-          const timeDiff = Math.abs(existingTime - messageTime);
-          const contentMatch = (existing.message || '') === messageContent;
-          const senderMatch = existing.sender_id === senderId;
-          
-          // CRITICAL FIX: For messages with same content+sender, check if they're duplicates
-          // regardless of timestamp if:
-          // 1. Both have server_id (synced messages) - match by content+sender only
-          // 2. One has tempLocalId and one has server_id - match if within reasonable time window
-          if (contentMatch && senderMatch) {
-            const msgHasServerId = msg.id && typeof msg.id === 'number' && msg.id < 1000000000000;
-            const existingHasServerId = existing.id && typeof existing.id === 'number' && existing.id < 1000000000000;
-            
-            // Case 1: Both have server_id - match regardless of timestamp (they're the same message)
-            if (msgHasServerId && existingHasServerId) {
-              // Same content, same sender, both synced - they're duplicates
-              // Prefer the one with more recent timestamp or better sync status
-              if (msg.sync_status === 'synced' && existing.sync_status !== 'synced') {
-                seenMessages.delete(key);
-                const newKey = `${msg.id}_${msg.created_at}_${messageContent}`;
-                seenMessages.set(newKey, msg);
-                if (existing.id && seenById.has(existing.id)) {
-                  seenById.delete(existing.id);
-                  seenById.set(msg.id, msg);
-                }
-              } else if (messageTime > existingTime && msg.sync_status === 'synced') {
-                // Prefer newer timestamp if both are synced
-                seenMessages.delete(key);
-                const newKey = `${msg.id}_${msg.created_at}_${messageContent}`;
-                seenMessages.set(newKey, msg);
-                if (existing.id && seenById.has(existing.id)) {
-                  seenById.delete(existing.id);
-                  seenById.set(msg.id, msg);
-                }
-              }
-              foundDuplicate = true;
-              break;
-            }
-            
-            // Case 2: One has tempLocalId, one has server_id - match if within 10 minutes
-            // (allows for network delays and clock differences)
-            if ((msgHasServerId && !existingHasServerId) || (!msgHasServerId && existingHasServerId)) {
-              if (timeDiff < 600000) { // 10 minutes window
-                // Prefer the one with server_id (synced) over tempLocalId (pending)
-                if (msg.sync_status === 'synced' && existing.sync_status !== 'synced') {
-                  seenMessages.delete(key);
-                  const newKey = `${msg.id}_${msg.created_at}_${messageContent}`;
-                  seenMessages.set(newKey, msg);
-                  if (existing.id && seenById.has(existing.id)) {
-                    seenById.delete(existing.id);
-                    seenById.set(msg.id, msg);
-                  }
-                }
-                foundDuplicate = true;
-                break;
-              }
-            }
-            
-            // Case 3: Both have tempLocalId - match if within 5 seconds (same send attempt)
-            if (!msgHasServerId && !existingHasServerId) {
-              if (timeDiff < 5000) {
-                // Prefer the one with better sync status
-                if (msg.sync_status === 'synced' && existing.sync_status !== 'synced') {
-                  seenMessages.delete(key);
-                  const newKey = `${msg.id}_${msg.created_at}_${messageContent}`;
-                  seenMessages.set(newKey, msg);
-                  if (existing.id && seenById.has(existing.id)) {
-                    seenById.delete(existing.id);
-                    seenById.set(msg.id, msg);
-                  }
-                }
-                foundDuplicate = true;
-                break;
-              }
-            }
-          }
-        }
-      }
-      
-      // Only add to seenMessages if not already added (messages with IDs are already added above)
-      if (!foundDuplicate && (!msg.id || msg.id === undefined || msg.id === null || msg.id === 0)) {
-        // Create composite key for deduplication (only for messages without IDs)
-        const messageKey = `${msg.created_at}_${messageContent}_${senderId}`;
-        seenMessages.set(messageKey, msg);
-      }
-    }
-    
-    // FIX: Combine both seenById and seenMessages, prioritizing seenById
-    // This ensures we don't lose messages that might not have IDs yet
-    const allUniqueMessages = new Map<number | string, Message>();
-    
-    // First, add all messages from seenById (has priority - these have IDs)
-    for (const msg of seenById.values()) {
-      allUniqueMessages.set(msg.id, msg);
-    }
-    
-    // Then, add messages from seenMessages that don't have IDs or weren't in seenById
-    for (const msg of seenMessages.values()) {
-      if (msg.id) {
-        // If it has an ID but wasn't in seenById, add it (shouldn't happen, but safety)
-        if (!allUniqueMessages.has(msg.id)) {
-          allUniqueMessages.set(msg.id, msg);
-        }
-      } else {
-        // Message without ID - use composite key
-        const key = `temp_${msg.created_at}_${msg.message || ''}_${msg.sender_id}`;
-        if (!allUniqueMessages.has(key)) {
-          allUniqueMessages.set(key, msg);
-        }
-      }
-    }
-    
-    // Sort by created_at
-    return Array.from(allUniqueMessages.values()).sort((a: Message, b: Message) => 
-      new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
-    );
-  }, []);
-  
-  // FIXED: Use ref-based approach to prevent infinite loops and race conditions
-  const prevMessagesLengthRef = useRef<number>(0);
-  const isDeduplicatingRef = useRef<boolean>(false);
-  
-  useEffect(() => {
-    // Only deduplicate if:
-    // 1. Messages length changed (might indicate duplicates)
-    // 2. Not already deduplicating (prevent race conditions)
-    // 3. We have messages
-    if (messages.length > 0 && 
-        messages.length !== prevMessagesLengthRef.current && 
-        !isDeduplicatingRef.current) {
-      
-      isDeduplicatingRef.current = true;
-      const deduplicated = deduplicateMessages(messages);
-      
-      if (deduplicated.length !== messages.length) {
-        if (__DEV__) {
-          console.log(`[UserChat] Deduplication safety net: Removed ${messages.length - deduplicated.length} duplicate messages`);
-        }
-        prevMessagesLengthRef.current = deduplicated.length;
-        setMessages(deduplicated);
-      } else {
-        prevMessagesLengthRef.current = messages.length;
-      }
-      
-      // Reset flag after a short delay to allow state updates
-      setTimeout(() => {
-        isDeduplicatingRef.current = false;
-      }, 100);
-    } else if (messages.length === prevMessagesLengthRef.current) {
-      // Length didn't change, update ref
-      prevMessagesLengthRef.current = messages.length;
-    }
-  }, [messages.length, deduplicateMessages]); // Only depend on length, not full array
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(true);
   const [sending, setSending] = useState(false);
@@ -471,7 +164,6 @@ export default function UserChatScreen() {
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
   const [keyboardHeight, setKeyboardHeight] = useState(0);
   const flatListRef = useRef<FlatList<Message>>(null);
-  const hasScrolledForThisConversation = useRef<string | null>(null); // Track which conversation we've scrolled for
   
   // Background retry state - track retry attempts and timeout
   const retryAttemptRef = useRef<number>(0);
@@ -484,35 +176,19 @@ export default function UserChatScreen() {
   const pollingIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const latestMessageIdRef = useRef<number | null>(null); // Track latest message ID to detect new messages
   const isPollingRef = useRef<boolean>(false); // Track if polling is active
-  const POLLING_INTERVAL = 3000; // Poll every 3 seconds
+  const POLLING_INTERVAL = DELTA_POLL_INTERVAL_MS;
   const MAX_RETRY_ATTEMPTS = 5; // Maximum retry attempts
   const INITIAL_RETRY_DELAY = 1000; // Start with 1 second delay
   
-  // Precise scroll position tracking
-  const isInitialLoadRef = useRef<boolean>(true); // Track if this is the initial load
-  const initialScrollCompleteRef = useRef<boolean>(false); // Track if initial scroll to bottom is complete
-  const lastScrollOffsetRef = useRef<number>(0); // Track last scroll offset for pagination
-  const isAtBottomRef = useRef<boolean>(true); // Track if user is at bottom
-  const lastVisibleMessageIdRef = useRef<number | null>(null); // Track last visible message ID for anchor
-  const needsMarkAsReadRef = useRef<boolean>(false); // Track if mark-read needs retry when network comes back
-  
-  // Precise position tracking refs
-  const viewportHeightRef = useRef<number>(0); // Viewport/window height
-  const lastMessageHeightRef = useRef<number>(0); // Last message bubble height
-  const lastMessageYPositionRef = useRef<number>(0); // Last message's Y position from top of content
-  const targetBottomOffsetRef = useRef<number>(20); // Desired distance from bottom (20px padding)
-  const shouldMaintainPositionRef = useRef<boolean>(false); // Whether to maintain fixed position
-  const messageHeightsRef = useRef<Map<number | string, number>>(new Map()); // Track heights of all messages
+  const isAtBottomRef = useRef<boolean>(true); // Inverted list: offset ~0 = at newest
+  const needsMarkAsReadRef = useRef<boolean>(false);
   
   // Pagination state
   const [currentPage, setCurrentPage] = useState(1);
   const [hasMoreMessages, setHasMoreMessages] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
-  const [lastScrollTrigger, setLastScrollTrigger] = useState(0);
   const [dbInitialized, setDbInitialized] = useState(false);
   const [loadedMessagesCount, setLoadedMessagesCount] = useState(0);
-  const MESSAGES_PER_PAGE = 50; // Load 50 messages at a time
-  // Note: INITIAL_VISIBLE_MESSAGES moved above visibleMessages useMemo to prevent NaN
 
   // Initialize database on mount
   useEffect(() => {
@@ -541,60 +217,41 @@ export default function UserChatScreen() {
     // UserInfo state changed
   }, [userInfo]);
 
-  // Load messages from local database first (instant display)
-  const loadMessagesFromDb = useCallback(async (limit: number = MESSAGES_PER_PAGE, offset: number = 0): Promise<Message[]> => {
+  const loadMessagesFromDb = useCallback(async (limit: number = MESSAGES_PER_PAGE): Promise<Message[]> => {
+    if (!dbInitialized) return [];
     try {
-      if (!dbInitialized) return [];
-      
-      const dbMessages = await getDbMessages(Number(id), 'individual', limit, offset);
-      
-      // Transform database format to UI format
-      return dbMessages.map(msg => ({
-        id: msg.server_id || msg.id,
-        message: msg.message || '',
-        sender_id: msg.sender_id,
-        receiver_id: msg.receiver_id,
-        group_id: msg.group_id,
-        created_at: msg.created_at,
-        read_at: msg.read_at,
-        edited_at: msg.edited_at,
-        sync_status: msg.sync_status, // Include sync_status for tick display
-        attachments: msg.attachments?.map(att => ({
-          id: att.server_id || att.id,
-          name: att.name,
-          mime: att.mime,
-          url: att.url,
-          size: att.size,
-          type: att.type,
-        })),
-        reply_to: msg.reply_to,
-        sender: msg.sender, // Include sender info if available
-      }));
+      return (await loadMessagesFromCache(Number(id), 'individual', limit)) as Message[];
     } catch (error) {
       console.error('[UserChat] Error loading messages from database:', error);
       return [];
     }
   }, [id, dbInitialized]);
 
-  // Fetch messages and user info
-  // ✅ API-FIRST STRATEGY: Try API first, fallback to SQLite only if API fails
+  // Cache-first: SQLite immediately, then API merge (stale-while-revalidate)
   const fetchMessages = useCallback(async (showLoading = true) => {
-      // ✅ CRITICAL FIX: Capture isInitialLoad state at start of fetchMessages
-      // This ensures we know if this is truly the initial load, even if flag changes during async operations
-      const isActuallyInitialLoad = isInitialLoadRef.current;
-      
-      // Reset scroll flag on initial load
-      if (isActuallyInitialLoad) {
-        setHasScrolledToBottom(false);
-        initialScrollCompleteRef.current = false; // ✅ Reset scroll complete flag to allow scrolling
-      }
-    
     // Show loading spinner if requested
     if (showLoading) {
       setLoading(true);
     }
+
+    if (dbInitialized) {
+      try {
+        const cached = await loadMessagesFromDb(MESSAGES_PER_PAGE);
+        if (cached.length > 0) {
+          setMessages(cached);
+          messagesLengthRef.current = cached.length;
+          setLoadedMessagesCount(cached.length);
+          latestMessageIdRef.current = cached[cached.length - 1].id;
+          if (showLoading) {
+            setLoading(false);
+          }
+        }
+      } catch (cacheError) {
+        console.error('[UserChat] Cache-first load failed:', cacheError);
+      }
+    }
     
-    // STEP 1: Try API first (source of truth)
+    // Background API fetch (source of truth)
     let apiSuccess = false;
     let apiMessages: Message[] = [];
     let apiError: any = null;
@@ -639,45 +296,35 @@ export default function UserChatScreen() {
         return msg;
       });
       
-      // Sort messages by created_at in ascending order (oldest first)
-      const sortedMessages = processedMessages.sort((a: Message, b: Message) => 
-        new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
-      );
-      
-      // Deduplicate messages
-      const uniqueMessages = deduplicateMessages(sortedMessages);
-      
-      // Mark API as successful
+      apiMessages = mapApiMessages(processedMessages) as Message[];
       apiSuccess = true;
-      apiMessages = uniqueMessages.map(msg => ({
-        ...msg,
-        sync_status: msg.sync_status || 'synced' as const,
-      }));
+
+      const partnerId = Number(id);
+      const authUserId = Number(user?.id ?? 0);
+      apiMessages = apiMessages.map((msg) => {
+        const enriched = { ...msg };
+        if (!enriched.sender && partnerId > 0 && Number(enriched.sender_id) === partnerId) {
+          enriched.sender = {
+            id: partnerId,
+            name: res.data.selectedConversation?.name ?? userInfo?.name ?? 'User',
+            avatar_url:
+              res.data.selectedConversation?.avatar_url ??
+              userInfo?.avatar_url ??
+              userInfo?.user?.avatar_url,
+          };
+        } else if (!enriched.sender && authUserId > 0 && Number(enriched.sender_id) === authUserId) {
+          enriched.sender = {
+            id: authUserId,
+            name: user?.name ?? 'You',
+            avatar_url: user?.avatar_url,
+          };
+        }
+        return enriched;
+      });
       
-      // Save messages to database
       if (dbInitialized) {
         try {
-          const messagesToSave = uniqueMessages.map((msg: any) => ({
-            server_id: msg.id,
-            conversation_id: Number(id),
-            conversation_type: 'individual' as const,
-            sender_id: msg.sender_id,
-            receiver_id: msg.receiver_id,
-            message: msg.message,
-            created_at: msg.created_at,
-            read_at: msg.read_at,
-            edited_at: msg.edited_at,
-            reply_to_id: msg.reply_to_id,
-            sync_status: 'synced' as const,
-            attachments: msg.attachments,
-          }));
-          await saveDbMessages(messagesToSave);
-          
-          // ❌ REMOVED: fixDuplicateMessagesWithWrongTimestamps - not needed since:
-          // 1. saveDbMessages already handles deduplication by server_id
-          // 2. API is source of truth, data is already correct
-          // 3. This function loads ALL messages which is slow
-          // 4. It was blocking UI on every conversation open
+          await persistApiMessages(Number(id), 'individual', apiMessages);
         } catch (dbError) {
           console.error('[UserChat] Error saving messages to database:', dbError);
         }
@@ -711,21 +358,6 @@ export default function UserChatScreen() {
         }
       }
       
-      // Mark messages as read
-      if (ENABLE_MARK_AS_READ) {
-        try {
-          await messagesAPI.markMessagesAsRead(Number(id));
-          updateUnreadCount(Number(id), 0);
-        } catch (error: any) {
-          const statusCode = error?.response?.status;
-          if (statusCode !== 429 && statusCode !== 422 && statusCode !== 404) {
-            if (__DEV__) {
-              console.log('markMessagesAsRead failed:', statusCode || error?.message || error);
-            }
-          }
-        }
-      }
-      
       // Successfully fetched - reset retry attempts
       retryAttemptRef.current = 0;
       if (retryTimeoutRef.current) {
@@ -740,159 +372,47 @@ export default function UserChatScreen() {
     // STEP 2: Handle API result or fallback to SQLite
     // ✅ CRITICAL FIX: Use the captured isActuallyInitialLoad from the start of the function
     if (apiSuccess) {
-      // ✅ API succeeded - merge with existing pending messages instead of replacing
-      console.log(`[UserChat] 📥 fetchMessages API success:`, {
-        messageCount: apiMessages.length,
-        isInitialLoad: isActuallyInitialLoad,
-        INITIAL_VISIBLE_MESSAGES,
-      });
-      
-      // ✅ CRITICAL FIX: Merge API messages with existing pending messages instead of replacing
-      // This prevents messages from disappearing when fetchMessages runs after sending
       setMessages(prev => {
-        // Protect messages that are pending or being sent
-        const messagesBeingSent = getMessagesBeingSent();
-        const pendingMessages = prev.filter(msg => {
-          // Keep pending/failed messages that are being sent
-          if (messagesBeingSent.has(msg.id as number)) {
-            return true;
-          }
-          // Keep pending/failed messages that don't have a server_id yet
-          if ((msg.sync_status === 'pending' || msg.sync_status === 'failed') && 
-              !apiMessages.some(apiMsg => apiMsg.id === msg.id)) {
-            return true;
-          }
-          return false;
-        });
-        
-        // Combine API messages with protected pending messages
-        const allMessages = [...apiMessages, ...pendingMessages];
-        
-        // Deduplicate (prefer API messages over pending if same ID)
-        const uniqueMessages = deduplicateMessages(allMessages);
-        
-        // Sort by created_at
-        const sortedMessages = uniqueMessages.sort((a, b) => 
-          new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
-        );
-        
-        if (__DEV__ && pendingMessages.length > 0) {
-          console.log(`[UserChat] 🔄 fetchMessages: Merged ${pendingMessages.length} pending messages with ${apiMessages.length} API messages`);
+        const merged = mergeMessagesWithPending(apiMessages, prev) as Message[];
+        messagesLengthRef.current = merged.length;
+        if (merged.length > 0) {
+          latestMessageIdRef.current = merged[merged.length - 1].id;
         }
-        
-        // Update refs with merged messages
-        messagesLengthRef.current = sortedMessages.length;
-        
-        if (sortedMessages.length > 0) {
-          const latestMsg = sortedMessages[sortedMessages.length - 1];
-          latestMessageIdRef.current = latestMsg.id;
-          console.log(`[UserChat] 📌 Latest message ID set to: ${latestMsg.id}`);
-          
-          // ✅ DEBUG LOGGING: Log initial message state
-          console.log(`[UserChat] 📊 Initial message state after setMessages:`, {
-            totalMessages: sortedMessages.length,
-            firstMessage: sortedMessages[0] ? {
-              id: sortedMessages[0].id,
-              content: sortedMessages[0].message?.substring(0, 30),
-              created_at: sortedMessages[0].created_at,
-            } : null,
-            lastMessage: {
-              id: latestMsg.id,
-              content: latestMsg.message?.substring(0, 30),
-              created_at: latestMsg.created_at,
-            },
-            isInitialLoad: isInitialLoadRef.current,
-            visibleMessagesStartIndex: visibleMessagesStartIndex,
-            note: 'FlatList will render these messages. With inverted=false, latest messages appear at bottom (need to scroll to bottom).',
-          });
-        }
-        
-        return sortedMessages;
+        return merged;
       });
-      
-      // ✅ CRITICAL FIX: Use captured isActuallyInitialLoad
-      // Initially show only last N messages (latest at bottom)
-      // Use messagesLengthRef which now has the merged count
-      if (isActuallyInitialLoad && messagesLengthRef.current > INITIAL_VISIBLE_MESSAGES) {
-        const startIndex = messagesLengthRef.current - INITIAL_VISIBLE_MESSAGES;
-        console.log(`[UserChat] 🎯 Setting visibleMessagesStartIndex:`, {
-          totalMessages: messagesLengthRef.current,
-          INITIAL_VISIBLE_MESSAGES,
-          startIndex,
-          willShowMessagesFrom: startIndex,
-          willShowMessagesTo: apiMessages.length - 1,
-          firstMessageToShow: apiMessages[startIndex] ? {
-            id: apiMessages[startIndex].id,
-            content: apiMessages[startIndex].message?.substring(0, 30),
-            created_at: apiMessages[startIndex].created_at,
-          } : null,
-          lastMessageToShow: apiMessages[apiMessages.length - 1] ? {
-            id: apiMessages[apiMessages.length - 1].id,
-            content: apiMessages[apiMessages.length - 1].message?.substring(0, 30),
-            created_at: apiMessages[apiMessages.length - 1].created_at,
-          } : null,
-        });
-        setVisibleMessagesStartIndex(startIndex);
-      }
-      // ✅ CRITICAL FIX: When messages < INITIAL_VISIBLE_MESSAGES, visibleMessagesStartIndex stays null
-      // This is correct - visibleMessages useMemo will show all messages
-      // But initialScrollIndex will still be set to ensure FlatList starts at the bottom
       
       setLoadedMessagesCount(messagesLengthRef.current);
       
       if (showLoading) {
         setLoading(false);
       }
-      
-      // ✅ CRITICAL FIX: Use captured isActuallyInitialLoad
-      if (isActuallyInitialLoad || isAtBottomRef.current) {
-        setHasScrolledToBottom(false);
-      }
     } else {
       // ❌ API failed - fallback to SQLite
       if (dbInitialized) {
         try {
-          const sqliteMessages = await loadMessagesFromDb(MESSAGES_PER_PAGE, 0);
+          const sqliteMessages = await loadMessagesFromDb(MESSAGES_PER_PAGE);
           
           if (sqliteMessages.length > 0) {
-            // ✅ SQLite has data - use it
-            const sortedMessages = sqliteMessages.sort((a, b) => 
-              new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
-            );
-            const uniqueMessages = deduplicateMessages(sortedMessages);
-            setMessages(uniqueMessages);
-            messagesLengthRef.current = uniqueMessages.length;
-            setLoadedMessagesCount(uniqueMessages.length);
+            setMessages(sqliteMessages);
+            messagesLengthRef.current = sqliteMessages.length;
+            setLoadedMessagesCount(sqliteMessages.length);
             
-            if (uniqueMessages.length > 0) {
-              const latestMsg = uniqueMessages[uniqueMessages.length - 1];
+            if (sqliteMessages.length > 0) {
+              const latestMsg = sqliteMessages[sqliteMessages.length - 1];
               latestMessageIdRef.current = latestMsg.id;
             }
-            
-            // ✅ CRITICAL FIX: Use captured isActuallyInitialLoad
-            if (isActuallyInitialLoad && uniqueMessages.length > INITIAL_VISIBLE_MESSAGES) {
-              const startIndex = uniqueMessages.length - INITIAL_VISIBLE_MESSAGES;
-              console.log(`[UserChat] 🎯 Setting visibleMessagesStartIndex (SQLite fallback):`, {
-                totalMessages: uniqueMessages.length,
-                INITIAL_VISIBLE_MESSAGES,
-                startIndex,
-                willShowMessagesFrom: startIndex,
-                willShowMessagesTo: uniqueMessages.length - 1,
-              });
-              setVisibleMessagesStartIndex(startIndex);
-            }
-            // ✅ CRITICAL FIX: When messages < INITIAL_VISIBLE_MESSAGES, visibleMessagesStartIndex stays null
-            // This is correct - visibleMessages useMemo will show all messages
-            // But initialScrollIndex will still be set to ensure FlatList starts at the bottom
             
             if (showLoading) {
               setLoading(false);
             }
           } else {
-            // ❌ Both API and SQLite are empty - show empty state
-            setMessages([]);
-            messagesLengthRef.current = 0;
-            setLoadedMessagesCount(0);
+            // Keep current messages on transient API/SQLite failures.
+            // Only show empty state if there are truly no messages in memory.
+            if (messagesLengthRef.current === 0) {
+              setMessages([]);
+              messagesLengthRef.current = 0;
+              setLoadedMessagesCount(0);
+            }
             
             if (showLoading) {
               setLoading(false);
@@ -900,18 +420,22 @@ export default function UserChatScreen() {
           }
         } catch (sqliteError) {
           console.error('[UserChat] Error loading from SQLite fallback:', sqliteError);
-          // ❌ Both API and SQLite failed - show empty state
-          setMessages([]);
-          messagesLengthRef.current = 0;
+          // Keep the last rendered messages on fallback errors.
+          if (messagesLengthRef.current === 0) {
+            setMessages([]);
+            messagesLengthRef.current = 0;
+          }
           
           if (showLoading) {
             setLoading(false);
           }
         }
       } else {
-        // ❌ API failed and no database - show empty state
-        setMessages([]);
-        messagesLengthRef.current = 0;
+        // Keep last rendered messages if available while backend is unavailable.
+        if (messagesLengthRef.current === 0) {
+          setMessages([]);
+          messagesLengthRef.current = 0;
+        }
         
         if (showLoading) {
           setLoading(false);
@@ -949,7 +473,7 @@ export default function UserChatScreen() {
         }
       }
     }
-    }, [id, updateUnreadCount, ENABLE_MARK_AS_READ]);
+    }, [id, updateUnreadCount, user?.id, user?.name, user?.avatar_url]);
 
   // Update messages length ref when messages change
   useEffect(() => {
@@ -963,235 +487,48 @@ export default function UserChatScreen() {
   
   // Background polling for new messages - silent, non-intrusive
   const pollForNewMessages = useCallback(async () => {
-    // Don't poll if:
-    // 1. Already polling (prevent concurrent polls)
-    // 2. User is loading more messages (pagination)
-    // 3. User is sending a message
-    // 4. No latest message ID tracked yet
-    // ✅ CRITICAL FIX: Don't poll if there are messages currently being sent (prevent race conditions)
-    const messagesBeingSent = getMessagesBeingSent();
     if (
+      AppState.currentState !== 'active' ||
       isPollingRef.current ||
       loadingMore ||
       isPaginatingRef.current ||
       sending ||
-      !latestMessageIdRef.current ||
-      messagesBeingSent.size > 0
+      !latestMessageIdRef.current
     ) {
-      if (messagesBeingSent.size > 0 && __DEV__) {
-        console.log(`[UserChat] ⏸️ Skipping poll - ${messagesBeingSent.size} message(s) being sent`);
-      }
       return;
     }
 
     isPollingRef.current = true;
     try {
-      // Fetch latest messages (page 1) silently
-      const res = await messagesAPI.getByUser(Number(id), 1, 10);
-      const messagesData = res.data.messages?.data || res.data.messages || [];
-      
-      if (messagesData.length === 0) {
-        isPollingRef.current = false;
-        return;
+      const latestId = latestMessageIdRef.current;
+      const res = await messagesAPI.getByUserSince(Number(id), undefined, latestId);
+      const messagesData = res.data.messages?.data || res.data.messages || res.data || [];
+      if (!Array.isArray(messagesData) || messagesData.length === 0) return;
+
+      const delta = mapApiMessages(messagesData) as Message[];
+      const newOnly = delta.filter((msg) => msg.id > latestId);
+      if (newOnly.length === 0) return;
+
+      if (dbInitialized) {
+        await persistApiMessages(Number(id), 'individual', newOnly);
       }
 
-      // Sort messages to find the newest
-      const sortedNewMessages = messagesData.sort((a: Message, b: Message) => 
-        new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
-      );
-      
-      const newestMessage = sortedNewMessages[sortedNewMessages.length - 1];
-      
-      // Check if we have new messages (newer than our latest)
-      if (newestMessage.id > latestMessageIdRef.current) {
-        // Find all new messages (those with ID > latestMessageIdRef.current)
-        const newMessages = sortedNewMessages.filter((msg: Message) => 
-          msg.id > latestMessageIdRef.current!
-        );
-        
-        if (newMessages.length > 0) {
-          // ✅ CRITICAL FIX: Merge with pending messages from SQLite before updating UI
-          // This prevents pending messages from disappearing when polling runs
-          let pendingMessages: Message[] = [];
-          if (dbInitialized) {
-            try {
-              const { getPendingMessages } = await import('@/services/database');
-              const pending = await getPendingMessages(Number(id), 'individual');
-              
-              // ✅ DEBUG LOGGING: Log all pending messages found
-              console.log(`[UserChat] 📋 Polling: Found ${pending.length} pending messages in SQLite:`, 
-                pending.map(m => ({ id: m.id, message: m.message?.substring(0, 30), sync_status: m.sync_status }))
-              );
-              
-              // Filter out messages that are currently being sent (they're already in UI)
-              const messagesBeingSent = getMessagesBeingSent();
-              console.log(`[UserChat] 📋 Polling: ${messagesBeingSent.size} message(s) currently being sent:`, 
-                Array.from(messagesBeingSent)
-              );
-              
-              pendingMessages = pending.filter(msg => 
-                msg.id != null && !messagesBeingSent.has(msg.id)
-              );
-              
-              console.log(`[UserChat] 📋 Polling: After filtering, ${pendingMessages.length} pending messages to merge`);
-              
-              if (pendingMessages.length > 0) {
-                console.log(`[UserChat] 📋 Polling: Pending messages to merge:`, 
-                  pendingMessages.map(m => ({ id: m.id, message: m.message?.substring(0, 30) }))
-                );
-              }
-            } catch (dbError) {
-              console.error('[UserChat] Error fetching pending messages during poll:', dbError);
-            }
-          }
-          
-          // Add new messages to existing messages (append at end, they're already sorted)
-          setMessages(prev => {
-            // ✅ DEBUG LOGGING: Log state before polling update
-            console.log(`[UserChat] 🔄 Polling: Before update - ${prev.length} messages in UI:`, 
-              prev.map(m => ({ id: m.id, message: m.message?.substring(0, 30), sync_status: m.sync_status }))
-            );
-            
-            console.log(`[UserChat] 🔄 Polling: ${newMessages.length} new API messages:`, 
-              newMessages.map(m => ({ id: m.id, message: m.message?.substring(0, 30) }))
-            );
-            
-            console.log(`[UserChat] 🔄 Polling: ${pendingMessages.length} pending messages to merge:`, 
-              pendingMessages.map(m => ({ id: m.id, message: m.message?.substring(0, 30) }))
-            );
-            
-            // CRITICAL FIX: Use prev (current state) instead of stale closure 'messages'
-            // Check for duplicates before adding - use comprehensive check
-            const existingIds = new Set(prev.map(m => m.id).filter(id => id != null));
-            const existingMessagesMap = new Map<number | string, Message>();
-            prev.forEach(m => {
-              if (m.id != null) {
-                existingMessagesMap.set(m.id, m);
-              }
-            });
-            
-            // ✅ CRITICAL FIX: Merge pending messages with new API messages
-            // Combine pending messages with new API messages before deduplication
-            const allNewMessages = [...newMessages, ...pendingMessages];
-            
-            console.log(`[UserChat] 🔄 Polling: Combined ${allNewMessages.length} messages (${newMessages.length} API + ${pendingMessages.length} pending)`);
-            
-            // ✅ CRITICAL FIX: Improved deduplication - match by server_id, content+sender+timestamp, or ID
-            const uniqueNewMessages = allNewMessages.filter(newMsg => {
-              // Check 1: Same ID
-              if (newMsg.id != null && existingIds.has(newMsg.id)) {
-                return false; // Duplicate by ID
-              }
-              
-              // Check 2: Match by server_id if message has server_id
-              // This handles the case where UI has tempLocalId but API returns server_id
-              if (newMsg.id != null) {
-                const hasMatchingServerId = prev.some(existing => {
-                  // If existing message has same server_id (stored in id field after sync)
-                  // or if they're the same message with different IDs
-                  return existing.id === newMsg.id;
-                });
-                
-                if (hasMatchingServerId) {
-                  return false; // Duplicate by server_id
-                }
-              }
-              
-              // Check 3: Same content + sender + timestamp (within 2 seconds) - exact duplicate
-              // ✅ Increased time window to 2 seconds to catch messages that were just sent
-              const isExactDuplicate = prev.some(existing => {
-                if (existing.id === newMsg.id) return true; // Already checked above
-                
-                const timeDiff = Math.abs(
-                  new Date(existing.created_at).getTime() - new Date(newMsg.created_at).getTime()
-                );
-                const contentMatch = (existing.message || '') === (newMsg.message || '');
-                const senderMatch = existing.sender_id === newMsg.sender_id;
-                
-                // If same content, sender, and timestamp within 2 seconds, it's an exact duplicate
-                return contentMatch && senderMatch && timeDiff < 2000;
-              });
-              
-              return !isExactDuplicate;
-            });
-            
-            console.log(`[UserChat] 🔄 Polling: After deduplication, ${uniqueNewMessages.length} unique new messages`);
-            
-            if (uniqueNewMessages.length === 0) {
-              console.log(`[UserChat] 🔄 Polling: No new unique messages, keeping existing ${prev.length} messages`);
-              return prev; // No new unique messages
-            }
-            
-            // Process new messages to ensure reply_to data is structured
-            // Use prev (current state) instead of stale closure
-            const processedNewMessages = uniqueNewMessages.map((msg: any) => {
-              if (msg.reply_to) {
-                return msg;
-              }
-              
-              if (msg.reply_to_id) {
-                // Try to find replied message in existing messages (prev) or new messages
-                const allMessages = [...prev, ...uniqueNewMessages];
-                const repliedMessage = allMessages.find((m: any) => m.id === msg.reply_to_id);
-                if (repliedMessage) {
-                  msg.reply_to = {
-                    id: repliedMessage.id,
-                    message: repliedMessage.message,
-                    sender: repliedMessage.sender || {
-                      id: repliedMessage.sender_id,
-                      name: repliedMessage.sender?.name || 'Unknown User'
-                    },
-                    attachments: repliedMessage.attachments || []
-                  };
-                }
-              }
-              return msg;
-            });
-            
-            // Combine and sort all messages
-            const allMessages = [...prev, ...processedNewMessages].sort((a: Message, b: Message) => 
-              new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
-            );
-            
-            // CRITICAL: Always deduplicate (defense in depth)
-            const uniqueMessages = deduplicateMessages(allMessages);
-            
-            // ✅ DEBUG LOGGING: Log final state after polling update
-            console.log(`[UserChat] ✅ Polling: After update - ${uniqueMessages.length} messages in UI:`, 
-              uniqueMessages.map(m => ({ id: m.id, message: m.message?.substring(0, 30), sync_status: m.sync_status }))
-            );
-            
-            // Update latest message ID
-            if (uniqueMessages.length > 0) {
-              const latestMsg = uniqueMessages[uniqueMessages.length - 1];
-              latestMessageIdRef.current = latestMsg.id;
-            }
-            messagesLengthRef.current = uniqueMessages.length;
-            
-            return uniqueMessages; // Return deduplicated messages
-          });
-          
-            // Auto-scroll to bottom when receiving new messages (only if user is at bottom)
-            // maintainVisibleContentPosition will handle position maintenance automatically
-            if (isAtBottomRef.current && !isInitialLoadRef.current) {
-              requestAnimationFrame(() => {
-                setTimeout(() => {
-                  scrollToBottom(false, 0, false);
-                }, 100);
-              });
-            }
-        }
+      setMessages((prev) => mergeDeltaMessages(prev as Message[], newOnly) as Message[]);
+      latestMessageIdRef.current = newOnly[newOnly.length - 1].id;
+
+      if (isAtBottomRef.current) {
+        requestAnimationFrame(() => {
+          flatListRef.current?.scrollToOffset({ offset: 0, animated: true });
+        });
       }
-    } catch (error: any) {
-      // Silently handle errors - don't interrupt user
-      // Only log in dev mode
+    } catch (error) {
       if (__DEV__) {
-        console.log('[UserChat] Polling error (silent):', error.message);
+        console.log('[UserChat] Polling error (silent):', (error as Error)?.message);
       }
     } finally {
       isPollingRef.current = false;
     }
-  }, [id, loadingMore, sending, hasScrolledToBottom, scrollToBottom]); // CRITICAL FIX: Removed 'messages' to prevent stale closure
+  }, [id, loadingMore, sending, dbInitialized]);
 
   // Start/stop polling based on screen focus and user activity
   useEffect(() => {
@@ -1210,6 +547,7 @@ export default function UserChatScreen() {
 
     // Start polling
     pollingIntervalRef.current = setInterval(() => {
+      if (isRealtimeConnected()) return;
       pollForNewMessages();
     }, POLLING_INTERVAL);
 
@@ -1233,10 +571,6 @@ export default function UserChatScreen() {
     lastFocusTimeRef.current = 0; // Reset focus time
     latestMessageIdRef.current = null; // Reset latest message ID
     isPollingRef.current = false; // Reset polling flag
-    initialScrollCompleteRef.current = false; // Reset initial scroll flag
-    isInitialLoadRef.current = true; // ✅ CRITICAL FIX: Set initial load flag when conversation changes
-    setVisibleMessagesStartIndex(null); // Reset visible messages start index
-    
     // Clear polling interval
     if (pollingIntervalRef.current) {
       clearInterval(pollingIntervalRef.current);
@@ -1253,6 +587,8 @@ export default function UserChatScreen() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]); // Only depend on id, fetchMessages is stable
 
+  // Phase 1: outbox sync handled by useOutboxSync(setMessages)
+
   // Cleanup retry timeout, polling, and scroll timeouts on unmount
   useEffect(() => {
     return () => {
@@ -1267,55 +603,121 @@ export default function UserChatScreen() {
     };
   }, []);
 
-  // Simplified scroll to bottom function - maintainVisibleContentPosition handles most cases
-  const scrollToBottom = useCallback((animated = false, delay = 0, force = false) => {
-    if (!flatListRef.current || messages.length === 0) {
-      return;
-    }
-    
-    const performScroll = () => {
-      if (!flatListRef.current || messages.length === 0) {
-        return;
-      }
-      
-      try {
-        // Simply scroll to end - maintainVisibleContentPosition will handle position maintenance
-        (flatListRef.current as any).scrollToEnd({ animated });
-            setHasScrolledToBottom(true);
-        isAtBottomRef.current = true;
-        
-        // Update anchor message when scrolling to bottom
-        if (messages.length > 0) {
-          lastVisibleMessageIdRef.current = messages[messages.length - 1].id;
-        }
-          } catch (error) {
-        console.warn('Scroll failed:', error);
-      }
-    };
-    
-    if (delay > 0) {
-      setTimeout(performScroll, delay);
-    } else {
-      requestAnimationFrame(performScroll);
-    }
+  const scrollToBottom = useCallback((animated = false) => {
+    // Inverted list: newest message lives at offset 0 (visual bottom)
+    if (!flatListRef.current || messages.length === 0) return;
+    flatListRef.current.scrollToOffset({ offset: 0, animated });
   }, [messages.length]);
 
-  // Reset scroll state when conversation changes
-  useEffect(() => {
-    if (hasScrolledForThisConversation.current !== id) {
-      hasScrolledForThisConversation.current = id as string;
-      setHasScrolledToBottom(false);
-      isInitialLoadRef.current = true;
-      isAtBottomRef.current = true;
-      shouldMaintainPositionRef.current = false; // Reset on conversation change
-      lastScrollOffsetRef.current = 0;
-      lastVisibleMessageIdRef.current = null;
-      viewportHeightRef.current = 0;
-      lastMessageHeightRef.current = 0;
-      lastMessageYPositionRef.current = 0;
-      messageHeightsRef.current.clear(); // Clear message heights cache
+  const applyLocalReadState = useCallback(() => {
+    if (!id || !user) return;
+    updateUnreadCount(Number(id), 0);
+    setMessages(prevMessages => {
+      const now = new Date().toISOString();
+      return prevMessages.map(msg => {
+        if (msg.sender_id === Number(id) && msg.receiver_id === user.id && !msg.read_at) {
+          return { ...msg, read_at: now };
+        }
+        return msg;
+      });
+    });
+  }, [id, user, updateUnreadCount]);
+
+  const markConversationAsRead = useCallback(async () => {
+    if (!ENABLE_MARK_AS_READ || !id || !user) return;
+
+    applyLocalReadState();
+
+    try {
+      const netInfo = await NetInfo.fetch();
+      if (!netInfo.isConnected) {
+        needsMarkAsReadRef.current = true;
+        return;
+      }
+    } catch {
+      needsMarkAsReadRef.current = true;
+      return;
     }
-  }, [id]);
+
+    try {
+      const result = await markUserChatAsRead(Number(id));
+      needsMarkAsReadRef.current = !result.ok && !result.skipped && !result.rateLimited;
+    } catch (error: any) {
+      const isNetworkError =
+        error?.code === 'ERR_NETWORK' ||
+        error?.message?.includes('Network Error') ||
+        !error?.response;
+
+      if (isNetworkError) {
+        needsMarkAsReadRef.current = true;
+      } else if (__DEV__ && error?.response?.status !== 429) {
+        console.log('[UserChat] mark as read failed:', error?.response?.status || error?.message);
+      }
+    }
+  }, [ENABLE_MARK_AS_READ, id, user, applyLocalReadState]);
+
+  const fetchMessagesRef = useRef(fetchMessages);
+  const markConversationAsReadRef = useRef(markConversationAsRead);
+  const loadingMoreRef = useRef(loadingMore);
+  const sendingRef = useRef(sending);
+  const currentPageRef = useRef(currentPage);
+  const setActiveConversationRef = useRef(setActiveConversation);
+  const clearActiveConversationRef = useRef(clearActiveConversation);
+  fetchMessagesRef.current = fetchMessages;
+  markConversationAsReadRef.current = markConversationAsRead;
+  loadingMoreRef.current = loadingMore;
+  sendingRef.current = sending;
+  currentPageRef.current = currentPage;
+  setActiveConversationRef.current = setActiveConversation;
+  clearActiveConversationRef.current = clearActiveConversation;
+
+  useEffect(() => {
+    const conversationId = Number(id);
+    if (!conversationId) return;
+
+    // The backend broadcasts each DM to both the sender and receiver id
+    // channels, and channel auth only permits listening on your *own* id.
+    // So subscribe to our own private channel, not the other user's id.
+    let unsubChannel = () => {};
+    let cancelled = false;
+
+    void (async () => {
+      const myUserId =
+        Number(user?.id ?? 0) || Number(await getCachedAuthUserId()) || 0;
+      if (cancelled || !myUserId) return;
+      unsubChannel = subscribeConversationChannel({
+        conversationId: myUserId,
+        conversationType: 'individual',
+      });
+    })();
+
+    const unsubHandler = onRealtimeMessage((message) => {
+      const isForThisChat =
+        message.group_id == null &&
+        (message.sender_id === conversationId || message.receiver_id === conversationId);
+      if (!isForThisChat) return;
+
+      void handleRealtimeMessage(conversationId, 'individual', message, (applyMerge) => {
+        setMessages((prev) => applyMerge(prev as Message[]) as Message[]);
+      });
+
+      if (message.id > (latestMessageIdRef.current ?? 0)) {
+        latestMessageIdRef.current = message.id;
+      }
+
+      if (isAtBottomRef.current) {
+        requestAnimationFrame(() => {
+          flatListRef.current?.scrollToOffset({ offset: 0, animated: true });
+        });
+      }
+    });
+
+    return () => {
+      cancelled = true;
+      unsubChannel();
+      unsubHandler();
+    };
+  }, [id, user?.id]);
 
   // Debug: Log all keys and check for duplicates before rendering FlatList
   useEffect(() => {
@@ -1343,24 +745,6 @@ export default function UserChatScreen() {
     }
   }, [messages]);
   
-  // ✅ DEBUG LOGGING: Track when visibleMessages changes
-  useEffect(() => {
-    console.log(`[UserChat] 🔄 visibleMessages changed:`, {
-      count: visibleMessages.length,
-      startIndex: visibleMessagesStartIndex,
-      firstMessage: visibleMessages[0] ? {
-        id: visibleMessages[0].id,
-        content: visibleMessages[0].message?.substring(0, 30),
-        created_at: visibleMessages[0].created_at,
-      } : null,
-      lastMessage: visibleMessages[visibleMessages.length - 1] ? {
-        id: visibleMessages[visibleMessages.length - 1].id,
-        content: visibleMessages[visibleMessages.length - 1].message?.substring(0, 30),
-        created_at: visibleMessages[visibleMessages.length - 1].created_at,
-      } : null,
-    });
-  }, [visibleMessages, visibleMessagesStartIndex]);
-
   // Keyboard listeners
   useEffect(() => {
     const keyboardDidShowListener = Keyboard.addListener('keyboardDidShow', (e) => {
@@ -1383,186 +767,48 @@ export default function UserChatScreen() {
     };
   }, []);
 
-  // Track if we've done initial scroll
-  const [hasScrolledToBottom, setHasScrolledToBottom] = useState(false);
-  
-  // Scroll to bottom when messages are first loaded (after content is rendered)
-  // This is handled by onContentSizeChange and onLayout to avoid blank screen
-
   // Mark messages as read and refresh messages when conversation is opened
   useFocusEffect(
     useCallback(() => {
-      // Set this conversation as active to suppress notifications
       const conversationId = Number(id);
       if (conversationId) {
-        setActiveConversation(conversationId);
+        setActiveConversationRef.current(conversationId);
       }
 
       const now = Date.now();
       const timeSinceLastFocus = now - lastFocusTimeRef.current;
       lastFocusTimeRef.current = now;
 
-      // Don't refresh if:
-      // 1. User is currently loading more messages (paginating)
-      // 2. User just focused (within 2 seconds) - likely a false trigger
-      // 3. We're on a page > 1 (user has paginated) - don't reset their pagination
-      // 4. User is currently sending a message - prevent refresh that would remove pending message
-      // 5. Messages are being sent - protect pending messages from being removed
-      const messagesBeingSent = getMessagesBeingSent();
-      const shouldSkipRefresh = 
-        loadingMore || 
-        isPaginatingRef.current || 
-        currentPage > 1 ||
-        sending || // ✅ Don't refresh if sending
-        messagesBeingSent.size > 0 || // ✅ Don't refresh if messages are being sent
-        (timeSinceLastFocus < 2000 && messages.length > 0);
+      const shouldSkipRefresh =
+        loadingMoreRef.current ||
+        isPaginatingRef.current ||
+        currentPageRef.current > 1 ||
+        sendingRef.current ||
+        (timeSinceLastFocus < 2000 && messagesLengthRef.current > 0);
 
       if (shouldSkipRefresh) {
-        // Still mark messages as read, but don't refresh
-        if (ENABLE_MARK_AS_READ && id && user) {
-          const markMessagesAsRead = async () => {
-            // CRITICAL FIX: Check network connectivity before making API call
-            try {
-              const netInfo = await NetInfo.fetch();
-              if (!netInfo.isConnected) {
-                if (__DEV__) {
-                  console.log('[UserChat] Skipping mark as read - no network connection');
-                }
-                needsMarkAsReadRef.current = true; // Set flag to retry when network comes back
-                return;
-              }
-            } catch (netError) {
-              // If NetInfo fails, assume offline to be safe
-              if (__DEV__) {
-                console.warn('[UserChat] Could not check network status:', netError);
-              }
-              needsMarkAsReadRef.current = true;
-              return;
-            }
-            
-            try {
-              await messagesAPI.markMessagesAsRead(Number(id));
-              updateUnreadCount(Number(id), 0);
-              needsMarkAsReadRef.current = false; // Reset flag on success
-            } catch (error: any) {
-              // Handle network errors gracefully
-              const isNetworkError = 
-                error?.code === 'ERR_NETWORK' ||
-                error?.message?.includes('Network Error') ||
-                !error?.response;
-              
-              if (isNetworkError) {
-                needsMarkAsReadRef.current = true; // Set flag to retry when network comes back
-                if (__DEV__) {
-                  console.log('[UserChat] Mark as read failed - network error, will retry when online');
-                }
-              } else {
-                // Other errors - silently ignore
-                if (__DEV__) {
-                  console.error('[UserChat] Error marking messages as read:', error);
-                }
-              }
-            }
-          };
-          markMessagesAsRead();
-        }
-        return;
+        void markConversationAsReadRef.current();
+        return () => {
+          clearActiveConversationRef.current();
+        };
       }
 
-      // Refresh messages when screen gains focus to get any new messages
-      // Don't show loading spinner if messages already exist (to avoid flickering)
-      const hasExistingMessages = messages.length > 0;
-      
-      // Reset scroll flag on focus if at bottom or initial load
-      if (!loadingMore && !isPaginatingRef.current && currentPage === 1) {
-        setHasScrolledToBottom(false);
+      const hasExistingMessages = messagesLengthRef.current > 0;
+
+      if (!hasExistingMessages) {
         isAtBottomRef.current = true;
       }
-      
-      fetchMessages(!hasExistingMessages);
 
-      const markMessagesAsRead = async () => {
-        if (!ENABLE_MARK_AS_READ || !id || !user) return;
-        
-        // CRITICAL FIX: Check network connectivity before making API call
-        try {
-          const netInfo = await NetInfo.fetch();
-          if (!netInfo.isConnected) {
-            if (__DEV__) {
-              console.log('[UserChat] Skipping mark as read - no network connection');
-            }
-            needsMarkAsReadRef.current = true; // Set flag to retry when network comes back
-            return; // Don't make API call if offline
-          }
-        } catch (netError) {
-          // If NetInfo fails, assume offline to be safe
-          if (__DEV__) {
-            console.warn('[UserChat] Could not check network status:', netError);
-          }
-          needsMarkAsReadRef.current = true; // Set flag to retry when network comes back
-          return;
-        }
-        
-        try {
-          // Mark all unread messages from this user as read
-          // Use the new route: PUT /api/messages/mark-read/{userId}
-          await messagesAPI.markMessagesAsRead(Number(id));
-          
-          // Update local messages state to reflect read status
-          // Mark messages as read where sender_id === other user's id and receiver_id === current user's id
-          setMessages(prevMessages => {
-            const now = new Date().toISOString();
-            return prevMessages.map(msg => {
-              // If this message was sent by the other user to the current user and hasn't been read yet
-              if (msg.sender_id === Number(id) && msg.receiver_id === user.id && !msg.read_at) {
-                return { ...msg, read_at: now };
-              }
-              return msg;
-            });
-          });
-          
-          // Update unread count to 0 for this conversation (instead of removing it)
-          // This ensures the UI updates immediately
-          updateUnreadCount(Number(id), 0);
-          needsMarkAsReadRef.current = false; // Reset flag on success
-          
-          if (__DEV__) {
-          console.log('Messages marked as read for conversation:', id);
-          }
-        } catch (error: any) {
-          // Handle network errors gracefully
-          const isNetworkError = 
-            error?.code === 'ERR_NETWORK' ||
-            error?.message?.includes('Network Error') ||
-            !error?.response;
-          
-          if (isNetworkError) {
-            // Network error - set flag to retry when network comes back
-            needsMarkAsReadRef.current = true;
-            if (__DEV__) {
-              console.log('[UserChat] Mark as read failed - network error, will retry when online');
-            }
-          } else {
-            // Other errors (auth, validation, etc.) - log for debugging
-            if (__DEV__) {
-              console.error('[UserChat] Error marking messages as read:', error);
-            }
-          }
-        }
-      };
-
-      // Small delay to ensure screen is fully loaded
-      const timer = setTimeout(() => {
-        markMessagesAsRead();
-      }, 300);
+      void fetchMessagesRef.current(!hasExistingMessages);
+      void markConversationAsReadRef.current();
 
       return () => {
-        clearTimeout(timer);
-        // Clear active conversation when screen loses focus
-        clearActiveConversation();
+        clearActiveConversationRef.current();
       };
-    }, [id, user, ENABLE_MARK_AS_READ, updateUnreadCount, setActiveConversation, clearActiveConversation, fetchMessages, messages.length, scrollToBottom, loadingMore, currentPage])
+    }, [id])
   );
+
+  // Inverted list rests at the newest message automatically — no manual initial scroll needed.
 
   // CRITICAL FIX: Network listener to retry mark-read when network comes back
   useEffect(() => {
@@ -1573,55 +819,14 @@ export default function UserChatScreen() {
       const isConnected = state.isConnected ?? false;
       
       if (isConnected && needsMarkAsReadRef.current) {
-        // Network came back and we need to retry mark-read
-        const retryMarkAsRead = async () => {
-          try {
-            await messagesAPI.markMessagesAsRead(Number(id));
-            
-            // Update local messages state
-            setMessages(prevMessages => {
-              const now = new Date().toISOString();
-              return prevMessages.map(msg => {
-                if (msg.sender_id === Number(id) && msg.receiver_id === user.id && !msg.read_at) {
-                  return { ...msg, read_at: now };
-                }
-                return msg;
-              });
-            });
-            
-            updateUnreadCount(Number(id), 0);
-            needsMarkAsReadRef.current = false; // Reset flag
-            
-            if (__DEV__) {
-              console.log('[UserChat] Mark as read retried successfully after network reconnect');
-            }
-          } catch (error: any) {
-            // If it still fails, check if it's a network error
-            const isNetworkError = 
-              error?.code === 'ERR_NETWORK' ||
-              error?.message?.includes('Network Error') ||
-              !error?.response;
-            
-            if (!isNetworkError) {
-              // Non-network error - reset flag to avoid infinite retries
-              needsMarkAsReadRef.current = false;
-            }
-            
-            if (__DEV__) {
-              console.error('[UserChat] Mark as read retry failed:', error);
-            }
-          }
-        };
-        
-        // Small delay to ensure network is stable
-        setTimeout(retryMarkAsRead, 500);
+        setTimeout(() => markConversationAsRead(), 500);
       }
     });
     
     return () => {
       unsubscribe();
     };
-  }, [id, user, ENABLE_MARK_AS_READ, updateUnreadCount]);
+  }, [id, user, ENABLE_MARK_AS_READ, markConversationAsRead]);
 
   // Handle mobile hardware back button
   useFocusEffect(
@@ -1644,7 +849,6 @@ export default function UserChatScreen() {
     // CRITICAL FIX: Disable auto-scroll when loading older messages
     // User wants to stay at the top viewing old messages
     isAtBottomRef.current = false;
-    shouldMaintainPositionRef.current = false; // Don't maintain position when loading older messages
     isPaginatingRef.current = true;
     setLoadingMore(true);
     
@@ -1690,16 +894,6 @@ export default function UserChatScreen() {
           new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
         ));
         
-        // Update visibleMessagesStartIndex to account for new older messages prepended
-        // Since we're prepending, the start index needs to increase by the number of new messages
-        if (visibleMessagesStartIndex !== null) {
-          setVisibleMessagesStartIndex(prevIndex => {
-            if (prevIndex === null) return null;
-            // Increase start index by number of new messages to keep showing the same messages
-            return prevIndex + uniqueNewMessages.length;
-          });
-        }
-        
         return deduplicated;
       });
       
@@ -1727,7 +921,7 @@ export default function UserChatScreen() {
       if (dbInitialized) {
         try {
           const currentOffset = loadedMessagesCount;
-          const cachedMessages = await loadMessagesFromDb(MESSAGES_PER_PAGE, currentOffset);
+          const cachedMessages = await loadMessagesFromDb(MESSAGES_PER_PAGE);
           
           if (cachedMessages.length > 0) {
             setMessages(prev => {
@@ -1760,109 +954,6 @@ export default function UserChatScreen() {
     }
   };
 
-  // ✅ IMPROVED: Helper function with 3 immediate retries + persistent retries while network is available
-  const sendMessageWithRetries = async (
-    formData: FormData,
-    messageId: number,
-    maxImmediateRetries: number = 3,
-    initialDelay: number = 1000,
-    persistentRetryInterval: number = 5000, // 5 seconds between persistent retries
-    persistentRetryTimeout: number = 30000 // 30 seconds total for persistent retries
-  ): Promise<{ success: boolean; response?: any; error?: any; attempt: number }> => {
-    let lastError: any = null;
-    
-    // STEP 1: 3 immediate retries with exponential backoff (1s, 2s, 4s)
-    for (let attempt = 1; attempt <= maxImmediateRetries; attempt++) {
-      try {
-        console.log(`[UserChat] 📤 Immediate retry attempt ${attempt}/${maxImmediateRetries} for message ${messageId}`);
-        
-        const res = await messagesAPI.sendMessage(formData);
-        
-        // Check if status indicates success
-        if (res.status >= 200 && res.status < 300) {
-          console.log(`[UserChat] ✅ API SEND SUCCESS on immediate attempt ${attempt}/${maxImmediateRetries}`);
-          return { success: true, response: res, attempt };
-        } else {
-          // Non-success status
-          lastError = new Error(`API returned status ${res.status}`);
-          console.warn(`[UserChat] ⚠️ API returned non-success status ${res.status} on attempt ${attempt}/${maxImmediateRetries}`);
-        }
-      } catch (apiError: any) {
-        lastError = apiError;
-        const isClientError = apiError.response?.status >= 400 && apiError.response?.status < 500;
-        
-        console.warn(`[UserChat] ⚠️ API SEND FAILED on immediate attempt ${attempt}/${maxImmediateRetries}: ${apiError.message}`);
-        
-        // If it's a client error (4xx), don't retry - it's a permanent failure
-        if (isClientError) {
-          console.log(`[UserChat] 🚫 Client error (4xx) detected, stopping retries`);
-          return { success: false, error: apiError, attempt };
-        }
-        
-        // If this is not the last attempt, wait before retrying
-        if (attempt < maxImmediateRetries) {
-          // Exponential backoff: 1s, 2s, 4s
-          const delay = initialDelay * Math.pow(2, attempt - 1);
-          console.log(`[UserChat] ⏳ Waiting ${delay}ms before immediate retry ${attempt + 1}/${maxImmediateRetries}`);
-          await new Promise(resolve => setTimeout(resolve, delay));
-        }
-      }
-    }
-    
-    // STEP 2: Persistent retries while network is available (up to timeout)
-    console.log(`[UserChat] 🔄 Starting persistent retries for message ${messageId} (while network available, max ${persistentRetryTimeout}ms)`);
-    const persistentRetryStartTime = Date.now();
-    let persistentAttempt = maxImmediateRetries + 1;
-    
-    while (Date.now() - persistentRetryStartTime < persistentRetryTimeout) {
-      // Check network before each persistent retry
-      try {
-        const netState = await NetInfo.fetch();
-        if (!netState.isConnected) {
-          console.log(`[UserChat] 🌐 Network offline, stopping persistent retries for message ${messageId}`);
-          break; // Network gone, fall back to SQLite retry service
-        }
-      } catch (netError) {
-        console.warn(`[UserChat] ⚠️ Error checking network status: ${netError}`);
-        // Continue retrying if network check fails (optimistic)
-      }
-      
-      try {
-        console.log(`[UserChat] 📤 Persistent retry attempt ${persistentAttempt} for message ${messageId}`);
-        const res = await messagesAPI.sendMessage(formData);
-        
-        if (res.status >= 200 && res.status < 300) {
-          console.log(`[UserChat] ✅ API SEND SUCCESS on persistent retry ${persistentAttempt}`);
-          return { success: true, response: res, attempt: persistentAttempt };
-        } else {
-          lastError = new Error(`API returned status ${res.status}`);
-          console.warn(`[UserChat] ⚠️ API returned non-success status ${res.status} on persistent retry ${persistentAttempt}`);
-        }
-      } catch (apiError: any) {
-        lastError = apiError;
-        const isClientError = apiError.response?.status >= 400 && apiError.response?.status < 500;
-        
-        if (isClientError) {
-          console.log(`[UserChat] 🚫 Client error (4xx) on persistent retry ${persistentAttempt}, stopping`);
-          return { success: false, error: apiError, attempt: persistentAttempt };
-        }
-        
-        // Log but continue retrying
-        console.warn(`[UserChat] ⚠️ Persistent retry ${persistentAttempt} failed: ${apiError.message}`);
-      }
-      
-      // Wait before next persistent retry
-      await new Promise(resolve => setTimeout(resolve, persistentRetryInterval));
-      persistentAttempt++;
-    }
-    
-    // All retries exhausted - fall back to SQLite retry service
-    const totalAttempts = persistentAttempt - 1;
-    console.log(`[UserChat] ⏱️ Persistent retry timeout reached for message ${messageId} (${totalAttempts} total attempts), falling back to SQLite retry service`);
-    return { success: false, error: lastError, attempt: totalAttempts };
-  };
-
-  // Send message
   const handleSend = async () => {
     // Don't send if there's no content at all
     if (!input.trim() && !attachment && !voiceRecording) return;
@@ -1872,8 +963,21 @@ export default function UserChatScreen() {
       console.warn('Message send already in progress, ignoring duplicate send');
       return;
     }
+
+    let senderId = Number(user?.id || 0);
+    if (!senderId) {
+      const cachedId = await getCachedAuthUserId();
+      if (cachedId) senderId = cachedId;
+    }
+    if (!senderId) {
+      Alert.alert('Error', 'Unable to verify your account. Please log in again.');
+      return;
+    }
     
     setSending(true);
+    const logSend = (...args: unknown[]) => {
+      if (ENABLE_CHAT_DEBUG_LOGS) console.log(...args);
+    };
       
     // Prepare message text
       let messageText = input.trim();
@@ -1890,638 +994,135 @@ export default function UserChatScreen() {
       messageText = messageText ? `${messageText} ${voiceMessage}` : voiceMessage;
     }
     
-    // Generate temporary local ID for the message
-    const tempLocalId = Date.now() + Math.random();
+    const clientMessageId = generateClientMessageId();
     const now = new Date().toISOString();
-    
-    // Create message object for local storage
-    const localMessage = {
-      id: tempLocalId, // Temporary local ID
-      conversation_id: Number(id),
-      conversation_type: 'individual' as const,
-      sender_id: Number(user?.id || 0),
+    const attachmentSnapshot = attachment;
+    const voiceSnapshot = voiceRecording;
+    const replySnapshot = replyingTo;
+
+    const localAttachments = attachment ? [{
+      name: attachment.name || 'attachment',
+      mime: attachment.type || 'application/octet-stream',
+      url: attachment.uri,
+      local_path: attachment.uri,
+    }] : voiceRecording ? [{
+      name: 'voice_message.m4a',
+      mime: 'audio/m4a',
+      url: voiceRecording.uri,
+      local_path: voiceRecording.uri,
+    }] : undefined;
+
+    const outboxPayload = buildOutboxPayload({
+      messageText: messageText || null,
+      receiverId: Number(id),
+      replyToId: replySnapshot?.id ?? null,
+      attachment: attachmentSnapshot,
+      voiceRecording: voiceSnapshot,
+    });
+
+    const uiMessage: Message = {
+      id: 0,
+      client_message_id: clientMessageId,
+      sender_id: senderId,
       receiver_id: Number(id),
-      message: messageText || null,
+      message: messageText || '',
       created_at: now,
       read_at: null,
       edited_at: null,
-      reply_to_id: replyingTo?.id || null,
-      sync_status: 'pending' as const,
-      attachments: attachment ? [{
-        name: attachment.name || 'attachment',
-        mime: attachment.type || 'application/octet-stream',
-        url: attachment.uri, // Local URI for now
-        local_path: attachment.uri,
-      }] : voiceRecording ? [{
-        name: 'voice_message.m4a',
-        mime: 'audio/m4a',
-        url: voiceRecording.uri,
-        local_path: voiceRecording.uri,
-      }] : undefined,
-    };
-    
-    // Create message for UI display
-    const uiMessage: any = {
-      id: tempLocalId,
-      conversation_id: Number(id),
-      sender_id: Number(user?.id || 0),
-      receiver_id: Number(id),
-      message: messageText || null,
-      created_at: now,
-      read_at: null,
-      edited_at: null,
-      reply_to_id: replyingTo?.id || null,
-      reply_to: replyingTo || undefined,
+      reply_to: replySnapshot || undefined,
       sender: {
-        id: Number(user?.id || 0),
+        id: senderId,
         name: user?.name || 'You',
         avatar_url: user?.avatar_url,
       },
-      sync_status: 'pending' as const, // Start as pending (single gray tick)
-      attachments: localMessage.attachments,
+      sync_status: 'pending',
+      attachments: localAttachments?.map((att, idx) => ({
+        id: idx,
+        name: att.name,
+        mime: att.mime,
+        url: att.url,
+      })),
     };
-    
+
   try {
-      // ✅ CRITICAL FIX: Mark message as sending BEFORE saving to SQLite
-      // This prevents retry service from picking it up before handleSend sends it
-      console.log(`[UserChat] 🔒 Marking message ${tempLocalId} as sending BEFORE SQLite save | Content: "${messageText?.substring(0, 50)}"`);
-      markMessageAsSending(tempLocalId);
-      
-      // STEP 1: Save to SQLite first with pending status (instant local storage)
-      let actualMessageId = tempLocalId; // Will be updated if SQLite assigns different ID
+      let localMessageId: number | null = null;
       if (dbInitialized) {
         try {
-          await saveDbMessages([{
-            id: tempLocalId, // ✅ CRITICAL: Provide tempLocalId so saveMessages uses it
-            conversation_id: Number(id),
-            conversation_type: 'individual',
-            sender_id: Number(user?.id || 0),
+          const saved = await persistOutgoingMessage(Number(id), 'individual', {
+            client_message_id: clientMessageId,
+            sender_id: senderId,
             receiver_id: Number(id),
             message: messageText || null,
             created_at: now,
-            read_at: null,
-            edited_at: null,
-            reply_to_id: replyingTo?.id || null,
-            sync_status: 'pending',
-            attachments: localMessage.attachments,
-          }]);
-          
-          // ✅ CRITICAL FIX: Verify the message was saved with the correct ID
-          // If saveMessages used auto-increment, we need to get the actual ID
-          try {
-            const database = await getDb();
-            if (database) {
-              const savedMessage = await database.getFirstAsync<{ id: number }>(
-                `SELECT id FROM messages 
-                 WHERE conversation_id = ? 
-                 AND sender_id = ? 
-                 AND message = ? 
-                 AND created_at = ? 
-                 AND sync_status = 'pending'
-                 ORDER BY id DESC
-                 LIMIT 1`,
-                [Number(id), Number(user?.id || 0), messageText || null, now]
-              );
-              
-              if (savedMessage) {
-                actualMessageId = savedMessage.id;
-                if (actualMessageId !== tempLocalId) {
-                  console.log(`[UserChat] ⚠️ ID MISMATCH: tempLocalId=${tempLocalId}, SQLite ID=${actualMessageId}. Marking BOTH as sending.`);
-                  // ✅ CRITICAL FIX: Keep BOTH IDs marked as sending
-                  // UI message has tempLocalId, but database has actualMessageId
-                  // Sync needs to preserve the message regardless of which ID it checks
-                  markMessageAsSending(actualMessageId);
-                  // Don't unmark tempLocalId - keep it marked so sync preserves the UI message
-                } else {
-                  console.log(`[UserChat] ✅ Message saved with tempLocalId: ${tempLocalId}`);
-                }
-              }
-            }
-          } catch (idCheckError) {
-            console.warn(`[UserChat] Could not verify SQLite ID, using tempLocalId:`, idCheckError);
-          }
-          
-          if (__DEV__ || process.env.EXPO_PUBLIC_DEBUG_API === 'true') {
-            console.log('[UserChat] Saved message to SQLite with pending status:', {
-              tempLocalId,
-              actualMessageId,
-              message: messageText?.substring(0, 50),
-              conversationId: Number(id),
-              timestamp: now,
-            });
-          }
-        } catch (dbError: any) {
-          // ✅ CRITICAL: Log detailed error information for debugging
-          console.error('[UserChat] Error saving to SQLite:', {
-            error: dbError?.message || String(dbError),
-            tempLocalId,
-            message: messageText?.substring(0, 50),
-            conversationId: Number(id),
-            stack: dbError?.stack,
+            reply_to_id: replySnapshot?.id ?? null,
+            attachments: localAttachments as any,
           });
-          // Continue anyway - we'll still try to send to API
-          // But the message won't persist if DB save fails
+          if (saved[0]?.localMessageId) {
+            localMessageId = saved[0].localMessageId;
+            uiMessage.id = localMessageId;
+          }
+        } catch (dbError) {
+          console.error('[UserChat] Error saving to SQLite:', dbError);
         }
       }
-      
-      // STEP 2: Show message immediately in UI (optimistic update)
-      setMessages(prev => {
-        // ✅ DEBUG LOGGING: Track message addition
-        console.log(`[UserChat] ➕ Adding message to UI:`, {
-          tempLocalId,
-          actualMessageId,
-          message: messageText?.substring(0, 30),
-          sync_status: 'pending',
-          currentMessagesCount: prev.length,
-          existingMessageIds: prev.map(m => ({ id: m.id, status: m.sync_status, message: m.message?.substring(0, 20) })),
-        });
-        
-        // Check if message with this tempLocalId already exists (prevent duplicates)
-        const existingIds = new Set(prev.map(m => m.id));
-        if (existingIds.has(tempLocalId)) {
-          console.warn(`[UserChat] ⚠️ Message ${tempLocalId} already exists in UI, skipping add`);
-          return prev; // Don't add duplicate
-        }
-        
-        const updatedMessages = [...prev, uiMessage].sort((a, b) => {
-          const dateA = new Date(a.created_at).getTime();
-          const dateB = new Date(b.created_at).getTime();
-          return dateA - dateB;
-        });
-        
-        const uniqueMessages = deduplicateMessages(updatedMessages);
-        
-        // ✅ DEBUG LOGGING: Log final state after adding
-        console.log(`[UserChat] ✅ Added message to UI - Total: ${uniqueMessages.length} messages:`, 
-          uniqueMessages.map(m => ({ id: m.id, message: m.message?.substring(0, 30), sync_status: m.sync_status }))
-        );
-        
-        if (uniqueMessages.length > 0) {
-          const latestMsg = uniqueMessages[uniqueMessages.length - 1];
-          latestMessageIdRef.current = latestMsg.id;
-        }
-        
-        // Scroll to bottom after sending
-        isAtBottomRef.current = true;
-        shouldMaintainPositionRef.current = true;
-        if (uniqueMessages.length > 0) {
-          lastVisibleMessageIdRef.current = uniqueMessages[uniqueMessages.length - 1].id;
-        }
-        requestAnimationFrame(() => {
-          setTimeout(() => {
-            scrollToBottom(true, 0, true);
-          }, attachment || voiceRecording ? 200 : 50);
-        });
-        
-        return uniqueMessages;
+
+      await enqueueOutgoingMessage({
+        clientMessageId,
+        localMessageId,
+        conversationId: Number(id),
+        conversationType: 'individual',
+        payload: outboxPayload,
       });
+
+      setMessages(prev => deduplicateMessages([...prev, uiMessage].sort((a, b) =>
+        new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
+      )));
       
-      // Clear input immediately for better UX
       setInput('');
       setAttachment(null);
       setVoiceRecording(null);
       setReplyingTo(null);
       setShowEmoji(false);
-      setSending(false); // Reset sending state - API call happens in background
+      setSending(false);
       
-      // CRITICAL FIX: Dismiss keyboard after sending to prevent extra space
       Keyboard.dismiss();
-      
-      // STEP 3: Send to API in background (non-blocking) with immediate retry
-      (async () => {
-        try {
-          // Check if message already has server_id (already synced) before sending
-          // This prevents duplicate sends if retry service already sent it
-          if (dbInitialized) {
-            try {
-              const database = await getDb();
-              if (database) {
-                const existingMessage = await database.getFirstAsync<{ server_id?: number; created_at?: string }>(
-                  `SELECT server_id, created_at FROM messages WHERE id = ?`,
-                  [tempLocalId]
-                );
-                
-                if (existingMessage?.server_id) {
-                  // Update UI with server ID and server timestamp
-                  setMessages(prev => prev.map(msg => 
-                    msg.id === tempLocalId 
-                      ? { 
-                          ...msg, 
-                          id: existingMessage.server_id!, 
-                          sync_status: 'synced',
-                          created_at: existingMessage.created_at || msg.created_at
-                        }
-                      : msg
-                  ));
-                  return; // Don't send again
-                }
-              }
-            } catch (checkError) {
-              // Continue with send if check fails
-            }
-          }
-          
-          // Prepare FormData
-          let formData = new FormData();
-          formData.append('receiver_id', String(id));
-          
-          if (replyingTo) {
-            formData.append('reply_to_id', replyingTo.id.toString());
-          }
-          
-          if (attachment) {
-            formData.append('attachments[]', {
-              uri: attachment.uri,
-              name: attachment.name,
-              type: attachment.type,
-            } as any);
-          }
-          
-          if (messageText && !voiceRecording) {
-            formData.append('message', messageText);
-          }
-          
-          if (voiceRecording) {
-            formData.append('message', messageText);
-            formData.append('attachments[]', {
-              uri: voiceRecording.uri,
-              name: 'voice_message.m4a',
-              type: 'audio/m4a',
-            } as any);
-            formData.append('voice_duration', voiceRecording.duration.toString());
-            formData.append('is_voice_message', 'true');
-          }
+      isAtBottomRef.current = true;
+      requestAnimationFrame(() => {
+        setTimeout(() => scrollToBottom(true), attachment || voiceRecording ? 200 : 50);
+      });
 
-          // ✅ IMPROVED: Send with 3 immediate retries + persistent retries (while network available) before falling back to SQLite retry service
-          try {
-            // ✅ CRITICAL: Double-check message is still marked as sending before API call
-            // Check both tempLocalId and actualMessageId
-            const isMarked = isMessageBeingSent(tempLocalId) || isMessageBeingSent(actualMessageId);
-            if (!isMarked) {
-              console.warn(`[UserChat] ⚠️ Message ${actualMessageId} (tempLocalId: ${tempLocalId}) was unmarked before send - marking again`);
-              markMessageAsSending(actualMessageId);
-            }
-            
-            // ✅ LOGGING: Log API send attempt
-            const sendStartTime = Date.now();
-            console.log(`[UserChat] 📤 SENDING message ${actualMessageId} (tempLocalId: ${tempLocalId}) to API with persistent retries | Content: "${messageText?.substring(0, 50)}"`);
-            
-            // Send to API with 3 immediate retries + persistent retries while network available
-            const retryResult = await sendMessageWithRetries(formData, actualMessageId, 3, 1000);
-            
-            const sendDuration = Date.now() - sendStartTime;
-            console.log(`[UserChat] 📥 API RESULT for message ${actualMessageId} (tempLocalId: ${tempLocalId}) | Success: ${retryResult.success} | Attempt: ${retryResult.attempt} | Duration: ${sendDuration}ms`);
-            
-            if (retryResult.success && retryResult.response) {
-              const res = retryResult.response;
-              console.log(`[UserChat] ✅ API SEND SUCCESS for message ${actualMessageId} (tempLocalId: ${tempLocalId}) after ${retryResult.attempt} attempt(s) | Status: ${res.status}`);
-              
-              // Check if status indicates success
-              if (res.status >= 200 && res.status < 300) {
-              
-              // Try to extract message ID from response
-              let messageId: number | undefined;
-              let serverCreatedAt: string | undefined;
-              
-              if (res.data) {
-                if (res.data.id) {
-                  messageId = res.data.id;
-                  serverCreatedAt = res.data.created_at;
-                } else if (res.data.data?.id) {
-                  messageId = res.data.data.id;
-                  serverCreatedAt = res.data.data.created_at;
-                } else if (res.data.message?.id) {
-                  messageId = res.data.message.id;
-                  serverCreatedAt = res.data.message.created_at;
-                } else if (res.data.message_id) {
-                  messageId = res.data.message_id;
-                  serverCreatedAt = res.data.created_at || res.data.message_created_at;
-                } else if (res.data.result?.id) {
-                  messageId = res.data.result.id;
-                  serverCreatedAt = res.data.result.created_at;
-                }
-              }
-              
-              if (messageId) {
-                console.log(`[UserChat] 📋 Extracted server_id ${messageId} from API response for message ${actualMessageId} (tempLocalId: ${tempLocalId})`);
-              } else {
-                console.warn(`[UserChat] ⚠️ No messageId found in API response for message ${actualMessageId} | Response structure:`, JSON.stringify(res.data).substring(0, 200));
-              }
-              
-              // ✅ If we got messageId from response, update immediately
-              if (messageId && dbInitialized) {
-                try {
-                  // ✅ CRITICAL FIX: Use actualMessageId (SQLite ID) instead of tempLocalId
-                  const messageIdToUpdate = actualMessageId;
-                  
-                  // Check for duplicate before updating
-                  const database = await getDb();
-                  if (database) {
-                    const existingByServerId = await database.getFirstAsync<{ id: number }>(
-                      `SELECT id FROM messages WHERE server_id = ? AND id != ?`,
-                      [messageId, messageIdToUpdate]
-                    );
-                    
-                    if (existingByServerId) {
-                      // Duplicate exists - remove messageIdToUpdate message
-                      await database.runAsync(`DELETE FROM messages WHERE id = ?`, [messageIdToUpdate]);
-                      setMessages(prev => prev.filter(msg => msg.id !== tempLocalId && msg.id !== messageIdToUpdate));
-                      unmarkMessageAsSending(tempLocalId);
-                      unmarkMessageAsSending(messageIdToUpdate);
-                      return;
-                    }
-                  }
-                  
-                  // ✅ CRITICAL FIX: Wait for updateMessageStatus to complete and check return value
-                  console.log(`[UserChat] 💾 Updating message ${messageIdToUpdate} (tempLocalId: ${tempLocalId}) status to synced with server_id ${messageId}`);
-                  const updateStartTime = Date.now();
-                  
-                  const updateSucceeded = await updateMessageStatus(messageIdToUpdate, messageId, 'synced', serverCreatedAt);
-                  const updateDuration = Date.now() - updateStartTime;
-                  
-                  if (updateSucceeded) {
-                    console.log(`[UserChat] ✅ DATABASE UPDATE SUCCESS for message ${messageIdToUpdate} | server_id: ${messageId} | Duration: ${updateDuration}ms`);
-                    // Update UI message with server ID
-                    setMessages(prev => {
-                      // ✅ DEBUG LOGGING: Log state before update
-                      console.log(`[UserChat] 🔄 handleSend update: Before - ${prev.length} messages:`, 
-                        prev.map(m => ({ id: m.id, message: m.message?.substring(0, 30), sync_status: m.sync_status }))
-                      );
-                      
-                      const existingIds = new Set(prev.map(m => m.id));
-                      const serverIdExists = existingIds.has(messageId);
-                      
-                      // ✅ CRITICAL FIX: Find message by both tempLocalId AND actualMessageId
-                      const messageToUpdate = prev.find(msg => 
-                        msg.id === tempLocalId || msg.id === actualMessageId
-                      );
-                      
-                      console.log(`[UserChat] 🔄 handleSend update: Looking for message with tempLocalId=${tempLocalId} or actualMessageId=${actualMessageId}`);
-                      console.log(`[UserChat] 🔄 handleSend update: Found message:`, messageToUpdate ? { id: messageToUpdate.id, message: messageToUpdate.message?.substring(0, 30) } : 'NOT FOUND');
-                      console.log(`[UserChat] 🔄 handleSend update: Server ID ${messageId} exists in UI:`, serverIdExists);
-                      
-                      if (serverIdExists && messageToUpdate) {
-                        // Server ID already exists (from polling), remove tempLocalId/actualMessageId to avoid duplication
-                        console.log(`[UserChat] 🔄 Server ID ${messageId} already exists in UI, removing tempLocalId ${tempLocalId} and actualMessageId ${actualMessageId}`);
-                        const filtered = prev.filter(msg => 
-                          msg.id !== tempLocalId && msg.id !== actualMessageId
-                        );
-                        console.log(`[UserChat] 🔄 handleSend update: After removal - ${filtered.length} messages`);
-                        return deduplicateMessages(filtered);
-                      } else if (messageToUpdate) {
-                        // Update tempLocalId/actualMessageId to server ID
-                        console.log(`[UserChat] 🔄 Updating message ${tempLocalId}/${actualMessageId} to server_id ${messageId}`);
-                        const updated = prev.map(msg => 
-                          (msg.id === tempLocalId || msg.id === actualMessageId)
-                            ? { 
-                                ...msg, 
-                                id: messageId, 
-                                sync_status: 'synced',
-                                created_at: serverCreatedAt || msg.created_at
-                              }
-                            : msg
-                        );
-                        console.log(`[UserChat] 🔄 handleSend update: After update - ${updated.length} messages`);
-                        return deduplicateMessages(updated);
-                      } else {
-                        // Message not found in UI (might have been removed by polling)
-                        // Add it back with server_id
-                        console.log(`[UserChat] ⚠️ Message ${tempLocalId}/${actualMessageId} not found in UI, adding with server_id ${messageId}`);
-                        const newMessage: Message = {
-                          id: messageId,
-                          message: messageText || null,
-                          sender_id: Number(user?.id || 0),
-                          receiver_id: Number(id),
-                          created_at: serverCreatedAt || now,
-                          sync_status: 'synced',
-                          attachments: localMessage.attachments || [],
-                        };
-                        const updated = [...prev, newMessage].sort((a, b) => 
-                          new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
-                        );
-                        console.log(`[UserChat] 🔄 handleSend update: After add - ${updated.length} messages`);
-                        return deduplicateMessages(updated);
-                      }
-                    });
-                    
-                    latestMessageIdRef.current = messageId;
-                  } else {
-                    console.error(`[UserChat] ❌ DATABASE UPDATE FAILED for message ${messageIdToUpdate} | server_id: ${messageId} | Duration: ${updateDuration}ms | Will be retried by retry service`);
-                  }
-                  
-                  // ✅ CRITICAL FIX: Only unmark AFTER updateMessageStatus completes
-                  // This prevents retry service from picking it up before status is updated
-                  console.log(`[UserChat] 🔓 Unmarking message ${messageIdToUpdate} (tempLocalId: ${tempLocalId}) as sending (update completed)`);
-                  unmarkMessageAsSending(tempLocalId);
-                  unmarkMessageAsSending(messageIdToUpdate); // Also unmark SQLite ID
-                } catch (updateError) {
-                  console.error('[UserChat] Error updating message status:', updateError);
-                  // ✅ Unmark even on error so retry service can handle it
-                  unmarkMessageAsSending(tempLocalId);
-                  unmarkMessageAsSending(actualMessageId);
-                }
-              } else {
-                // No messageId in response - leave as pending, retry service will verify and update
-                console.warn(`[UserChat] ⚠️ API SUCCESS but NO messageId for message ${actualMessageId} (tempLocalId: ${tempLocalId}) | Leaving as pending for retry service`);
-                unmarkMessageAsSending(tempLocalId);
-                unmarkMessageAsSending(actualMessageId);
-              }
-              }
-            } else {
-              // ✅ NEW: All retries (immediate + persistent) failed - mark as failed
-              // User can manually retry from UI with retry button
-              const apiError = retryResult.error;
-              
-              console.error(`[UserChat] ❌ All retries failed for message ${actualMessageId} (tempLocalId: ${tempLocalId}) | Total attempts: ${retryResult.attempt} | Error: ${apiError?.message || 'Unknown'} | Status: ${apiError?.response?.status} | Marking as failed - user can retry from UI`);
-              
-              // Mark ALL failures as 'failed' (not just 4xx) - user can manually retry
-              console.log(`[UserChat] 🚫 Marking message ${actualMessageId} as failed (all retries exhausted - user can retry from UI)`);
-              if (dbInitialized) {
-                await updateMessageStatus(actualMessageId, undefined, 'failed');
-                setMessages(prev => prev.map(msg => 
-                  (msg.id === tempLocalId || msg.id === actualMessageId)
-                    ? { ...msg, sync_status: 'failed' }
-                    : msg
-                ));
-              }
-              unmarkMessageAsSending(tempLocalId);
-              unmarkMessageAsSending(actualMessageId);
-            }
-          } catch (e: unknown) {
-            const error = e as any;
-            console.error('[UserChat] Unexpected error in handleSend API call:', error);
-            
-            // Ensure message is kept as pending for retry
-            if (dbInitialized) {
-              await updateMessageStatus(actualMessageId, undefined, 'pending');
-              setMessages(prev => prev.map(msg => 
-                (msg.id === tempLocalId || msg.id === actualMessageId)
-                  ? { ...msg, sync_status: 'pending' }
-                  : msg
-              ));
-            }
-            unmarkMessageAsSending(tempLocalId);
-            unmarkMessageAsSending(actualMessageId);
-          }
-          
-          // Update last_seen_at
-          try {
-            await usersAPI.updateLastSeen();
-          } catch (error) {
-            // Silently fail
-          }
-          
-        } catch (e: unknown) {
-          const error = e as any;
-          console.error('[UserChat] Unexpected error in handleSend:', error);
-          
-          // ✅ NEW: Mark as failed on unexpected error - user can retry from UI
-          if (dbInitialized) {
-            await updateMessageStatus(actualMessageId, undefined, 'failed');
-            setMessages(prev => prev.map(msg => 
-              (msg.id === tempLocalId || msg.id === actualMessageId)
-                ? { ...msg, sync_status: 'failed' }
-                : msg
-            ));
-          }
-          unmarkMessageAsSending(tempLocalId);
-          unmarkMessageAsSending(actualMessageId);
-        } finally {
-          // ✅ CRITICAL FIX: Always unmark message as being sent, even if something goes wrong
-          unmarkMessageAsSending(tempLocalId);
-          if (actualMessageId !== tempLocalId) {
-            unmarkMessageAsSending(actualMessageId);
-          }
-        }
-      })();
+      usersAPI.updateLastSeen().catch(() => {});
       
     } catch (e: unknown) {
       const error = e as any;
-      console.error('[UserChat] Error in handleSend:', error);
+      console.error('[UserChat] Error in handleSend:', error?.message ?? error);
       setSending(false);
       
-          Alert.alert(
+      Alert.alert(
         'Error',
-        'Failed to save message. Please try again.',
-            [{ text: 'OK' }]
-          );
+        error?.message?.includes('runAsync')
+          ? 'Could not save message locally. Please restart the app and try again.'
+          : 'Failed to save message. Please try again.',
+        [{ text: 'OK' }]
+      );
     }
   };
 
-  // ✅ NEW: Retry sending a failed message
   const retryFailedMessage = async (messageId: number) => {
-    try {
-      // Find the message in state
-      const message = messages.find(m => m.id === messageId);
-      if (!message || message.sync_status !== 'failed') {
-        console.warn(`[UserChat] Cannot retry message ${messageId} - not found or not failed`);
-        return;
-      }
-      
-      console.log(`[UserChat] 🔄 Retrying failed message ${messageId}`);
-      
-      // Mark as pending and update UI
-      if (dbInitialized) {
-        await updateMessageStatus(messageId, undefined, 'pending');
-      }
-      
-      // Update UI to pending
-      setMessages(prev => prev.map(msg => 
-        msg.id === messageId ? { ...msg, sync_status: 'pending' } : msg
-      ));
-      
-      // Reconstruct FormData
-      const formData = new FormData();
-      formData.append('receiver_id', String(id));
-      
-      if (message.message) {
-        formData.append('message', message.message);
-      }
-      
-      if (message.reply_to_id) {
-        formData.append('reply_to_id', String(message.reply_to_id));
-      }
-      
-      // Add attachments if any
-      if (message.attachments && message.attachments.length > 0) {
-        for (const att of message.attachments) {
-          if (att.local_path || (att.url && !att.url.startsWith('http'))) {
-            try {
-              formData.append('attachments[]', {
-                uri: att.local_path || att.url,
-                name: att.name || 'attachment',
-                type: att.mime || 'application/octet-stream',
-              } as any);
-            } catch (attachError) {
-              console.warn('[UserChat] Error adding attachment to retry:', attachError);
-            }
-          }
-        }
-      }
-      
-      // Mark as sending
-      markMessageAsSending(messageId);
-      
-      // Retry sending with persistent retries
-      const retryResult = await sendMessageWithRetries(formData, messageId, 3, 1000);
-      
-      if (retryResult.success && retryResult.response) {
-        const res = retryResult.response;
-        
-        // Extract message ID from response
-        let serverMessageId: number | undefined;
-        let serverCreatedAt: string | undefined;
-        
-        if (res.data) {
-          if (res.data.id) {
-            serverMessageId = res.data.id;
-            serverCreatedAt = res.data.created_at;
-          } else if (res.data.data?.id) {
-            serverMessageId = res.data.data.id;
-            serverCreatedAt = res.data.data.created_at;
-          } else if (res.data.message?.id) {
-            serverMessageId = res.data.message.id;
-            serverCreatedAt = res.data.message.created_at;
-          }
-        }
-        
-        if (serverMessageId && dbInitialized) {
-          await updateMessageStatus(messageId, serverMessageId, 'synced', serverCreatedAt);
-          setMessages(prev => prev.map(msg => 
-            msg.id === messageId 
-              ? { ...msg, id: serverMessageId!, sync_status: 'synced', created_at: serverCreatedAt || msg.created_at }
-              : msg
-          ));
-          console.log(`[UserChat] ✅ Retry successful for message ${messageId}, now has server_id ${serverMessageId}`);
-        }
-      } else {
-        // Failed again - mark as failed
-        console.error(`[UserChat] ❌ Retry failed for message ${messageId}`);
-        if (dbInitialized) {
-          await updateMessageStatus(messageId, undefined, 'failed');
-        }
-        setMessages(prev => prev.map(msg => 
-          msg.id === messageId ? { ...msg, sync_status: 'failed' } : msg
-        ));
-      }
-      
-      unmarkMessageAsSending(messageId);
-    } catch (error) {
-      console.error('[UserChat] Error retrying failed message:', error);
-      if (dbInitialized) {
-        await updateMessageStatus(messageId, undefined, 'failed');
-      }
-      setMessages(prev => prev.map(msg => 
-        msg.id === messageId ? { ...msg, sync_status: 'failed' } : msg
-      ));
-      unmarkMessageAsSending(messageId);
-    }
+    const message = messages.find((m) => m.id === messageId);
+    if (!message || message.sync_status !== 'failed') return;
+    setMessages((prev) =>
+      prev.map((msg) => (msg.id === messageId ? { ...msg, sync_status: 'pending' } : msg))
+    );
+    await retryFailedMessageViaOutbox(messageId);
   };
 
   // ✅ NEW: Dismiss a failed message (remove it)
   const dismissFailedMessage = async (messageId: number) => {
     try {
-      console.log(`[UserChat] 🗑️ Dismissing failed message ${messageId}`);
+      if (ENABLE_CHAT_DEBUG_LOGS) {
+        console.log(`[UserChat] 🗑️ Dismissing failed message ${messageId}`);
+      }
       
       if (dbInitialized) {
         await deleteDbMessage(messageId);
@@ -2869,13 +1470,11 @@ export default function UserChatScreen() {
 
   // Render message bubble
   const renderItem = ({ item, index }: { item: Message; index: number }) => {
-    // Ensure sender_id and user.id are compared as numbers
-    const senderId = Number(item.sender_id);
-    const currentUserId = Number(user?.id);
-    const isMine = senderId === currentUserId && senderId !== 0;
-    const previousMessage = index > 0 ? visibleMessages[index - 1] : null;
+    const partnerId = Number(id);
+    const isMine = isOwnDirectMessage(item, partnerId, user?.id);
+    // Inverted data: the chronologically older message sits at index + 1
+    const previousMessage = index < invertedMessages.length - 1 ? invertedMessages[index + 1] : null;
     const showDateSeparator = shouldShowDateSeparator(item, previousMessage);
-    const isLastMessage = index === visibleMessages.length - 1; // Track if this is the last visible message
     
     // Safe date parsing to avoid invalid date errors
     let timestamp = 'Now';
@@ -2889,74 +1488,43 @@ export default function UserChatScreen() {
       timestamp = 'Now';
     }
 
-    // Check if this is a voice message (look for voice message format in text)
-    let voiceMessageData = null;
+    // Check if this is a voice message (marker and/or audio attachment)
+    let voiceMessageData: {
+      url: string | null;
+      duration: number;
+      textPart?: string;
+    } | null = null;
     let isVoiceMessage = false;
-    let messageText = null;
-    
-    // Helper function to clean message text by removing markers
+    let messageText: string | null = null;
+
     const cleanMessageText = (text: string | null | undefined): string | null => {
       if (!text) return null;
-      // Remove [IMAGE] and [FILE] markers at the end, but preserve other text
       let cleaned = text.replace(/\s*\[IMAGE\]$/g, '').replace(/\s*\[FILE\]$/g, '').trim();
-      // If after cleaning we have content, return it; otherwise return original if it had content
       return cleaned || (text.trim() ? text.trim() : null);
     };
-    
-    // Check for voice message format: [VOICE_MESSAGE:duration] (at end of message)
-    const voiceMatch = item.message?.match(/\[VOICE_MESSAGE:(\d+)\]$/);
-    
-    if (voiceMatch) {
-      // This is a voice message - ALWAYS render as voice bubble regardless of attachments
-      const duration = parseInt(voiceMatch[1]);
-      
-      // Try to find audio attachment
-      let audioAttachment = null;
-      if (item.attachments && item.attachments.length > 0) {
-        audioAttachment = item.attachments.find((att: any) => att.mime?.startsWith('audio/'));
-      }
-      
-      // Extract text part (everything before the voice message format)
-      const textPart = item.message.replace(/\[VOICE_MESSAGE:\d+\]$/, '').trim();
-      
-      // Construct full URL for audio attachment
-      let audioUrl = null;
-      if (audioAttachment?.url) {
-        if (audioAttachment.url.startsWith('http')) {
-          audioUrl = audioAttachment.url;
-        } else {
-          const cleanUrl = audioAttachment.url.startsWith('/') ? audioAttachment.url.substring(1) : audioAttachment.url;
-          audioUrl = `${getBaseUrl()}/${cleanUrl}`;
-        }
-      }
-      
-      voiceMessageData = {
-        url: audioUrl,
-        duration: duration,
-        textPart: textPart // Store the text part for display
-      };
+
+    const parsedVoice = parseVoiceMessage(item.message, item.attachments);
+    if (parsedVoice) {
       isVoiceMessage = true;
+      const audioAttachment = parsedVoice.audioAttachment;
+      voiceMessageData = {
+        url: resolveMediaUrl(
+          audioAttachment?.url ?? audioAttachment?.path ?? audioAttachment?.uri ?? null,
+          getBaseUrl
+        ),
+        duration: parsedVoice.duration,
+        textPart: parsedVoice.textPart,
+      };
     } else if (item.attachments && item.attachments.length > 0) {
-      // Check for audio attachment in regular messages (only if NOT a voice message)
-      const audioAttachment = item.attachments.find(att => att.mime?.startsWith('audio/'));
-      if (audioAttachment) {
-        // For audio attachments, clean the message text
-        messageText = cleanMessageText(item.message);
-      } else {
-        // For image/file attachments, check if message is ONLY [IMAGE] or [FILE]
-        // If so, don't display any text - only show the attachment
-        if (item.message) {
-          const trimmedMessage = item.message.trim();
-          // If message is ONLY [IMAGE] or [FILE] (no other text), don't display it
-          if (trimmedMessage === '[IMAGE]' || trimmedMessage === '[FILE]') {
-            messageText = null; // Don't show the marker as text
-          } else {
-            // If message has text before the marker, remove the marker and show the text
-            messageText = cleanMessageText(item.message);
-          }
-        } else {
+      if (item.message) {
+        const trimmedMessage = item.message.trim();
+        if (trimmedMessage === '[IMAGE]' || trimmedMessage === '[FILE]') {
           messageText = null;
+        } else {
+          messageText = cleanMessageText(item.message);
         }
+      } else {
+        messageText = null;
       }
     } else {
       // Regular text message with no attachments - show the message text directly
@@ -2982,51 +1550,50 @@ export default function UserChatScreen() {
     // If it's a voice message, render the dedicated voice bubble
     if (isVoiceMessage && voiceMessageData) {
       return (
-        <View
-          onLayout={(event) => {
-            // Measure voice message height
-            const { height, y } = event.nativeEvent.layout;
-            messageHeightsRef.current.set(item.id, height);
-            
-            // If this is the last message, track its position
-            if (isLastMessage) {
-              lastMessageHeightRef.current = height;
-              lastMessageYPositionRef.current = y;
-              
-              if (viewportHeightRef.current > 0 && shouldMaintainPositionRef.current) {
-                const targetScrollOffset = y + height + targetBottomOffsetRef.current - viewportHeightRef.current;
-                setTimeout(() => {
-                  if (flatListRef.current && shouldMaintainPositionRef.current) {
-                    try {
-                      flatListRef.current.scrollToOffset({
-                        offset: Math.max(0, targetScrollOffset),
-                        animated: false
-                      });
-                    } catch (error) {
-                      // Silently handle
-                    }
-                  }
-                }, 10);
-              }
-            }
-          }}
-        >
-          <TouchableOpacity
-            onLongPress={() => handleMessageLongPress(item)}
-            activeOpacity={0.8}
-          >
-            <VoiceMessageBubble
-              uri={voiceMessageData.url}
-              duration={voiceMessageData.duration}
-              isMine={isMine}
-              timestamp={timestamp}
-              textPart={voiceMessageData.textPart}
-              readAt={item.read_at}
-              syncStatus={item.sync_status || 'pending'}
-            />
-          </TouchableOpacity>
-          
-          {/* ✅ NEW: Retry/Dismiss buttons for failed voice messages */}
+        <View>
+          {showDateSeparator && (
+            <View style={{ alignItems: 'center', marginVertical: 16, marginHorizontal: 16 }}>
+              <View style={{
+                backgroundColor: isDark ? '#374151' : '#E5E7EB',
+                paddingHorizontal: 12,
+                paddingVertical: 6,
+                borderRadius: 12,
+              }}>
+                <Text style={{
+                  color: isDark ? '#9CA3AF' : '#6B7280',
+                  fontSize: 12,
+                  fontWeight: '500',
+                }}>
+                  {formatMessageDate(item.created_at)}
+                </Text>
+              </View>
+            </View>
+          )}
+
+          <View style={{
+            flexDirection: 'row',
+            alignItems: 'flex-end',
+            marginVertical: 4,
+            justifyContent: isMine ? 'flex-end' : 'flex-start',
+          }}>
+            <TouchableOpacity
+              onLongPress={() => handleMessageLongPress(item)}
+              activeOpacity={0.8}
+              style={{ maxWidth: '85%' }}
+            >
+              <VoiceMessageBubble
+                uri={voiceMessageData.url}
+                duration={voiceMessageData.duration}
+                isMine={isMine}
+                timestamp={timestamp}
+                textPart={voiceMessageData.textPart}
+                readAt={item.read_at}
+                syncStatus={item.sync_status || 'pending'}
+                embedded
+              />
+            </TouchableOpacity>
+          </View>
+
           {isMine && item.sync_status === 'failed' && (
             <View style={{
               flexDirection: 'row',
@@ -3116,60 +1683,19 @@ export default function UserChatScreen() {
           marginVertical: 4,
           justifyContent: isMine ? 'flex-end' : 'flex-start'
         }}>
-        {/* Avatar for received messages */}
-        {!isMine && (
-          <UserAvatar
-            avatarUrl={item.sender?.avatar_url}
-            name={item.sender?.name || 'User'}
-            size={32}
-            style={{ marginRight: 8, marginBottom: 4 }}
-          />
-        )}
-        
         <TouchableOpacity
           onLongPress={() => handleMessageLongPress(item)}
           activeOpacity={0.8}
         >
           <View
-            onLayout={(event) => {
-              // Measure message height for precise scroll calculations
-              const { height, y } = event.nativeEvent.layout;
-              messageHeightsRef.current.set(item.id, height);
-              
-              // If this is the last message, track its position and height
-              if (isLastMessage) {
-                lastMessageHeightRef.current = height;
-                lastMessageYPositionRef.current = y;
-                
-                // Calculate target scroll offset to keep message at fixed position from bottom
-                if (viewportHeightRef.current > 0 && shouldMaintainPositionRef.current) {
-                  // Calculate the exact offset needed to keep last message at targetBottomOffsetRef from bottom
-                  const targetScrollOffset = y + height + targetBottomOffsetRef.current - viewportHeightRef.current;
-                  
-                  // Apply scroll offset after a small delay to ensure layout is complete
-                  setTimeout(() => {
-                    if (flatListRef.current && shouldMaintainPositionRef.current) {
-                      try {
-                        flatListRef.current.scrollToOffset({
-                          offset: Math.max(0, targetScrollOffset),
-                          animated: false
-                        });
-                      } catch (error) {
-                        // Silently handle - scroll might not be ready yet
-                      }
-                    }
-                  }, 10);
-                }
-              }
-            }}
             style={{
               backgroundColor: isMine ? '#25D366' : (isDark ? '#374151' : '#E5E7EB'),
               borderRadius: 18,
               borderTopLeftRadius: isMine ? 18 : 4,
               borderTopRightRadius: isMine ? 4 : 18,
               padding: 12,
-              maxWidth: isMine ? '85%' : '75%', // Wider for sent messages to use more space
-              minWidth: 120, // Increased minimum width for short messages
+              maxWidth: '85%',
+              minWidth: 120,
               alignSelf: isMine ? 'flex-end' : 'flex-start', // This ensures proper alignment
               shadowColor: '#000',
               shadowOffset: { width: 0, height: 1 },
@@ -3304,6 +1830,20 @@ export default function UserChatScreen() {
                   )}
                 </View>
               </View>
+            ) : (firstAttachment.mime?.startsWith('audio/') || firstAttachment.type?.startsWith('audio/') ||
+                /\.(m4a|mp3|wav|ogg|aac|amr|caf)$/i.test(firstAttachment.name || '')) ? (
+              <VoiceMessageBubble
+                uri={resolveMediaUrl(
+                  firstAttachment.url || firstAttachment.path || firstAttachment.uri,
+                  getBaseUrl
+                )}
+                duration={parseVoiceMessage(item.message, item.attachments)?.duration ?? 0}
+                isMine={isMine}
+                timestamp={timestamp}
+                readAt={item.read_at}
+                syncStatus={item.sync_status || 'synced'}
+                embedded
+              />
             ) : (
               <View style={{ width: '100%', overflow: 'hidden' }}>
                 <View style={{ 
@@ -3826,142 +2366,51 @@ export default function UserChatScreen() {
             >
               <FlatList
               ref={flatListRef}
-              data={visibleMessages}
+              data={invertedMessages}
               renderItem={renderItem}
-              extraData={messages.length} // Force re-render when messages array changes
-              initialNumToRender={30} // Render 30 items initially for better performance
-              windowSize={10} // Keep 10 screens worth of items in memory (optimized)
-              maxToRenderPerBatch={15} // Render 15 items per batch
-              removeClippedSubviews={true} // Remove off-screen views for better performance
-              updateCellsBatchingPeriod={50} // Batch updates every 50ms
-              // ✅ CRITICAL FIX: Always start at the last message (latest at bottom) on initial load
-              // This ensures the latest message is visible even when all messages fit on screen
-              // Only set initialScrollIndex when we're truly on initial load and haven't completed positioning
-              initialScrollIndex={
-                isInitialLoadRef.current && visibleMessages.length > 0 && !initialScrollCompleteRef.current
-                  ? visibleMessages.length - 1  // Always start at last message on initial load
-                  : undefined
-              }
-              getItemLayout={(data, index) => {
-                // ✅ CRITICAL FIX: getItemLayout must be accurate for initialScrollIndex to work
-                // If this is inaccurate, initialScrollIndex won't position correctly
-                // Estimate ~60px per message (will be adjusted by onLayout)
-                const estimatedHeight = 60; // Base height per message
-                return { 
-                  length: estimatedHeight, 
-                  offset: estimatedHeight * index, 
-                  index 
-                };
-              }}
-              // REMOVED: onEndReached - it fires at bottom (newest messages) but we want to load at top (oldest)
-              // Loading more messages is handled by onScroll handler when user scrolls to top
+              extraData={messages.length}
+              inverted
+              initialNumToRender={25}
+              windowSize={10}
+              maxToRenderPerBatch={15}
+              removeClippedSubviews={false}
+              updateCellsBatchingPeriod={50}
               keyExtractor={(item, index) => {
-                // Use message ID if available, otherwise use index with a stable fallback
-                // Always include index as a fallback to ensure uniqueness even with duplicate IDs
                 if (item && item.id !== undefined && item.id !== null && item.id !== 0) {
-                  // Include index and created_at to ensure uniqueness even if duplicate IDs exist
-                  // This prevents React key warnings when deduplication hasn't run yet
                   const createdAt = item.created_at ? `-${item.created_at}` : '';
                   return `message-${item.id}${createdAt}-${index}`;
                 }
-                // For messages without IDs, use index and created_at if available
-                // Include sender_id to make it more unique
                 const fallbackKey = item?.created_at
                   ? `message-fallback-${index}-${item.sender_id || 'unknown'}-${item.created_at}`
                   : `message-fallback-${index}-${item.sender_id || 'unknown'}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
                 return fallbackKey;
               }}
               style={{ flex: 1 }}
-              contentContainerStyle={{ 
-                padding: 16, 
-                paddingBottom: 0, // Let KeyboardAvoidingView handle spacing
-                flexGrow: 1, // ✅ CRITICAL FIX: Allow content to grow and fill viewport
-                justifyContent: 'flex-end', // ✅ CRITICAL FIX: Align content to bottom when shorter than viewport
-                minHeight: '100%', // ✅ CRITICAL FIX: Ensure container is at least viewport height for proper scrolling
+              contentContainerStyle={{
+                flexGrow: 1,
+                padding: 16,
               }}
-              inverted={false} // Normal scrolling - latest messages at bottom (correct for chat apps)
               keyboardShouldPersistTaps="handled"
+              onScrollToIndexFailed={(info) => {
+                flatListRef.current?.scrollToOffset({
+                  offset: info.averageItemLength * info.index,
+                  animated: false,
+                });
+              }}
               keyboardDismissMode={Platform.OS === 'ios' ? 'interactive' : 'on-drag'}
-              // CRITICAL: Maintain scroll position relative to last visible message
-              // This handles image loading, polling refetch, and content changes automatically
-              maintainVisibleContentPosition={
-                initialScrollCompleteRef.current ? {
-                  minIndexForVisible: 0, // Start maintaining from first item
-                  autoscrollToTopThreshold: 10, // Auto-scroll to top if less than 10 items visible
-                } : undefined
-              }
               onScroll={({ nativeEvent }) => {
-                const { contentOffset, contentSize, layoutMeasurement } = nativeEvent;
-                
-                // Track viewport height for precise calculations
-                viewportHeightRef.current = layoutMeasurement.height;
-                
-                // Track scroll offset for pagination
-                const currentOffset = contentOffset.y;
-                lastScrollOffsetRef.current = currentOffset;
-                
-                // Calculate if user is at bottom (within 50px threshold)
-                const contentHeight = contentSize.height;
-                const viewportHeight = layoutMeasurement.height;
-                const distanceFromBottom = contentHeight - (currentOffset + viewportHeight);
-                const isAtBottom = distanceFromBottom <= 50;
-                
-                // ✅ DEBUG LOGGING: Track scroll position (especially on initial load)
-                if (isInitialLoadRef.current || !initialScrollCompleteRef.current) {
-                  console.log(`[UserChat] 📜 onScroll (initial load):`, {
-                    contentOffsetY: currentOffset,
-                    contentHeight,
-                    viewportHeight,
-                    distanceFromBottom,
-                    isAtBottom,
-                    scrollPercentage: contentHeight > 0 ? ((currentOffset / (contentHeight - viewportHeight)) * 100).toFixed(1) + '%' : '0%',
-                    isInitialLoad: isInitialLoadRef.current,
-                    initialScrollComplete: initialScrollCompleteRef.current,
-                    visibleMessagesCount: visibleMessages.length,
-                    messagesCount: messages.length,
-                  });
-                }
-                
-                // Update anchor message and position maintenance flag when user is at bottom
-                if (isAtBottom && visibleMessages.length > 0) {
-                  isAtBottomRef.current = true;
-                  shouldMaintainPositionRef.current = true;
-                  lastVisibleMessageIdRef.current = visibleMessages[visibleMessages.length - 1].id;
-                } else {
-                  isAtBottomRef.current = false;
-                  shouldMaintainPositionRef.current = false;
-                }
-                
-                // Load more messages when at top (pagination)
-                const isAtTop = contentOffset.y <= 50;
-                const now = Date.now();
-                if (isAtTop && hasMoreMessages && !loadingMore && (now - lastScrollTrigger > 2000)) {
-                  setLastScrollTrigger(now);
+                isAtBottomRef.current = nativeEvent.contentOffset.y <= 80;
+              }}
+              scrollEventThrottle={16}
+              onEndReached={() => {
+                if (hasMoreMessages && !loadingMore) {
                   loadMoreMessages();
                 }
               }}
-              onScrollEndDrag={({ nativeEvent }) => {
-                const { contentOffset } = nativeEvent;
-                const isAtTop = contentOffset.y <= 50;
-                
-                // Show more messages when scrolling up (if we're showing only last N messages)
-                if (isAtTop && visibleMessagesStartIndex !== null && visibleMessagesStartIndex > 0) {
-                  // Show more older messages (decrease start index)
-                  const newStartIndex = Math.max(0, visibleMessagesStartIndex - INITIAL_VISIBLE_MESSAGES);
-                  setVisibleMessagesStartIndex(newStartIndex);
-                }
-                
-                // Load more messages from API when at top and we've shown all loaded messages
-                const now = Date.now();
-                if (isAtTop && visibleMessagesStartIndex === 0 && hasMoreMessages && !loadingMore && (now - lastScrollTrigger > 2000)) {
-                  setLastScrollTrigger(now);
-                  loadMoreMessages();
-                }
-              }}
-              scrollEventThrottle={100}
-              ListHeaderComponent={() => 
+              onEndReachedThreshold={0.4}
+              ListFooterComponent={() =>
                 loadingMore ? (
-                  <View style={{ padding: 20, alignItems: 'center' }}>
+                  <View style={{ padding: 20, alignItems: 'center', transform: [{ scaleY: -1 }] }}>
                     <ActivityIndicator size="small" color="#283891" />
                     <Text style={{ color: isDark ? '#9CA3AF' : '#6B7280', marginTop: 8 }}>
                       Loading more messages...
@@ -3969,219 +2418,18 @@ export default function UserChatScreen() {
                   </View>
                 ) : null
               }
-              onContentSizeChange={(contentWidth, contentHeight) => {
-                // ✅ DEBUG LOGGING: Track content size changes
-                const viewportHeight = viewportHeightRef.current || 0;
-                const scrollPosition = lastScrollOffsetRef.current || 0;
-                const distanceFromBottom = contentHeight - (scrollPosition + viewportHeight);
-                const scrollPercentage = contentHeight > viewportHeight 
-                  ? ((scrollPosition / (contentHeight - viewportHeight)) * 100).toFixed(1) + '%'
-                  : '0% (all visible)';
-                
-                console.log(`[UserChat] 📏 onContentSizeChange:`, {
-                  contentWidth,
-                  contentHeight,
-                  viewportHeight,
-                  scrollPosition,
-                  distanceFromBottom,
-                  scrollPercentage,
-                  isAtTop: scrollPosition <= 10,
-                  isAtBottom: distanceFromBottom <= 50,
-                  messagesCount: messages.length,
-                  visibleMessagesCount: visibleMessages.length,
-                  visibleMessagesStartIndex,
-                  isInitialLoad: isInitialLoadRef.current,
-                  initialScrollComplete: initialScrollCompleteRef.current,
-                  loading,
-                  hasScrolledToBottom,
-                  isAtBottom: isAtBottomRef.current,
-                  firstVisibleMessageId: visibleMessages[0]?.id,
-                  lastVisibleMessageId: visibleMessages[visibleMessages.length - 1]?.id,
-                  shouldMaintainPosition: shouldMaintainPositionRef.current,
-                  lastMessageHeight: lastMessageHeightRef.current,
-                  // Calculate which message should be visible at current scroll position
-                  estimatedVisibleRange: viewportHeight > 0 && visibleMessages.length > 0 ? {
-                    estimatedFirstVisibleIndex: Math.floor((scrollPosition / contentHeight) * visibleMessages.length),
-                    estimatedLastVisibleIndex: Math.floor(((scrollPosition + viewportHeight) / contentHeight) * visibleMessages.length),
-                  } : null,
-                });
-                
-                // ✅ CRITICAL FIX: On initial load, verify positioning without scrolling
-                // Rely on initialScrollIndex and contentContainerStyle to position correctly
-                // Only verify we're at bottom, don't scroll to avoid interrupting user
-                if (isInitialLoadRef.current && !loading && visibleMessages.length > 0) {
-                  // Check if we're at bottom (initialScrollIndex should have positioned us correctly)
-                  const isAtBottom = distanceFromBottom <= 100;
-                  
-                  if (isAtBottom && !initialScrollCompleteRef.current) {
-                    // We're positioned correctly by initialScrollIndex/contentContainerStyle
-                    console.log(`[UserChat] ✅ Initial load - positioned at bottom correctly`, {
-                      contentHeight,
-                      viewportHeight,
-                      distanceFromBottom,
-                      note: 'initialScrollIndex and contentContainerStyle handled positioning',
-                    });
-                    
-                    // Mark as complete - no scrolling needed
-                    initialScrollCompleteRef.current = true;
-                    setHasScrolledToBottom(true);
-                    isAtBottomRef.current = true;
-                    shouldMaintainPositionRef.current = true;
-                    
-                    setTimeout(() => {
-                      isInitialLoadRef.current = false;
-                      console.log(`[UserChat] ✅ Marked initial load as complete`);
-                    }, 100);
-                    return; // Exit early, don't run maintain position logic during initial load
-                  }
-                  // If not at bottom, initialScrollIndex should handle it on next render
-                  // Don't scroll here to avoid interrupting user - let initialScrollIndex do its job
-                }
-                
-                // Maintain fixed position of last message when content changes (polling, refetch, image loading)
-                // This only runs AFTER initial load is complete
-                if (shouldMaintainPositionRef.current && 
-                    !isInitialLoadRef.current && 
-                    initialScrollCompleteRef.current &&
-                    lastMessageHeightRef.current > 0 && 
-                    viewportHeightRef.current > 0 &&
-                    messages.length > 0) {
-                  
-                  // Calculate exact scroll offset to keep last message at fixed position from bottom
-                  // Formula: contentHeight - viewportHeight - targetBottomOffset
-                  const targetScrollOffset = contentHeight - viewportHeightRef.current - targetBottomOffsetRef.current;
-                  
-                  setTimeout(() => {
-                    if (flatListRef.current && shouldMaintainPositionRef.current) {
-                      try {
-                        flatListRef.current.scrollToOffset({
-                          offset: Math.max(0, targetScrollOffset),
-                          animated: false
-                        });
-                      } catch (error) {
-                        // Silently handle - might be during layout
-                      }
-                    }
-                  }, 50); // Small delay to ensure layout is complete
-                }
-                
-                // ✅ CRITICAL FIX: Scroll to bottom on initial load to show latest messages (at bottom)
-                // This is a fallback for when the above logic doesn't catch it
-                // Check if we need to scroll: initial load AND not already scrolled AND messages exist
-                const needsInitialScroll = isInitialLoadRef.current && !loading && visibleMessages.length > 0 && !initialScrollCompleteRef.current;
-                // Also check if scroll is not at bottom (distanceFromBottom > 100px) - this handles the case where initialScrollComplete is true but scroll didn't happen
-                const isNearBottom = distanceFromBottom <= 100; // Within 100px of bottom
-                const shouldScrollToBottom = needsInitialScroll || (isInitialLoadRef.current && !isNearBottom && visibleMessages.length > 0 && !initialScrollCompleteRef.current);
-                
-                if (shouldScrollToBottom) {
-                  console.log(`[UserChat] ✅ Initial load - scrolling to bottom to show latest messages`, {
-                    isInitialLoad: isInitialLoadRef.current,
-                    initialScrollComplete: initialScrollCompleteRef.current,
-                    scrollPosition,
-                    contentHeight,
-                    viewportHeight,
-                    distanceFromBottom,
-                    isNearBottom,
-                    needsInitialScroll,
-                    shouldScrollToBottom,
-                  });
-                  
-                  // Use scrollToIndex to scroll to the last message (latest at bottom)
-                  setTimeout(() => {
-                    if (flatListRef.current && visibleMessages.length > 0) {
-                      try {
-                        const lastIndex = visibleMessages.length - 1;
-                        console.log(`[UserChat] 📜 Scrolling to index ${lastIndex} (latest message at bottom)`);
-                        flatListRef.current.scrollToIndex({
-                          index: lastIndex,
-                          animated: false,
-                          viewPosition: 1, // 1 = bottom of viewport (latest message visible)
-                        });
-                        console.log(`[UserChat] ✅ Scrolled to bottom successfully`);
-                      } catch (scrollError: any) {
-                        // If scrollToIndex fails, fallback to scrollToEnd
-                        console.warn(`[UserChat] ⚠️ scrollToIndex failed, using scrollToEnd:`, scrollError?.message);
-                        try {
-                          (flatListRef.current as any).scrollToEnd({ animated: false });
-                          console.log(`[UserChat] ✅ Used scrollToEnd fallback`);
-                        } catch (endError) {
-                          console.error(`[UserChat] ❌ Both scroll methods failed:`, endError);
-                        }
-                      }
-                    }
-                  }, 300); // Increased delay to ensure messages are fully rendered
-                  
-                  // ✅ CRITICAL FIX: Only mark as complete AFTER scroll is attempted
-                  initialScrollCompleteRef.current = true;
-                  setHasScrolledToBottom(true);
-                  isAtBottomRef.current = true;
-                  shouldMaintainPositionRef.current = true;
-                  if (visibleMessages.length > 0) {
-                    lastVisibleMessageIdRef.current = visibleMessages[visibleMessages.length - 1].id;
-                    console.log(`[UserChat] 📌 Set lastVisibleMessageIdRef to: ${lastVisibleMessageIdRef.current}`);
-                    
-                    // ✅ CRITICAL FIX: Set isInitialLoad to false AFTER scroll is initiated
-                    // This prevents it from being false before scroll happens
-                    setTimeout(() => {
-                      isInitialLoadRef.current = false;
-                      console.log(`[UserChat] ✅ Marked initial load as complete after scroll`);
-                    }, 500); // Wait for scroll to complete
-                  }
-                }
-              }}
-              onLayout={(event) => {
-                // Track viewport height when layout changes
-                const { height, width, x, y } = event.nativeEvent.layout;
-                const previousViewportHeight = viewportHeightRef.current;
-                
-                // ✅ DEBUG LOGGING: Track layout changes
-                console.log(`[UserChat] 📐 FlatList onLayout:`, {
-                  height,
-                  width,
-                  x,
-                  y,
-                  previousViewportHeight,
-                  heightChanged: previousViewportHeight !== height,
-                  isInitialLoad: isInitialLoadRef.current,
-                  initialScrollComplete: initialScrollCompleteRef.current,
-                  visibleMessagesCount: visibleMessages.length,
-                  messagesCount: messages.length,
-                  visibleMessagesStartIndex,
-                  // Check if FlatList is ready to show content
-                  flatListRefExists: !!flatListRef.current,
-                  // Estimate how many messages fit in viewport (rough estimate: ~60px per message)
-                  estimatedMessagesInViewport: Math.ceil(height / 60),
-                });
-                
-                viewportHeightRef.current = height;
-                
-                // ✅ DEBUG: Log initial scroll position after layout
-                if (isInitialLoadRef.current && !initialScrollCompleteRef.current && flatListRef.current) {
-                  setTimeout(() => {
-                    // Try to get current scroll position
-                    if (flatListRef.current) {
-                      console.log(`[UserChat] 🔍 Initial layout complete - checking scroll state:`, {
-                        viewportHeight: height,
-                        visibleMessagesCount: visibleMessages.length,
-                        firstMessageId: visibleMessages[0]?.id,
-                        lastMessageId: visibleMessages[visibleMessages.length - 1]?.id,
-                        note: 'FlatList with inverted=true shows last item (latest message) at bottom by default',
-                      });
-                    }
-                  }, 100);
-                }
-              }}
               ListEmptyComponent={() => (
-                <View style={{ 
-                  flex: 1, 
-                  justifyContent: 'center', 
+                <View style={{
+                  flex: 1,
+                  justifyContent: 'center',
                   alignItems: 'center',
-                  paddingVertical: 40
+                  paddingVertical: 40,
+                  transform: [{ scaleY: -1 }],
                 }}>
-                  <Text style={{ 
+                  <Text style={{
                     color: isDark ? '#9CA3AF' : '#6B7280',
                     fontSize: 16,
-                    textAlign: 'center'
+                    textAlign: 'center',
                   }}>
                     No messages yet. Start a conversation!
                   </Text>

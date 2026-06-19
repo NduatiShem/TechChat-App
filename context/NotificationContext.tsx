@@ -781,13 +781,13 @@ export const NotificationProvider: React.FC<NotificationProviderProps> = ({ chil
     }
   };
 
-  const setActiveConversation = (conversationId: number | null) => {
+  const setActiveConversation = useCallback((conversationId: number | null) => {
     setActiveConversationId(conversationId);
-  };
+  }, []);
 
-  const clearActiveConversation = () => {
+  const clearActiveConversation = useCallback(() => {
     setActiveConversationId(null);
-  };
+  }, []);
 
   useEffect(() => {
     // Debounce registration on auth/token change to prevent rapid successive calls

@@ -1,5 +1,6 @@
-import type { DatabaseAttachment, DatabaseConversation, DatabaseGroup, DatabaseMessage, MessageWithAttachments, SyncState } from '@/types/database';
+import type { DatabaseAttachment, DatabaseConversation, DatabaseGroup, DatabaseMessage, MessageWithAttachments, SavedMessageResult, SyncState } from '@/types/database';
 import { runMigrations } from '@/utils/dbMigrations';
+import { logger } from '@/utils/logger';
 import * as SQLite from 'expo-sqlite';
 
 let db: SQLite.SQLiteDatabase | null = null;
@@ -172,6 +173,13 @@ export async function initDatabase(): Promise<SQLite.SQLiteDatabase | null> {
           
           // Test database is ready by doing a simple query
           await database.getFirstAsync('SELECT 1');
+
+          // Phase 0: WAL + concurrency + referential integrity
+          await database.execAsync(`
+            PRAGMA journal_mode = WAL;
+            PRAGMA busy_timeout = 5000;
+            PRAGMA foreign_keys = ON;
+          `);
           
           break; // Success, exit retry loop
         } catch (openError: any) {
@@ -204,9 +212,7 @@ export async function initDatabase(): Promise<SQLite.SQLiteDatabase | null> {
       
       db = database;
       
-      if (__DEV__) {
-        console.log('[Database] Initialized successfully');
-      }
+      logger.debug('[Database] Initialized successfully (WAL mode)');
       
       return db;
     } catch (error: any) {
@@ -255,16 +261,35 @@ export function isDatabaseAvailable(): boolean {
   return db !== null;
 }
 
+export async function getMessageByClientMessageId(
+  clientMessageId: string
+): Promise<DatabaseMessage | null> {
+  try {
+    const database = await getDb();
+    if (!database) return null;
+    const isValid = await validateDatabase(database);
+    if (!isValid) return null;
+    return (
+      (await database.getFirstAsync<DatabaseMessage>(
+        `SELECT * FROM messages WHERE client_message_id = ?`,
+        [clientMessageId]
+      )) ?? null
+    );
+  } catch {
+    return null;
+  }
+}
+
 export async function getMessages(
   conversationId: number,
   conversationType: 'individual' | 'group',
   limit: number = 50,
-  offset: number = 0
+  offset: number = 0,
+  beforeCreatedAt?: string
 ): Promise<MessageWithAttachments[]> {
   try {
     let database = await getDb();
     if (!database) {
-      // CRITICAL FIX: Wait a bit if database is still initializing
       let retries = 0;
       while (!database && retries < 3) {
         await new Promise(resolve => setTimeout(resolve, 100));
@@ -280,11 +305,8 @@ export async function getMessages(
       return [];
     }
     
-    // ✅ CRITICAL FIX: Put all read operations through queue to prevent concurrent access
     const dbRef = database;
     return await retryWithBackoff(async () => {
-      return await writeQueue.enqueue(async () => {
-        // Re-validate database inside callback
         let dbToUse: SQLite.SQLiteDatabase | null = dbRef;
         if (!dbToUse) {
           dbToUse = await getDb();
@@ -293,7 +315,6 @@ export async function getMessages(
           }
         }
         
-        // Validate database is still valid
         const isValid = await validateDatabase(dbToUse);
         if (!isValid || !dbToUse) {
           return [];
@@ -301,16 +322,34 @@ export async function getMessages(
         
         const validDb = dbToUse;
         
-        // CRITICAL FIX: Wrap query in try-catch to handle NullPointerException
         let messages: DatabaseMessage[] = [];
         try {
-          messages = await validDb.getAllAsync<DatabaseMessage>(
-            `SELECT * FROM messages 
-             WHERE conversation_id = ? AND conversation_type = ?
-             ORDER BY created_at DESC
-             LIMIT ? OFFSET ?`,
-            [conversationId, conversationType, limit, offset]
-          );
+          if (beforeCreatedAt) {
+            messages = await validDb.getAllAsync<DatabaseMessage>(
+              `SELECT * FROM messages 
+               WHERE conversation_id = ? AND conversation_type = ?
+               AND created_at < ?
+               ORDER BY created_at DESC
+               LIMIT ?`,
+              [conversationId, conversationType, beforeCreatedAt, limit]
+            );
+          } else if (offset > 0) {
+            messages = await validDb.getAllAsync<DatabaseMessage>(
+              `SELECT * FROM messages 
+               WHERE conversation_id = ? AND conversation_type = ?
+               ORDER BY created_at DESC
+               LIMIT ? OFFSET ?`,
+              [conversationId, conversationType, limit, offset]
+            );
+          } else {
+            messages = await validDb.getAllAsync<DatabaseMessage>(
+              `SELECT * FROM messages 
+               WHERE conversation_id = ? AND conversation_type = ?
+               ORDER BY created_at DESC
+               LIMIT ?`,
+              [conversationId, conversationType, limit]
+            );
+          }
         } catch (queryError: any) {
           // Check if it's a NullPointerException or database not ready error
           if (queryError?.message?.includes('NullPointerException') || 
@@ -395,7 +434,6 @@ export async function getMessages(
         return messagesWithDetails.filter((msg): msg is MessageWithAttachments => {
           return msg !== null;
         }) as MessageWithAttachments[];
-      });
     });
   } catch (error) {
     console.error('[Database] Error getting messages:', error);
@@ -418,6 +456,7 @@ export async function saveMessages(
     edited_at?: string | null;
     reply_to_id?: number | null;
     sync_status?: 'synced' | 'pending' | 'failed';
+    client_message_id?: string | null;
     attachments?: Array<{
       id?: number;
       server_id?: number;
@@ -429,9 +468,10 @@ export async function saveMessages(
       type?: string;
     }>;
   }>
-): Promise<void> {
+): Promise<SavedMessageResult[]> {
+  const savedResults: SavedMessageResult[] = [];
   if (!messages || messages.length === 0) {
-    return;
+    return savedResults;
   }
 
   try {
@@ -451,7 +491,7 @@ export async function saveMessages(
       if (__DEV__) {
         console.warn('[Database] Database not available after retries, skipping save');
       }
-      return;
+      return savedResults;
     }
     
     // ✅ CRITICAL FIX: Validate database is still valid before enqueueing
@@ -462,7 +502,7 @@ export async function saveMessages(
       database = await initDatabase(); // Try to reinitialize
       if (!database) {
         console.error('[Database] Failed to reinitialize, skipping save');
-        return;
+        return savedResults;
       }
     }
     
@@ -497,6 +537,19 @@ export async function saveMessages(
       
       try {
         for (const msg of messages) {
+          if (msg.client_message_id) {
+            try {
+              const existing = await validDb.getFirstAsync<DatabaseMessage>(
+                `SELECT * FROM messages WHERE client_message_id = ?`,
+                [msg.client_message_id]
+              );
+              if (existing) {
+                existingMessagesMap.set(`client_${msg.client_message_id}`, existing);
+              }
+            } catch {
+              // ignore
+            }
+          }
           if (msg.server_id) {
             try {
               const existing = await validDb.getFirstAsync<DatabaseMessage>(
@@ -509,7 +562,7 @@ export async function saveMessages(
             } catch (e) {
               // Ignore errors, will try again in transaction
             }
-          } else if (msg.id) {
+          } else if (msg.id && Number.isInteger(msg.id)) {
             try {
               const existing = await validDb.getFirstAsync<DatabaseMessage>(
                 `SELECT * FROM messages WHERE id = ?`,
@@ -540,46 +593,25 @@ export async function saveMessages(
           return;
         }
 
-        // ✅ CRITICAL FIX: Remove retryWithBackoff - queue serializes operations, so retries are not needed
-        // Use pre-fetched data only - no reads inside transaction to avoid locks
         let existingMessage: DatabaseMessage | null = null;
-          const key = msg.server_id ? `server_${msg.server_id}` : msg.id ? `id_${msg.id}` : null;
+        if (msg.client_message_id) {
+          const clientKey = `client_${msg.client_message_id}`;
+          if (existingMessagesMap.has(clientKey)) {
+            existingMessage = existingMessagesMap.get(clientKey)!;
+          }
+        }
+        if (!existingMessage) {
+          const key = msg.server_id
+            ? `server_${msg.server_id}`
+            : msg.id && Number.isInteger(msg.id)
+              ? `id_${msg.id}`
+              : null;
           if (key && existingMessagesMap.has(key)) {
             existingMessage = existingMessagesMap.get(key)!;
           }
-          
-          // CRITICAL FIX: If message has server_id but not found in cache, check by content+sender
-          // This prevents duplicates when a message was saved with tempLocalId, then synced with server_id
-          if (!existingMessage && msg.server_id && msg.message) {
-            try {
-              // Check if there's a message with same content+sender in same conversation without server_id
-              // This handles the case where message was saved locally, then synced from API
-              const potentialDuplicate = await validDb.getFirstAsync<DatabaseMessage>(
-                `SELECT * FROM messages 
-                 WHERE conversation_id = ? 
-                 AND conversation_type = ? 
-                 AND sender_id = ? 
-                 AND message = ? 
-                 AND server_id IS NULL
-                 ORDER BY created_at DESC
-                 LIMIT 1`,
-                [msg.conversation_id, msg.conversation_type, msg.sender_id, msg.message]
-              );
-              
-              if (potentialDuplicate) {
-                // Found a message without server_id that matches - update it instead of inserting
-                existingMessage = potentialDuplicate;
-                existingMessagesMap.set(`server_${msg.server_id}`, potentialDuplicate);
-              }
-            } catch (e) {
-              // Ignore errors, will insert as new if needed
-            }
-          }
-          
-          // If not in cache and no duplicate found, assume it's a new message (will insert)
-          // This prevents read-write conflicts inside transactions
+        }
 
-          let messageId: number;
+          let messageId: number | undefined;
 
           if (existingMessage) {
             // ✅ CRITICAL FIX: Protect pending/failed messages from being overwritten
@@ -614,20 +646,26 @@ export async function saveMessages(
               await validDb.runAsync(
                 `UPDATE messages SET
                   server_id = ?,
+                  sender_id = COALESCE(?, sender_id),
+                  receiver_id = COALESCE(?, receiver_id),
                   message = ?,
                   created_at = ?,
                   read_at = ?,
                   edited_at = ?,
                   sync_status = ?,
+                  client_message_id = COALESCE(?, client_message_id),
                   updated_at = datetime('now')
                 WHERE id = ?`,
                 [
-                  msg.server_id ?? existingMessage.server_id, // Update server_id if provided
+                  msg.server_id ?? existingMessage.server_id,
+                  msg.sender_id ?? null,
+                  msg.receiver_id ?? null,
                   (msg.message ?? existingMessage.message) || null,
-                  msg.created_at, // Use server timestamp
+                  msg.created_at,
                   (msg.read_at ?? existingMessage.read_at) || null,
                   (msg.edited_at ?? existingMessage.edited_at) || null,
-                  newSyncStatus, // Use protected status
+                  newSyncStatus,
+                  msg.client_message_id ?? null,
                   existingMessage.id,
                 ]
               );
@@ -652,79 +690,39 @@ export async function saveMessages(
             }
             messageId = existingMessage.id;
           } else {
-            // INSERT new message (not in cache, assume new)
-            // ✅ CRITICAL FIX: Use provided id if available (for tempLocalId from handleSend)
-            // This ensures the ID used for marking matches the ID in the database
-            if (msg.id && typeof msg.id === 'number') {
-              // Try to insert with provided ID (tempLocalId)
-              try {
-                const result = await validDb.runAsync(
-                  `INSERT INTO messages (
-                    id, server_id, conversation_id, conversation_type, sender_id, receiver_id, group_id,
-                    message, created_at, read_at, edited_at, reply_to_id, sync_status
-                  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                  [
-                    msg.id, // Use provided ID (tempLocalId)
-                    msg.server_id ?? null,
-                    msg.conversation_id,
-                    msg.conversation_type,
-                    msg.sender_id,
-                    msg.receiver_id ?? null,
-                    msg.group_id ?? null,
-                    msg.message ?? null,
-                    msg.created_at,
-                    msg.read_at ?? null,
-                    msg.edited_at ?? null,
-                    msg.reply_to_id ?? null,
-                    msg.sync_status ?? 'synced',
-                  ]
-                );
-                messageId = msg.id; // Use provided ID
-                if (__DEV__) {
-                  console.log(`[Database] Inserted message with provided ID: ${msg.id}`);
-                }
-              } catch (insertError: any) {
-                // If insert fails (e.g., ID already exists), fall back to auto-increment
-                if (insertError?.message?.includes('UNIQUE constraint') || insertError?.message?.includes('PRIMARY KEY')) {
-                  if (__DEV__) {
-                    console.warn(`[Database] Provided ID ${msg.id} already exists, using auto-increment instead`);
-                  }
-                  // Fall through to auto-increment INSERT below
-                } else {
-                  throw insertError; // Re-throw other errors
-                }
-              }
+            const result = await validDb.runAsync(
+              `INSERT INTO messages (
+                server_id, conversation_id, conversation_type, sender_id, receiver_id, group_id,
+                message, created_at, read_at, edited_at, reply_to_id, sync_status, client_message_id
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              [
+                msg.server_id ?? null,
+                msg.conversation_id,
+                msg.conversation_type,
+                msg.sender_id,
+                msg.receiver_id ?? null,
+                msg.group_id ?? null,
+                msg.message ?? null,
+                msg.created_at,
+                msg.read_at ?? null,
+                msg.edited_at ?? null,
+                msg.reply_to_id ?? null,
+                msg.sync_status ?? 'synced',
+                msg.client_message_id ?? null,
+              ]
+            );
+            messageId = result.lastInsertRowId;
+            if (__DEV__) {
+              logger.debug(`[Database] Inserted message id=${messageId} client=${msg.client_message_id ?? 'none'}`);
             }
-            
-            // If no ID provided or insert with provided ID failed, use auto-increment
-            if (!messageId) {
-              const result = await validDb.runAsync(
-                `INSERT INTO messages (
-                  server_id, conversation_id, conversation_type, sender_id, receiver_id, group_id,
-                  message, created_at, read_at, edited_at, reply_to_id, sync_status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                [
-                  msg.server_id ?? null,
-                  msg.conversation_id,
-                  msg.conversation_type,
-                  msg.sender_id,
-                  msg.receiver_id ?? null,
-                  msg.group_id ?? null,
-                  msg.message ?? null,
-                  msg.created_at,
-                  msg.read_at ?? null,
-                  msg.edited_at ?? null,
-                  msg.reply_to_id ?? null,
-                  msg.sync_status ?? 'synced',
-                ]
-              );
-              messageId = result.lastInsertRowId;
-              if (__DEV__) {
-                console.log(`[Database] Inserted message with auto-increment ID: ${messageId}`);
-              }
-            }
-            // If INSERT fails with constraint error, retryWithBackoff will retry
-            // and on retry, the pre-fetch should have the message, so it will UPDATE instead
+          }
+
+          if (messageId) {
+            savedResults.push({
+              localMessageId: messageId,
+              clientMessageId: msg.client_message_id ?? null,
+              serverId: msg.server_id ?? null,
+            });
           }
 
           // Handle attachments - check cache first
@@ -800,7 +798,7 @@ export async function saveMessages(
         });
       
       if (__DEV__) {
-        console.log(`[Database] Saved ${messages.length} messages (transaction)`);
+        logger.debug(`[Database] Saved ${messages.length} messages (transaction)`);
       }
     } catch (transactionError) {
       // If transaction fails, fallback to saving individually with retry
@@ -824,7 +822,7 @@ export async function saveMessages(
       }
       
       if (__DEV__) {
-        console.log(`[Database] Saved ${successCount}/${messages.length} messages (individual)`);
+        logger.debug(`[Database] Saved ${successCount}/${messages.length} messages (individual)`);
       }
     }
     });
@@ -835,6 +833,7 @@ export async function saveMessages(
       console.error('[Database] Error details:', error instanceof Error ? error.message : String(error));
     }
   }
+  return savedResults;
 }
 
 export async function markMessageAsRead(messageId: number): Promise<void> {
@@ -976,7 +975,7 @@ export async function getGroups(): Promise<DatabaseGroup[]> {
             CREATE INDEX IF NOT EXISTS idx_groups_updated_at ON groups(updated_at DESC);
             CREATE INDEX IF NOT EXISTS idx_groups_owner_id ON groups(owner_id);
           `);
-          console.log('[Database] Groups table created successfully');
+          logger.debug('[Database] Groups table created successfully');
         } catch (createError) {
           console.error('[Database] Failed to create groups table:', createError);
           return [];
@@ -1034,7 +1033,7 @@ export async function getGroups(): Promise<DatabaseGroup[]> {
                 CREATE INDEX IF NOT EXISTS idx_groups_updated_at ON groups(updated_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_groups_owner_id ON groups(owner_id);
               `);
-              console.log('[Database] Groups table created successfully');
+              logger.debug('[Database] Groups table created successfully');
             } catch (createError) {
               console.error('[Database] Failed to create groups table:', createError);
               return [];
@@ -1157,7 +1156,7 @@ export async function saveGroups(
               CREATE INDEX IF NOT EXISTS idx_groups_updated_at ON groups(updated_at DESC);
               CREATE INDEX IF NOT EXISTS idx_groups_owner_id ON groups(owner_id);
             `);
-            console.log('[Database] Groups table created successfully');
+            logger.debug('[Database] Groups table created successfully');
           } catch (createError) {
             console.error('[Database] Failed to create groups table:', createError);
             return; // Can't proceed without the table
@@ -1609,7 +1608,7 @@ export async function saveConversations(
     });
 
     if (__DEV__) {
-      console.log(`[Database] Saved ${conversations.length} conversations`);
+      logger.debug(`[Database] Saved ${conversations.length} conversations`);
     }
   } catch (error) {
     console.error('[Database] Error saving conversations:', error);
@@ -1863,7 +1862,7 @@ export async function saveUsers(
             await dbToUse.execAsync(`
               CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
             `);
-            console.log('[Database] Users table created successfully');
+            logger.debug('[Database] Users table created successfully');
           } catch (createError) {
             console.error('[Database] Failed to create users table:', createError);
             return; // Can't proceed without the table
@@ -2007,7 +2006,7 @@ export async function saveUsers(
     });
 
     if (__DEV__) {
-      console.log(`[Database] Saved ${users.length} users`);
+      logger.debug(`[Database] Saved ${users.length} users`);
     }
   } catch (error) {
     console.error('[Database] Error saving users:', error);
@@ -2066,20 +2065,20 @@ export async function getPendingMessages(): Promise<DatabaseMessage[]> {
         
         // ✅ CRITICAL FIX: Filter out messages that are currently being sent by handleSend
         // Import dynamically to avoid circular dependency
-        const { getMessagesBeingSent } = await import('./messageRetryService');
+        const { getMessagesBeingSent } = await import('./outboxService');
         const messagesBeingSent = getMessagesBeingSent();
         
-        console.log(`[Database] 📋 getPendingMessages: Found ${allMessages?.length || 0} pending messages | ${messagesBeingSent.size} currently being sent`);
+        logger.debug(`[Database] 📋 getPendingMessages: Found ${allMessages?.length || 0} pending messages | ${messagesBeingSent.size} currently being sent`);
         
         const messages = (allMessages || []).filter(msg => {
           if (messagesBeingSent.has(msg.id)) {
-            console.log(`[Database] ⏭️ Excluding message ${msg.id} from pending - currently being sent by handleSend | Content: "${msg.message?.substring(0, 50)}"`);
+            logger.debug(`[Database] ⏭️ Excluding message ${msg.id} from pending - currently being sent by handleSend | Content: "${msg.message?.substring(0, 50)}"`);
             return false;
           }
           return true;
         });
         
-        console.log(`[Database] ✅ getPendingMessages: Returning ${messages.length} messages after filtering (excluded ${(allMessages?.length || 0) - messages.length})`);
+        logger.debug(`[Database] ✅ getPendingMessages: Returning ${messages.length} messages after filtering (excluded ${(allMessages?.length || 0) - messages.length})`);
         
         return messages;
       } catch (queryError: any) {
@@ -2448,7 +2447,7 @@ export async function updateMessageByServerId(
     });
     
     if (__DEV__) {
-      console.log(`[Database] Updated message with server_id ${serverId}`);
+      logger.debug(`[Database] Updated message with server_id ${serverId}`);
     }
   } catch (error) {
     console.error('[Database] Error updating message by server_id:', error);
@@ -2529,7 +2528,7 @@ export async function deleteMessage(
     });
     
     if (__DEV__) {
-      console.log(`[Database] Deleted message: server_id=${serverId}, local_id=${localId}`);
+      logger.debug(`[Database] Deleted message: server_id=${serverId}, local_id=${localId}`);
     }
   } catch (error) {
     console.error('[Database] Error deleting message:', error);
@@ -2766,7 +2765,7 @@ export async function fixDuplicateMessagesWithWrongTimestamps(
     });
 
     if (__DEV__) {
-      console.log(`[Database] Fixed ${fixed} timestamps and removed ${removed} duplicates for conversation ${conversationId}`);
+      logger.debug(`[Database] Fixed ${fixed} timestamps and removed ${removed} duplicates for conversation ${conversationId}`);
     }
 
     return { fixed, removed };
@@ -2787,7 +2786,7 @@ export async function clearDatabase(): Promise<void> {
       DELETE FROM sync_state;
     `);
     if (__DEV__) {
-      console.log('[Database] Cleared all data');
+      logger.debug('[Database] Cleared all data');
     }
   } catch (error) {
     console.error('[Database] Error clearing database:', error);

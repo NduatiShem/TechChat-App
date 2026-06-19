@@ -1,6 +1,6 @@
 import * as SQLite from 'expo-sqlite';
 
-export const DB_VERSION = 3;
+export const DB_VERSION = 4;
 
 export async function runMigrations(db: SQLite.SQLiteDatabase): Promise<void> {
   const result = await db.getFirstAsync<{ user_version: number }>(
@@ -18,6 +18,10 @@ export async function runMigrations(db: SQLite.SQLiteDatabase): Promise<void> {
   
   if (currentVersion < 3) {
     await migrateToVersion3(db);
+  }
+
+  if (currentVersion < 4) {
+    await migrateToVersion4(db);
   }
 }
 
@@ -161,6 +165,39 @@ async function migrateToVersion3(db: SQLite.SQLiteDatabase): Promise<void> {
   await db.execAsync(`
     CREATE INDEX IF NOT EXISTS idx_groups_updated_at ON groups(updated_at DESC);
     CREATE INDEX IF NOT EXISTS idx_groups_owner_id ON groups(owner_id);
+  `);
+
+  await db.execAsync(`PRAGMA user_version = 3`);
+}
+
+async function migrateToVersion4(db: SQLite.SQLiteDatabase): Promise<void> {
+  // Idempotent send key on messages (links UI row to server dedup)
+  try {
+    await db.execAsync(`ALTER TABLE messages ADD COLUMN client_message_id TEXT`);
+  } catch {
+    // Column may already exist
+  }
+
+  await db.execAsync(`
+    CREATE TABLE IF NOT EXISTS message_outbox (
+      client_message_id TEXT PRIMARY KEY,
+      local_message_id INTEGER,
+      conversation_id INTEGER NOT NULL,
+      conversation_type TEXT NOT NULL CHECK(conversation_type IN ('individual', 'group')),
+      payload_json TEXT NOT NULL,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      last_attempt_at TEXT,
+      status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'sending', 'synced', 'failed')),
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (local_message_id) REFERENCES messages(id) ON DELETE CASCADE
+    );
+  `);
+
+  await db.execAsync(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_client_message_id
+      ON messages(client_message_id) WHERE client_message_id IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_outbox_status ON message_outbox(status);
+    CREATE INDEX IF NOT EXISTS idx_outbox_local_message ON message_outbox(local_message_id);
   `);
 
   await db.execAsync(`PRAGMA user_version = ${DB_VERSION}`);
