@@ -1,5 +1,39 @@
 import type { MessageOutboxRow, OutboxPayload, OutboxStatus } from '@/types/database';
-import { getDb, writeQueue, validateDatabase } from './database';
+import {
+  getDb,
+  isRecoverableDbWriteError,
+  repairDatabaseSchema,
+  retryWithBackoff,
+  validateDatabase,
+  writeQueue,
+} from './database';
+
+async function runOutboxWrite<T>(operation: () => Promise<T>): Promise<T> {
+  const attempt = async () => {
+    const database = await getDb();
+    if (!database) {
+      throw new Error('Database unavailable');
+    }
+
+    return writeQueue.enqueue(async () => {
+      const db = await getDb();
+      if (!db || !(await validateDatabase(db))) {
+        throw new Error('Database unavailable');
+      }
+      return retryWithBackoff(operation);
+    });
+  };
+
+  try {
+    return await attempt();
+  } catch (error) {
+    if (!isRecoverableDbWriteError(error)) {
+      throw error;
+    }
+    await repairDatabaseSchema();
+    return attempt();
+  }
+}
 
 export async function upsertOutboxEntry(params: {
   clientMessageId: string;
@@ -8,18 +42,17 @@ export async function upsertOutboxEntry(params: {
   conversationType: 'individual' | 'group';
   payload: OutboxPayload;
 }): Promise<void> {
-  const database = await getDb();
-  if (!database) return;
-
   const payloadJson = JSON.stringify(params.payload);
   const localMessageId =
     params.localMessageId != null && params.localMessageId > 0
       ? params.localMessageId
       : null;
 
-  await writeQueue.enqueue(async () => {
+  await runOutboxWrite(async () => {
     const db = await getDb();
-    if (!db || !(await validateDatabase(db))) return;
+    if (!db) {
+      throw new Error('Database unavailable');
+    }
 
     await db.runAsync(
       `INSERT INTO message_outbox (

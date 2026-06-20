@@ -2,7 +2,8 @@ import UserAvatar from '@/components/UserAvatar';
 import { useAuth } from '@/context/AuthContext';
 import { useTheme } from '@/context/ThemeContext';
 import { usersAPI } from '@/services/api';
-import { getUsers as getDbUsers, initDatabase, saveUsers as saveDbUsers } from '@/services/database';
+import { getUsers as getDbUsers, saveUsers as saveDbUsers } from '@/services/database';
+import { useDatabaseInit } from '@/hooks/useDatabaseInit';
 import { MaterialCommunityIcons } from '@expo/vector-icons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { router } from 'expo-router';
@@ -34,33 +35,11 @@ export default function UsersScreen() {
   const [filteredUsers, setFilteredUsers] = useState<User[]>([]);
   const [searchQuery, setSearchQuery] = useState('');
   const [isLoading, setIsLoading] = useState(true);
-  const [dbInitialized, setDbInitialized] = useState(false);
+  const dbInitialized = useDatabaseInit();
   const { user } = useAuth();
   const { currentTheme } = useTheme();
 
   const isDark = currentTheme === 'dark';
-
-  // Initialize database on mount
-  useEffect(() => {
-    let mounted = true;
-    const initDb = async () => {
-      try {
-        await initDatabase();
-        if (mounted) {
-          setDbInitialized(true);
-        }
-      } catch (error) {
-        console.error('[Users] Failed to initialize database:', error);
-        if (mounted) {
-          setDbInitialized(true); // Still allow app to work
-        }
-      }
-    };
-    initDb();
-    return () => {
-      mounted = false;
-    };
-  }, []);
 
   // ✅ HYBRID CACHE: Load from AsyncStorage (fastest, instant display)
   const loadAsyncStorageUsers = async (): Promise<User[]> => {

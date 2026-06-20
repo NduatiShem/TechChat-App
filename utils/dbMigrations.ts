@@ -23,6 +23,14 @@ export async function runMigrations(db: SQLite.SQLiteDatabase): Promise<void> {
   if (currentVersion < 4) {
     await migrateToVersion4(db);
   }
+
+  // Repair partial upgrades where user_version was bumped but objects are missing
+  await ensureSchemaIntegrity(db);
+}
+
+/** Idempotently ensure v4 outbox schema exists (fixes stale user_version on upgraded installs). */
+export async function ensureSchemaIntegrity(db: SQLite.SQLiteDatabase): Promise<void> {
+  await applyVersion4Schema(db);
 }
 
 async function migrateToVersion1(db: SQLite.SQLiteDatabase): Promise<void> {
@@ -171,7 +179,10 @@ async function migrateToVersion3(db: SQLite.SQLiteDatabase): Promise<void> {
 }
 
 async function migrateToVersion4(db: SQLite.SQLiteDatabase): Promise<void> {
-  // Idempotent send key on messages (links UI row to server dedup)
+  await applyVersion4Schema(db);
+}
+
+async function applyVersion4Schema(db: SQLite.SQLiteDatabase): Promise<void> {
   try {
     await db.execAsync(`ALTER TABLE messages ADD COLUMN client_message_id TEXT`);
   } catch {

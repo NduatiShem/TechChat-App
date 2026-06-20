@@ -4,7 +4,8 @@ import { useAuth } from '@/context/AuthContext';
 import { useNotifications } from '@/context/NotificationContext';
 import { useTheme } from '@/context/ThemeContext';
 import { groupsAPI } from '@/services/api';
-import { getGroups as getDbGroups, initDatabase, saveGroups as saveDbGroups } from '@/services/database';
+import { getGroups as getDbGroups, saveGroups as saveDbGroups } from '@/services/database';
+import { useDatabaseInit } from '@/hooks/useDatabaseInit';
 import { MaterialCommunityIcons } from '@expo/vector-icons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import NetInfo from '@react-native-community/netinfo';
@@ -62,29 +63,7 @@ export default function GroupsScreen() {
   const { updateGroupUnreadCount } = useNotifications();
 
   const isDark = currentTheme === 'dark';
-  const [dbInitialized, setDbInitialized] = useState(false);
-
-  // Initialize database on mount
-  useEffect(() => {
-    let mounted = true;
-    const initDb = async () => {
-      try {
-        await initDatabase();
-        if (mounted) {
-          setDbInitialized(true);
-        }
-      } catch (error) {
-        console.error('[Groups] Failed to initialize database:', error);
-        if (mounted) {
-          setDbInitialized(true);
-        }
-      }
-    };
-    initDb();
-    return () => {
-      mounted = false;
-    };
-  }, []);
+  const dbInitialized = useDatabaseInit();
 
   // ✅ HYBRID CACHE: Load from AsyncStorage (fastest, instant display)
   const loadAsyncStorageGroups = async (): Promise<Group[]> => {

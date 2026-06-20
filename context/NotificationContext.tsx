@@ -8,6 +8,19 @@ import * as Notifications from 'expo-notifications';
 import React, { createContext, ReactNode, useCallback, useContext, useEffect, useRef, useState } from 'react';
 import { AppState, AppStateStatus, Platform } from 'react-native';
 
+const NOTIFICATION_CHANNEL_ID = 'techchat-messages';
+
+const getConversationNotificationId = (conversationId: number | string): string =>
+  `conv-${conversationId}`;
+
+const formatNotificationBody = (body: string, unreadCount?: number): string => {
+  if (unreadCount && unreadCount > 1) {
+    return `${unreadCount} new messages · ${body}`;
+  }
+
+  return body;
+};
+
 interface NotificationContextType {
   unreadCount: number;
   groupUnreadCount: number; // Total unread count for groups only
@@ -28,8 +41,18 @@ interface NotificationContextType {
     isExpoGo: boolean;
     errors: string[];
   }>;
-  scheduleLocalNotification: (title: string, body: string, data?: any) => Promise<void>;
-  showForegroundNotification: (title: string, body: string, data?: any) => Promise<void>;
+  scheduleLocalNotification: (
+    title: string,
+    body: string,
+    data?: Record<string, unknown>,
+    options?: { conversationId?: number; unreadCount?: number },
+  ) => Promise<void>;
+  showForegroundNotification: (
+    title: string,
+    body: string,
+    data?: Record<string, unknown>,
+    options?: { conversationId?: number; unreadCount?: number },
+  ) => Promise<void>;
   getExpoPushToken: () => Promise<string | null>;
   triggerPushTokenRegistration: (options?: {
     forceRefresh?: boolean;
@@ -115,6 +138,10 @@ export const NotificationProvider: React.FC<NotificationProviderProps> = ({ chil
       updateAppBadge(total);
       
       return newCounts;
+    });
+
+    Notifications.dismissNotificationAsync(getConversationNotificationId(conversationId)).catch(() => {
+      // Notification may already be cleared by the user.
     });
   };
 
@@ -750,32 +777,57 @@ export const NotificationProvider: React.FC<NotificationProviderProps> = ({ chil
     }
   };
 
-  const scheduleLocalNotification = async (title: string, body: string, data?: any) => {
+  const postClusteredNotification = async (
+    title: string,
+    body: string,
+    data?: Record<string, unknown>,
+    options?: { conversationId?: number; unreadCount?: number; badge?: number },
+  ) => {
+    const conversationId =
+      options?.conversationId ??
+      Number(data?.conversation_id ?? data?.conversationId ?? NaN);
+    const hasConversationId = Number.isFinite(conversationId);
+    const identifier = hasConversationId
+      ? getConversationNotificationId(conversationId)
+      : 'techchat-summary';
+    const displayBody = formatNotificationBody(body, options?.unreadCount);
+
     await Notifications.scheduleNotificationAsync({
+      identifier,
       content: {
         title,
-        body,
+        body: displayBody,
         data,
         sound: true,
-        badge: unreadCount + 1,
+        badge: options?.badge ?? unreadCount + 1,
+        ...(Platform.OS === 'ios' && hasConversationId
+          ? { threadIdentifier: identifier }
+          : {}),
       },
-      trigger: null, // Send immediately
+      trigger:
+        Platform.OS === 'android'
+          ? { channelId: NOTIFICATION_CHANNEL_ID }
+          : null,
     });
   };
 
-  const showForegroundNotification = async (title: string, body: string, data?: any) => {
+  const scheduleLocalNotification = async (
+    title: string,
+    body: string,
+    data?: Record<string, unknown>,
+    options?: { conversationId?: number; unreadCount?: number },
+  ) => {
+    await postClusteredNotification(title, body, data, options);
+  };
+
+  const showForegroundNotification = async (
+    title: string,
+    body: string,
+    data?: Record<string, unknown>,
+    options?: { conversationId?: number; unreadCount?: number },
+  ) => {
     try {
-      // Show notification even when app is in foreground
-      await Notifications.scheduleNotificationAsync({
-        content: {
-          title,
-          body,
-          data,
-          sound: true,
-          badge: unreadCount + 1,
-        },
-        trigger: null, // Send immediately
-      });
+      await postClusteredNotification(title, body, data, options);
     } catch (error) {
       console.error('Error showing foreground notification:', error);
     }
@@ -814,6 +866,16 @@ export const NotificationProvider: React.FC<NotificationProviderProps> = ({ chil
     
     const initializeNotifications = async () => {
       try {
+        if (Platform.OS === 'android') {
+          await Notifications.setNotificationChannelAsync(NOTIFICATION_CHANNEL_ID, {
+            name: 'Messages',
+            description: 'New messages and notifications from TechChat',
+            importance: Notifications.AndroidImportance.HIGH,
+            vibrationPattern: [0, 250, 250, 250],
+            lightColor: '#283891FF',
+          });
+        }
+
         // Add small delay to ensure everything is initialized
         await new Promise(resolve => setTimeout(resolve, 100));
         
@@ -914,11 +976,14 @@ export const NotificationProvider: React.FC<NotificationProviderProps> = ({ chil
               }
             }
             
+            let conversationUnreadCount: number | undefined;
+
             // Update unread count for the conversation
             if (conversationId && typeof conversationId === 'number') {
               try {
                 // Increment unread count
                 const newCount = (conversationCounts[conversationId] || 0) + 1;
+                conversationUnreadCount = newCount;
                 updateUnreadCount(conversationId, newCount);
                 
                 // Update badge count - use total unread count
@@ -937,33 +1002,38 @@ export const NotificationProvider: React.FC<NotificationProviderProps> = ({ chil
               }
             }
             
-            // Only show notification if:
-            // 1. App is in background, OR
-            // 2. App is in foreground but user is NOT viewing this conversation
-            const isAppInBackground = appState !== 'active';
+            // Only show a local notification while the app is open in the foreground.
+            // Background pushes are already displayed by FCM / the system tray.
             const isViewingThisConversation = conversationId === activeConversationId;
-            const shouldShowNotification = isAppInBackground || !isViewingThisConversation;
+            const shouldShowLocalNotification =
+              appState === 'active' && !isViewingThisConversation;
             
-            if (shouldShowNotification) {
-              const title = (data.sender_name as string) || 'New Message';
+            if (shouldShowLocalNotification) {
+              const title = (data.sender_name as string) || notification.request.content.title || 'New Message';
               const body = notification.request.content.body || 'You have a new message';
               
-              console.log('Showing notification for new message:', { 
+              console.log('Showing foreground notification for new message:', {
                 title, 
                 body, 
                 appState, 
                 conversationId, 
                 activeConversationId,
-                isViewingThisConversation 
+                isViewingThisConversation,
+                conversationUnreadCount,
               });
               
-              // Small delay to ensure the notification shows
               setTimeout(() => {
-                showForegroundNotification(title, body, data).catch((err: unknown) => {
+                showForegroundNotification(title, body, data, {
+                  conversationId:
+                    conversationId && typeof conversationId === 'number'
+                      ? conversationId
+                      : undefined,
+                  unreadCount: conversationUnreadCount,
+                }).catch((err: unknown) => {
                   console.error('Error showing foreground notification:', err);
                 });
               }, 100);
-            } else {
+            } else if (appState === 'active' && isViewingThisConversation) {
               console.log('Suppressing notification - user is viewing this conversation:', {
                 conversationId,
                 activeConversationId,

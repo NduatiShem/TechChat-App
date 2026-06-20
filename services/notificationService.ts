@@ -31,11 +31,18 @@ export class NotificationService {
     // Show local notification with updated badge count
     const title = conversation.is_group ? conversation.name : conversation.name;
     const body = message.message || 'New message';
+    const unreadCount = currentCount + 1;
     
     await scheduleLocalNotification(title, body, {
+      conversation_id: conversation.id,
       conversationId: conversation.id,
+      message_id: message.id,
       messageId: message.id,
-      type: conversation.is_group ? 'group' : 'user'
+      type: 'new_message',
+      is_group: conversation.is_group,
+    }, {
+      conversationId: conversation.id,
+      unreadCount,
     });
   }
 

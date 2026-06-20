@@ -12,7 +12,7 @@ import { useAuth } from '@/context/AuthContext';
 import { useNotifications } from '@/context/NotificationContext';
 import { useTheme } from '@/context/ThemeContext';
 import { messagesAPI, usersAPI } from '@/services/api';
-import { deleteMessage as deleteDbMessage, initDatabase, updateMessageByServerId } from '@/services/database';
+import { deleteMessage as deleteDbMessage, updateMessageByServerId } from '@/services/database';
 import { retryFailedMessage as retryFailedMessageViaOutbox } from '@/services/messageRetryService';
 import { enqueueOutgoingMessage } from '@/services/outboxService';
 import {
@@ -28,6 +28,7 @@ import {
   useOutboxSync,
   deduplicateMessages,
 } from '@/hooks/useChatMessages';
+import { useDatabaseInit } from '@/hooks/useDatabaseInit';
 import { generateClientMessageId } from '@/utils/clientMessageId';
 import { getCachedAuthUserId } from '@/utils/cachedAuthUser';
 import { isLocalPending } from '@/utils/messageIdentity';
@@ -187,30 +188,8 @@ export default function UserChatScreen() {
   const [currentPage, setCurrentPage] = useState(1);
   const [hasMoreMessages, setHasMoreMessages] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
-  const [dbInitialized, setDbInitialized] = useState(false);
+  const dbInitialized = useDatabaseInit();
   const [loadedMessagesCount, setLoadedMessagesCount] = useState(0);
-
-  // Initialize database on mount
-  useEffect(() => {
-    let mounted = true;
-    const initDb = async () => {
-      try {
-        await initDatabase();
-        if (mounted) {
-          setDbInitialized(true);
-        }
-      } catch (error) {
-        console.error('[UserChat] Failed to initialize database:', error);
-        if (mounted) {
-          setDbInitialized(true); // Still allow app to work
-        }
-      }
-    };
-    initDb();
-    return () => {
-      mounted = false;
-    };
-  }, []);
 
   // Debug: Log when userInfo changes
   useEffect(() => {
@@ -1100,9 +1079,7 @@ export default function UserChatScreen() {
       
       Alert.alert(
         'Error',
-        error?.message?.includes('runAsync')
-          ? 'Could not save message locally. Please restart the app and try again.'
-          : 'Failed to save message. Please try again.',
+        'Failed to send message. Please check your connection and try again.',
         [{ text: 'OK' }]
       );
     }

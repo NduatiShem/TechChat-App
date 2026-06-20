@@ -12,7 +12,7 @@ import { useAuth } from '@/context/AuthContext';
 import { useNotifications } from '@/context/NotificationContext';
 import { useTheme } from '@/context/ThemeContext';
 import { groupsAPI, messagesAPI, usersAPI } from '@/services/api';
-import { deleteMessage as deleteDbMessage, initDatabase, updateMessageByServerId } from '@/services/database';
+import { deleteMessage as deleteDbMessage, updateMessageByServerId } from '@/services/database';
 import { retryFailedMessage as retryFailedMessageViaOutbox } from '@/services/messageRetryService';
 import { enqueueOutgoingMessage } from '@/services/outboxService';
 import {
@@ -28,6 +28,7 @@ import {
   useOutboxSync,
   deduplicateMessages,
 } from '@/hooks/useChatMessages';
+import { useDatabaseInit } from '@/hooks/useDatabaseInit';
 import { generateClientMessageId } from '@/utils/clientMessageId';
 import { getCachedAuthUserId } from '@/utils/cachedAuthUser';
 import { markGroupChatAsRead } from '@/services/markReadService';
@@ -196,30 +197,8 @@ export default function GroupChatScreen() {
   const [currentPage, setCurrentPage] = useState(1);
   const [hasMoreMessages, setHasMoreMessages] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
-  const [dbInitialized, setDbInitialized] = useState(false);
+  const dbInitialized = useDatabaseInit();
   const [loadedMessagesCount, setLoadedMessagesCount] = useState(0);
-
-  // Initialize database on mount
-  useEffect(() => {
-    let mounted = true;
-    const initDb = async () => {
-      try {
-        await initDatabase();
-        if (mounted) {
-          setDbInitialized(true);
-        }
-      } catch (error) {
-        console.error('[GroupChat] Failed to initialize database:', error);
-        if (mounted) {
-          setDbInitialized(true); // Still allow app to work
-        }
-      }
-    };
-    initDb();
-    return () => {
-      mounted = false;
-    };
-  }, []);
 
   // Load messages from local database first (instant display)
   const loadMessagesFromDb = useCallback(async (limit: number = MESSAGES_PER_PAGE): Promise<Message[]> => {
@@ -965,7 +944,7 @@ export default function GroupChatScreen() {
       const error = e as Error;
       console.error('[GroupChat] Error in handleSend:', error);
       setSending(false);
-      Alert.alert('Error', 'Failed to save message. Please try again.', [{ text: 'OK' }]);
+      Alert.alert('Error', 'Failed to send message. Please check your connection and try again.', [{ text: 'OK' }]);
     }
   };
 

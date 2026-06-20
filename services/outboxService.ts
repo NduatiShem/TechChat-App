@@ -124,17 +124,76 @@ export async function enqueueOutgoingMessage(params: {
   conversationType: 'individual' | 'group';
   payload: OutboxPayload;
 }): Promise<void> {
-  await upsertOutboxEntry({
-    clientMessageId: params.clientMessageId,
-    localMessageId: params.localMessageId,
-    conversationId: params.conversationId,
-    conversationType: params.conversationType,
-    payload: params.payload,
-  });
-  if (shouldLogOutbox) {
-    logger.debug('[Outbox] Enqueued', params.clientMessageId, params.localMessageId);
+  try {
+    await upsertOutboxEntry({
+      clientMessageId: params.clientMessageId,
+      localMessageId: params.localMessageId,
+      conversationId: params.conversationId,
+      conversationType: params.conversationType,
+      payload: params.payload,
+    });
+    if (shouldLogOutbox) {
+      logger.debug('[Outbox] Enqueued', params.clientMessageId, params.localMessageId);
+    }
+    kickOutboxWorker();
+  } catch (error) {
+    logger.warn('[Outbox] Local enqueue failed, sending directly:', error);
+    await sendPayloadDirectly(params);
   }
-  kickOutboxWorker();
+}
+
+async function sendPayloadDirectly(params: {
+  clientMessageId: string;
+  localMessageId: number | null;
+  payload: OutboxPayload;
+}): Promise<void> {
+  const { clientMessageId, localMessageId, payload } = params;
+  const net = await NetInfo.fetch();
+  if (!net.isConnected) {
+    throw new Error('Offline and local storage unavailable. Please try again when online.');
+  }
+
+  const formData = buildFormData(payload, clientMessageId);
+
+  try {
+    const res = await messagesAPI.sendMessage(formData);
+
+    if (res.status >= 200 && res.status < 300) {
+      const { id: serverId, created_at: serverCreatedAt } = extractServerMessageId(res.data);
+      if (localMessageId && serverId) {
+        await updateMessageStatus(localMessageId, serverId, 'synced', serverCreatedAt);
+      }
+      emit({
+        clientMessageId,
+        localMessageId: localMessageId ?? 0,
+        serverId,
+        serverCreatedAt,
+        status: 'synced',
+      });
+      if (shouldLogOutbox) {
+        logger.debug('[Outbox] Direct send synced', clientMessageId, serverId);
+      }
+    }
+  } catch (error: unknown) {
+    const err = error as { response?: { status?: number; data?: unknown }; message?: string };
+    if (err.response?.status === 409) {
+      const { id: serverId, created_at: serverCreatedAt } = extractServerMessageId(err.response.data);
+      if (serverId) {
+        if (localMessageId) {
+          await updateMessageStatus(localMessageId, serverId, 'synced', serverCreatedAt);
+        }
+        emit({
+          clientMessageId,
+          localMessageId: localMessageId ?? 0,
+          serverId,
+          serverCreatedAt,
+          status: 'synced',
+        });
+        return;
+      }
+    }
+    throw error;
+  }
 }
 
 export async function requeueOutboxMessage(clientMessageId: string): Promise<void> {

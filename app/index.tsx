@@ -4,9 +4,10 @@ import { useAuth } from '@/context/AuthContext';
 import { useNotifications } from '@/context/NotificationContext';
 import { useTheme } from '@/context/ThemeContext';
 import { conversationsAPI } from '@/services/api';
-import { getConversations as getDbConversations, initDatabase, isDatabaseEmpty, saveConversations as saveDbConversations } from '@/services/database';
+import { getConversations as getDbConversations, isDatabaseEmpty, saveConversations as saveDbConversations } from '@/services/database';
 import { syncConversations, startBackgroundBulkSync } from '@/services/syncService';
 import { runAsyncStorageMigration } from '@/utils/migrateAsyncStorage';
+import { useDatabaseInit } from '@/hooks/useDatabaseInit';
 import { MaterialCommunityIcons } from '@expo/vector-icons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import NetInfo from '@react-native-community/netinfo';
@@ -69,32 +70,14 @@ export default function ConversationsScreen() {
   const { requestPermissions, conversationCounts, updateUnreadCount } = useNotifications();
 
   const isDark = currentTheme === 'dark';
-  const [dbInitialized, setDbInitialized] = useState(false);
+  const dbInitialized = useDatabaseInit();
 
-  // Initialize database on mount
   useEffect(() => {
-    let mounted = true;
-    const initDb = async () => {
-      try {
-        await initDatabase();
-        // Run migration from AsyncStorage on first launch
-        await runAsyncStorageMigration();
-        if (mounted) {
-          setDbInitialized(true);
-        }
-      } catch (error) {
-        console.error('[Conversations] Failed to initialize database:', error);
-        // Fallback: still allow app to work with AsyncStorage
-        if (mounted) {
-          setDbInitialized(true);
-        }
-      }
-    };
-    initDb();
-    return () => {
-      mounted = false;
-    };
-  }, []);
+    if (!dbInitialized) return;
+    runAsyncStorageMigration().catch((error) => {
+      console.error('[Conversations] AsyncStorage migration failed:', error);
+    });
+  }, [dbInitialized]);
 
   // Deduplicate conversations helper
   const deduplicateConversations = useCallback((convs: Conversation[]): Conversation[] => {

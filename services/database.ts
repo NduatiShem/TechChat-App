@@ -1,5 +1,5 @@
 import type { DatabaseAttachment, DatabaseConversation, DatabaseGroup, DatabaseMessage, MessageWithAttachments, SavedMessageResult, SyncState } from '@/types/database';
-import { runMigrations } from '@/utils/dbMigrations';
+import { ensureSchemaIntegrity, runMigrations } from '@/utils/dbMigrations';
 import { logger } from '@/utils/logger';
 import * as SQLite from 'expo-sqlite';
 
@@ -115,6 +115,29 @@ export async function retryWithBackoff<T>(
   throw lastError;
 }
 
+export function isRecoverableDbWriteError(error: unknown): boolean {
+  if (!error) return false;
+  const errorMessage =
+    (error as { message?: string })?.message || String(error) || '';
+  return (
+    isDatabaseLockedError(error) ||
+    errorMessage.includes('runAsync') ||
+    errorMessage.includes('no such table') ||
+    errorMessage.includes('no such column') ||
+    errorMessage.includes('NullPointerException') ||
+    errorMessage.includes('Database unavailable')
+  );
+}
+
+async function verifyOutboxSchema(database: SQLite.SQLiteDatabase): Promise<boolean> {
+  try {
+    await database.getFirstAsync('SELECT 1 FROM message_outbox LIMIT 1');
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // CRITICAL FIX: Database health check function
 export async function validateDatabase(database: SQLite.SQLiteDatabase | null): Promise<boolean> {
   if (!database) {
@@ -127,7 +150,8 @@ export async function validateDatabase(database: SQLite.SQLiteDatabase | null): 
   } catch (error: any) {
     if (error?.message?.includes('NullPointerException') || 
         error?.message?.includes('prepareAsync') ||
-        error?.message?.includes('execAsync')) {
+        error?.message?.includes('execAsync') ||
+        error?.message?.includes('runAsync')) {
       return false;
     }
     throw error;
@@ -140,6 +164,11 @@ export async function initDatabase(): Promise<SQLite.SQLiteDatabase | null> {
     // CRITICAL FIX: Validate database is still valid
     const isValid = await validateDatabase(db);
     if (isValid) {
+      try {
+        await ensureSchemaIntegrity(db);
+      } catch (schemaError) {
+        console.warn('[Database] Schema repair on existing connection failed:', schemaError);
+      }
       return db;
     } else {
       // Database is invalid, reset it
@@ -209,6 +238,13 @@ export async function initDatabase(): Promise<SQLite.SQLiteDatabase | null> {
         }
         throw migrationError;
       }
+
+      try {
+        await ensureSchemaIntegrity(database);
+      } catch (schemaError) {
+        console.error('[Database] Schema integrity check failed:', schemaError);
+        throw schemaError;
+      }
       
       db = database;
       
@@ -232,6 +268,36 @@ export async function initDatabase(): Promise<SQLite.SQLiteDatabase | null> {
   })();
   
   return await initPromise;
+}
+
+/** Initialize DB and confirm outbox schema is usable (for UI gating). */
+export async function initDatabaseReady(): Promise<boolean> {
+  const database = await initDatabase();
+  if (!database) return false;
+  if (await verifyOutboxSchema(database)) return true;
+
+  try {
+    await ensureSchemaIntegrity(database);
+    return await verifyOutboxSchema(database);
+  } catch (error) {
+    console.error('[Database] initDatabaseReady schema verification failed:', error);
+    return false;
+  }
+}
+
+/** Reset connection and re-run migrations + schema repair. */
+export async function repairDatabaseSchema(): Promise<SQLite.SQLiteDatabase | null> {
+  if (db) {
+    try {
+      await db.closeAsync();
+    } catch {
+      // ignore
+    }
+  }
+  db = null;
+  isInitializing = false;
+  initPromise = null;
+  return initDatabase();
 }
 
 export async function getDb(): Promise<SQLite.SQLiteDatabase | null> {

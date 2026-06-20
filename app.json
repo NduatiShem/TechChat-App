@@ -2,7 +2,7 @@
   "expo": {
     "name": "TechChat",
     "slug": "techchat",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "sdkVersion": "54.0.0",
     "orientation": "portrait",
     "icon": "./assets/images/healtclassique-icon.png",
@@ -63,7 +63,7 @@
       "icon": "./assets/ic_launcher/android/ic_launcher-web.png",
       "color": "#283891",
       "iosDisplayInForeground": true,
-      "androidMode": "default",
+      "androidMode": "collapse",
       "androidCollapsedTitle": "TechChat",
       "androidChannelId": "techchat-messages",
       "androidChannelName": "Messages",
