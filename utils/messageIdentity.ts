@@ -7,13 +7,25 @@ export interface IdentifiableMessage {
   sync_status?: MessageSyncStatus;
 }
 
-/** Stable dedup / merge key: server id wins, then client id, then local id */
+/**
+ * Stable dedup / merge key.
+ *
+ * client_message_id MUST take precedence over server_id: it is the only
+ * identifier shared by an optimistic message and its server echo (realtime /
+ * API). If we keyed by server_id first, the optimistic row (which has no
+ * server_id until the outbox reconciles it) and its server copy would get
+ * different keys and both survive in the in-memory list — showing the message
+ * twice until a full app restart rebuilds state from SQLite (which already
+ * upserts by client_message_id). Keying by client_message_id first collapses
+ * them immediately. UUIDs are globally unique, so this never collides across
+ * distinct messages, including those received from other users.
+ */
 export function getMessageKey(msg: IdentifiableMessage): string {
-  if (msg.server_id != null) {
-    return `server:${msg.server_id}`;
-  }
   if (msg.client_message_id) {
     return `client:${msg.client_message_id}`;
+  }
+  if (msg.server_id != null) {
+    return `server:${msg.server_id}`;
   }
   if (msg.id != null && msg.id !== 0) {
     return `local:${msg.id}`;

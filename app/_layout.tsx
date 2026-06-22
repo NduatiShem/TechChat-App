@@ -16,7 +16,6 @@ import { UpdateNotification } from "@/components/UpdateNotification";
 // ✅ NEW: Retry service removed - users can manually retry failed messages from UI
 import { initDatabase } from "@/services/database";
 import { initSentry, Sentry } from "@/services/sentry";
-import { startBackgroundBulkSync } from "@/services/syncService";
 import NetInfo from '@react-native-community/netinfo';
 import "../global.css";
 
@@ -128,28 +127,19 @@ function AppTabsLayout() {
           const { initRealtimeService } = await import('@/services/realtimeService');
           initRealtimeService();
           
-          // ✅ BULK SYNC: Start background bulk sync after database is initialized
-          // Check network status first, then start sync if online
+          // ✅ HISTORY BACKFILL: Start the resumable, throttled backfill scheduler.
+          // It trickles older messages into SQLite in the background (after interactions),
+          // is resumable across restarts, and never blocks the UI.
           setTimeout(async () => {
             try {
-              const netState = await NetInfo.fetch();
-              const isOnline = netState.isConnected ?? false;
-              
-              if (isOnline && user?.id) {
-                console.log('[AppTabsLayout] Starting background bulk sync...');
-                // Start bulk sync in background (non-blocking)
-                // Only sync if SQLite is mostly empty (first time setup)
-                startBackgroundBulkSync(user.id, {
-                  onlyIfEmpty: true, // Only sync if SQLite has < 100 messages
-                  maxConversations: undefined // Sync all conversations
-                });
-              } else {
-                console.log('[AppTabsLayout] Skipping bulk sync - offline or no user');
+              if (user?.id) {
+                const { startBackfillScheduler } = await import('@/services/syncService');
+                startBackfillScheduler(user.id);
               }
             } catch (error) {
-              console.error('[AppTabsLayout] Error starting bulk sync:', error);
+              console.error('[AppTabsLayout] Error starting backfill scheduler:', error);
             }
-          }, 2000); // Wait 2 seconds after database init to start bulk sync
+          }, 2000); // Let first paint settle before starting background sync
         } else {
           console.error('[AppTabsLayout] Database initialization failed after retries, retry service not started');
         }
@@ -178,20 +168,18 @@ function AppTabsLayout() {
           
           // ✅ NEW: Retry service removed - users can manually retry failed messages from UI
           
-          // ✅ BULK SYNC: Start background bulk sync when app comes to foreground (if online)
-          // This ensures any missing messages are synced when user returns to app
+          // ✅ FOREGROUND: only ensure the resumable backfill scheduler is running.
+          // Heavy "sync everything from page 1" no longer runs on each foreground;
+          // the cheap delta sync for the open chat is handled by the chat screen.
           if (user?.id) {
-            NetInfo.fetch().then(netState => {
+            NetInfo.fetch().then(async netState => {
               const isOnline = netState.isConnected ?? false;
-              if (isOnline) {
-                console.log('[AppTabsLayout] App came to foreground, starting background bulk sync...');
-                startBackgroundBulkSync(user.id, {
-                  onlyIfEmpty: false, // Always sync when app comes to foreground
-                  maxConversations: undefined // Sync all conversations
-                });
+              if (isOnline && user?.id) {
+                const { startBackfillScheduler } = await import('@/services/syncService');
+                startBackfillScheduler(user.id);
               }
             }).catch(err => {
-              console.error('[AppTabsLayout] Error checking network for bulk sync:', err);
+              console.error('[AppTabsLayout] Error checking network for backfill:', err);
             });
           }
           

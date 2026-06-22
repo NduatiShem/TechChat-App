@@ -39,7 +39,7 @@ import {
 } from '@/utils/chatMessageOwnership';
 import { markUserChatAsRead } from '@/services/markReadService';
 import { subscribeConversationChannel, onRealtimeMessage, handleRealtimeMessage, isRealtimeConnected } from '@/services/realtimeService';
-import { syncOlderMessages } from '@/services/syncService';
+import { syncOlderMessages, pauseBackfill, resumeBackfill } from '@/services/syncService';
 import { isVideoAttachment } from '@/utils/textUtils';
 import { MaterialCommunityIcons, MaterialIcons } from '@expo/vector-icons';
 import { useFocusEffect } from '@react-navigation/native';
@@ -190,6 +190,9 @@ export default function UserChatScreen() {
   const [loadingMore, setLoadingMore] = useState(false);
   const dbInitialized = useDatabaseInit();
   const [loadedMessagesCount, setLoadedMessagesCount] = useState(0);
+  // Distinguishes a genuinely empty conversation from a network/server problem,
+  // so we never show "No messages yet" when it's really an offline/API issue.
+  const [loadError, setLoadError] = useState<'offline' | 'error' | null>(null);
 
   // Debug: Log when userInfo changes
   useEffect(() => {
@@ -197,14 +200,42 @@ export default function UserChatScreen() {
   }, [userInfo]);
 
   const loadMessagesFromDb = useCallback(async (limit: number = MESSAGES_PER_PAGE): Promise<Message[]> => {
-    if (!dbInitialized) return [];
+    // Don't gate on the async dbInitialized flag: loadMessagesFromCache → getDb()
+    // initializes the DB on demand, so cached messages render even on a cold/offline open.
     try {
       return (await loadMessagesFromCache(Number(id), 'individual', limit)) as Message[];
     } catch (error) {
       console.error('[UserChat] Error loading messages from database:', error);
       return [];
     }
-  }, [id, dbInitialized]);
+  }, [id]);
+
+  // Pause the background history backfill while this chat is mounted so foreground
+  // interactions (scrolling, sending, live sync) always take priority over trickle sync.
+  useEffect(() => {
+    pauseBackfill();
+    return () => {
+      resumeBackfill();
+    };
+  }, []);
+
+  // If the DB finishes initializing after the screen opened with nothing rendered yet,
+  // hydrate from cache so an offline open never stays stuck on an empty screen.
+  useEffect(() => {
+    if (!dbInitialized || messagesLengthRef.current > 0) return;
+    let cancelled = false;
+    (async () => {
+      const cached = await loadMessagesFromDb(MESSAGES_PER_PAGE);
+      if (!cancelled && cached.length > 0) {
+        setMessages(cached);
+        messagesLengthRef.current = cached.length;
+        setLoadedMessagesCount(cached.length);
+        latestMessageIdRef.current = cached[cached.length - 1].id;
+        setLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [dbInitialized, loadMessagesFromDb]);
 
   // Cache-first: SQLite immediately, then API merge (stale-while-revalidate)
   const fetchMessages = useCallback(async (showLoading = true) => {
@@ -213,21 +244,21 @@ export default function UserChatScreen() {
       setLoading(true);
     }
 
-    if (dbInitialized) {
-      try {
-        const cached = await loadMessagesFromDb(MESSAGES_PER_PAGE);
-        if (cached.length > 0) {
-          setMessages(cached);
-          messagesLengthRef.current = cached.length;
-          setLoadedMessagesCount(cached.length);
-          latestMessageIdRef.current = cached[cached.length - 1].id;
-          if (showLoading) {
-            setLoading(false);
-          }
+    // Cache-first, unconditionally (getDb initializes on demand). This guarantees
+    // saved messages render instantly even on a cold or offline open.
+    try {
+      const cached = await loadMessagesFromDb(MESSAGES_PER_PAGE);
+      if (cached.length > 0) {
+        setMessages(cached);
+        messagesLengthRef.current = cached.length;
+        setLoadedMessagesCount(cached.length);
+        latestMessageIdRef.current = cached[cached.length - 1].id;
+        if (showLoading) {
+          setLoading(false);
         }
-      } catch (cacheError) {
-        console.error('[UserChat] Cache-first load failed:', cacheError);
       }
+    } catch (cacheError) {
+      console.error('[UserChat] Cache-first load failed:', cacheError);
     }
     
     // Background API fetch (source of truth)
@@ -301,12 +332,12 @@ export default function UserChatScreen() {
         return enriched;
       });
       
-      if (dbInitialized) {
-        try {
-          await persistApiMessages(Number(id), 'individual', apiMessages);
-        } catch (dbError) {
-          console.error('[UserChat] Error saving messages to database:', dbError);
-        }
+      // Always cache to SQLite so messages are available offline (saveMessages
+      // no-ops safely if the DB isn't ready yet).
+      try {
+        await persistApiMessages(Number(id), 'individual', apiMessages);
+      } catch (dbError) {
+        console.error('[UserChat] Error saving messages to database:', dbError);
       }
       
       // Set user info
@@ -351,6 +382,7 @@ export default function UserChatScreen() {
     // STEP 2: Handle API result or fallback to SQLite
     // ✅ CRITICAL FIX: Use the captured isActuallyInitialLoad from the start of the function
     if (apiSuccess) {
+      setLoadError(null);
       setMessages(prev => {
         const merged = mergeMessagesWithPending(apiMessages, prev) as Message[];
         messagesLengthRef.current = merged.length;
@@ -366,8 +398,13 @@ export default function UserChatScreen() {
         setLoading(false);
       }
     } else {
-      // ❌ API failed - fallback to SQLite
-      if (dbInitialized) {
+      // ❌ API failed - mark why (offline vs server error) so the UI can explain it
+      // instead of showing the misleading "No messages yet" placeholder.
+      const isOffline = !apiError?.response;
+      setLoadError(isOffline ? 'offline' : 'error');
+
+      // Fallback to SQLite (getDb initializes on demand; not gated on dbInitialized).
+      {
         try {
           const sqliteMessages = await loadMessagesFromDb(MESSAGES_PER_PAGE);
           
@@ -408,16 +445,6 @@ export default function UserChatScreen() {
           if (showLoading) {
             setLoading(false);
           }
-        }
-      } else {
-        // Keep last rendered messages if available while backend is unavailable.
-        if (messagesLengthRef.current === 0) {
-          setMessages([]);
-          messagesLengthRef.current = 0;
-        }
-        
-        if (showLoading) {
-          setLoading(false);
         }
       }
       
@@ -1024,27 +1051,48 @@ export default function UserChatScreen() {
     };
 
   try {
+      // Optimistic UI first: the message appears immediately as "pending" and stays
+      // visible even when offline or when local storage is unavailable.
+      setMessages(prev => deduplicateMessages([...prev, uiMessage].sort((a, b) =>
+        new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
+      )));
+
+      setInput('');
+      setAttachment(null);
+      setVoiceRecording(null);
+      setReplyingTo(null);
+      setShowEmoji(false);
+      setSending(false);
+
+      Keyboard.dismiss();
+      isAtBottomRef.current = true;
+      requestAnimationFrame(() => {
+        setTimeout(() => scrollToBottom(true), attachment || voiceRecording ? 200 : 50);
+      });
+
       let localMessageId: number | null = null;
-      if (dbInitialized) {
-        try {
-          const saved = await persistOutgoingMessage(Number(id), 'individual', {
-            client_message_id: clientMessageId,
-            sender_id: senderId,
-            receiver_id: Number(id),
-            message: messageText || null,
-            created_at: now,
-            reply_to_id: replySnapshot?.id ?? null,
-            attachments: localAttachments as any,
-          });
-          if (saved[0]?.localMessageId) {
-            localMessageId = saved[0].localMessageId;
-            uiMessage.id = localMessageId;
-          }
-        } catch (dbError) {
-          console.error('[UserChat] Error saving to SQLite:', dbError);
+      try {
+        const saved = await persistOutgoingMessage(Number(id), 'individual', {
+          client_message_id: clientMessageId,
+          sender_id: senderId,
+          receiver_id: Number(id),
+          message: messageText || null,
+          created_at: now,
+          reply_to_id: replySnapshot?.id ?? null,
+          attachments: localAttachments as any,
+        });
+        if (saved[0]?.localMessageId) {
+          localMessageId = saved[0].localMessageId;
+          // Patch the optimistic row with its real local id (needed for retry/dismiss).
+          setMessages(prev => prev.map(m =>
+            m.client_message_id === clientMessageId ? { ...m, id: localMessageId! } : m
+          ));
         }
+      } catch (dbError) {
+        console.error('[UserChat] Error saving to SQLite (message stays pending):', dbError);
       }
 
+      // enqueueOutgoingMessage never throws while offline — it queues for retry.
       await enqueueOutgoingMessage({
         clientMessageId,
         localMessageId,
@@ -1053,35 +1101,16 @@ export default function UserChatScreen() {
         payload: outboxPayload,
       });
 
-      setMessages(prev => deduplicateMessages([...prev, uiMessage].sort((a, b) =>
-        new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
-      )));
-      
-      setInput('');
-      setAttachment(null);
-      setVoiceRecording(null);
-      setReplyingTo(null);
-      setShowEmoji(false);
-      setSending(false);
-      
-      Keyboard.dismiss();
-      isAtBottomRef.current = true;
-      requestAnimationFrame(() => {
-        setTimeout(() => scrollToBottom(true), attachment || voiceRecording ? 200 : 50);
-      });
-
       usersAPI.updateLastSeen().catch(() => {});
-      
+
     } catch (e: unknown) {
       const error = e as any;
       console.error('[UserChat] Error in handleSend:', error?.message ?? error);
       setSending(false);
-      
-      Alert.alert(
-        'Error',
-        'Failed to send message. Please check your connection and try again.',
-        [{ text: 'OK' }]
-      );
+      // Don't block the user with an alert; mark the message failed so they can retry.
+      setMessages(prev => prev.map(m =>
+        m.client_message_id === clientMessageId ? { ...m, sync_status: 'failed' as const } : m
+      ));
     }
   };
 
@@ -2395,24 +2424,37 @@ export default function UserChatScreen() {
                   </View>
                 ) : null
               }
-              ListEmptyComponent={() => (
-                <View style={{
-                  flex: 1,
+              ListEmptyComponent={null}
+            />
+            {!loading && messages.length === 0 && (
+              <View
+                pointerEvents="none"
+                style={{
+                  position: 'absolute',
+                  top: 0,
+                  left: 0,
+                  right: 0,
+                  bottom: 0,
                   justifyContent: 'center',
                   alignItems: 'center',
-                  paddingVertical: 40,
-                  transform: [{ scaleY: -1 }],
-                }}>
-                  <Text style={{
+                  paddingHorizontal: 32,
+                }}
+              >
+                <Text
+                  style={{
                     color: isDark ? '#9CA3AF' : '#6B7280',
                     fontSize: 16,
                     textAlign: 'center',
-                  }}>
-                    No messages yet. Start a conversation!
-                  </Text>
-                </View>
-              )}
-            />
+                  }}
+                >
+                  {loadError === 'offline'
+                    ? "You're offline. New messages will appear once you're back online."
+                    : loadError === 'error'
+                      ? "Couldn't load messages. Pull down or try again shortly."
+                      : 'No messages yet. Start a conversation!'}
+                </Text>
+              </View>
+            )}
           </TouchableOpacity>
         )}
         {/* Edit Message Preview */}

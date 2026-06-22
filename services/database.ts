@@ -6,6 +6,7 @@ import * as SQLite from 'expo-sqlite';
 let db: SQLite.SQLiteDatabase | null = null;
 let isInitializing = false; // Add initialization lock
 let initPromise: Promise<SQLite.SQLiteDatabase | null> | null = null; // Track ongoing initialization
+let schemaEnsured = false; // Run idempotent schema repair only once per healthy session
 
 // Database operation queue to serialize write operations and prevent locks
 type QueueOperation<T> = () => Promise<T>;
@@ -164,10 +165,13 @@ export async function initDatabase(): Promise<SQLite.SQLiteDatabase | null> {
     // CRITICAL FIX: Validate database is still valid
     const isValid = await validateDatabase(db);
     if (isValid) {
-      try {
-        await ensureSchemaIntegrity(db);
-      } catch (schemaError) {
-        console.warn('[Database] Schema repair on existing connection failed:', schemaError);
+      if (!schemaEnsured) {
+        try {
+          await ensureSchemaIntegrity(db);
+          schemaEnsured = true;
+        } catch (schemaError) {
+          console.warn('[Database] Schema repair on existing connection failed:', schemaError);
+        }
       }
       return db;
     } else {
@@ -241,6 +245,7 @@ export async function initDatabase(): Promise<SQLite.SQLiteDatabase | null> {
 
       try {
         await ensureSchemaIntegrity(database);
+        schemaEnsured = true;
       } catch (schemaError) {
         console.error('[Database] Schema integrity check failed:', schemaError);
         throw schemaError;
@@ -297,6 +302,7 @@ export async function repairDatabaseSchema(): Promise<SQLite.SQLiteDatabase | nu
   db = null;
   isInitializing = false;
   initPromise = null;
+  schemaEnsured = false; // force a fresh schema repair after a reset
   return initDatabase();
 }
 
@@ -1781,6 +1787,87 @@ export async function updateSyncState(
   } catch (error) {
     if (!isDatabaseLockedError(error)) {
       console.error('[Database] Error updating sync state:', error);
+    }
+  }
+}
+
+/**
+ * Read the resumable backfill cursor for a conversation.
+ * Defaults to page 1 / not complete when no sync_state row exists yet.
+ */
+export async function getBackfillState(
+  conversationId: number,
+  conversationType: 'individual' | 'group'
+): Promise<{ backfillPage: number; backfillComplete: boolean }> {
+  const fallback = { backfillPage: 1, backfillComplete: false };
+  try {
+    const database = await getDb();
+    if (!database) return fallback;
+    const row = await database.getFirstAsync<{ backfill_page: number; backfill_complete: number }>(
+      `SELECT backfill_page, backfill_complete FROM sync_state
+       WHERE conversation_id = ? AND conversation_type = ?`,
+      [conversationId, conversationType]
+    );
+    if (!row) return fallback;
+    return {
+      backfillPage: row.backfill_page ?? 1,
+      backfillComplete: (row.backfill_complete ?? 0) === 1,
+    };
+  } catch (error) {
+    if (!isDatabaseLockedError(error)) {
+      console.error('[Database] Error reading backfill state:', error);
+    }
+    return fallback;
+  }
+}
+
+/** Persist the resumable backfill cursor for a conversation. */
+export async function setBackfillState(
+  conversationId: number,
+  conversationType: 'individual' | 'group',
+  backfillPage: number,
+  backfillComplete: boolean
+): Promise<void> {
+  try {
+    const database = await getDb();
+    if (!database) return;
+    const dbRef = database;
+    await retryWithBackoff(async () => {
+      await writeQueue.enqueue(async () => {
+        let dbToUse: SQLite.SQLiteDatabase | null = dbRef;
+        if (!dbToUse) {
+          dbToUse = await getDb();
+          if (!dbToUse) return;
+        }
+        if (!(await validateDatabase(dbToUse)) || !dbToUse) return;
+        const validDb = dbToUse;
+
+        const existing = await validDb.getFirstAsync<{ conversation_id: number }>(
+          `SELECT conversation_id FROM sync_state
+           WHERE conversation_id = ? AND conversation_type = ?`,
+          [conversationId, conversationType]
+        );
+
+        if (existing) {
+          await validDb.runAsync(
+            `UPDATE sync_state SET backfill_page = ?, backfill_complete = ?
+             WHERE conversation_id = ? AND conversation_type = ?`,
+            [backfillPage, backfillComplete ? 1 : 0, conversationId, conversationType]
+          );
+        } else {
+          await validDb.runAsync(
+            `INSERT INTO sync_state (
+              conversation_id, conversation_type, last_sync_timestamp, sync_status,
+              backfill_page, backfill_complete
+            ) VALUES (?, ?, datetime('now'), 'synced', ?, ?)`,
+            [conversationId, conversationType, backfillPage, backfillComplete ? 1 : 0]
+          );
+        }
+      });
+    });
+  } catch (error) {
+    if (!isDatabaseLockedError(error)) {
+      console.error('[Database] Error setting backfill state:', error);
     }
   }
 }

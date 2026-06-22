@@ -33,7 +33,7 @@ import { generateClientMessageId } from '@/utils/clientMessageId';
 import { getCachedAuthUserId } from '@/utils/cachedAuthUser';
 import { markGroupChatAsRead } from '@/services/markReadService';
 import { subscribeConversationChannel, onRealtimeMessage, handleRealtimeMessage, isRealtimeConnected } from '@/services/realtimeService';
-import { syncConversationMessages } from '@/services/syncService';
+import { syncConversationMessages, pauseBackfill, resumeBackfill } from '@/services/syncService';
 import { isVideoAttachment } from '@/utils/textUtils';
 import { MaterialCommunityIcons, MaterialIcons } from '@expo/vector-icons';
 import { useFocusEffect } from '@react-navigation/native';
@@ -199,17 +199,46 @@ export default function GroupChatScreen() {
   const [loadingMore, setLoadingMore] = useState(false);
   const dbInitialized = useDatabaseInit();
   const [loadedMessagesCount, setLoadedMessagesCount] = useState(0);
+  // Distinguishes a genuinely empty conversation from a network/server problem.
+  const [loadError, setLoadError] = useState<'offline' | 'error' | null>(null);
 
-  // Load messages from local database first (instant display)
+  // Load messages from local database first (instant display).
+  // Not gated on dbInitialized: loadMessagesFromCache → getDb() initializes on demand,
+  // so cached messages render even on a cold/offline open.
   const loadMessagesFromDb = useCallback(async (limit: number = MESSAGES_PER_PAGE): Promise<Message[]> => {
-    if (!dbInitialized) return [];
     try {
       return (await loadMessagesFromCache(Number(id), 'group', limit)) as Message[];
     } catch (error) {
       console.error('[GroupChat] Error loading messages from database:', error);
       return [];
     }
-  }, [id, dbInitialized]);
+  }, [id]);
+
+  // Pause the background history backfill while this chat is mounted so foreground
+  // interactions always take priority over trickle sync.
+  useEffect(() => {
+    pauseBackfill();
+    return () => {
+      resumeBackfill();
+    };
+  }, []);
+
+  // Hydrate from cache once the DB is ready if nothing has rendered yet.
+  useEffect(() => {
+    if (!dbInitialized || messagesLengthRef.current > 0) return;
+    let cancelled = false;
+    (async () => {
+      const cached = await loadMessagesFromDb(MESSAGES_PER_PAGE);
+      if (!cancelled && cached.length > 0) {
+        setMessages(cached);
+        messagesLengthRef.current = cached.length;
+        setLoadedMessagesCount(cached.length);
+        latestMessageIdRef.current = cached[cached.length - 1].id;
+        setLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [dbInitialized, loadMessagesFromDb]);
 
   // Fetch messages
   // ✅ API-FIRST STRATEGY: Try API first, fallback to SQLite only if API fails
@@ -219,19 +248,18 @@ export default function GroupChatScreen() {
       setLoading(true);
     }
 
-    if (dbInitialized) {
-      try {
-        const cached = await loadMessagesFromDb(MESSAGES_PER_PAGE);
-        if (cached.length > 0) {
-          setMessages(cached);
-          messagesLengthRef.current = cached.length;
-          setLoadedMessagesCount(cached.length);
-          latestMessageIdRef.current = cached[cached.length - 1].id;
-          if (showLoading) setLoading(false);
-        }
-      } catch (cacheError) {
-        console.error('[GroupChat] Cache-first load failed:', cacheError);
+    // Cache-first, unconditionally (getDb initializes on demand).
+    try {
+      const cached = await loadMessagesFromDb(MESSAGES_PER_PAGE);
+      if (cached.length > 0) {
+        setMessages(cached);
+        messagesLengthRef.current = cached.length;
+        setLoadedMessagesCount(cached.length);
+        latestMessageIdRef.current = cached[cached.length - 1].id;
+        if (showLoading) setLoading(false);
       }
+    } catch (cacheError) {
+      console.error('[GroupChat] Cache-first load failed:', cacheError);
     }
     
     // Background API fetch
@@ -280,12 +308,11 @@ export default function GroupChatScreen() {
       apiMessages = mapApiMessages(processedMessages) as Message[];
       apiSuccess = true;
 
-      if (dbInitialized) {
-        try {
-          await persistApiMessages(Number(id), 'group', apiMessages);
-        } catch (dbError) {
-          console.error('[GroupChat] Error saving messages to database:', dbError);
-        }
+      // Always cache to SQLite so messages are available offline.
+      try {
+        await persistApiMessages(Number(id), 'group', apiMessages);
+      } catch (dbError) {
+        console.error('[GroupChat] Error saving messages to database:', dbError);
       }
       
       // Set group info
@@ -304,6 +331,7 @@ export default function GroupChatScreen() {
     
     // STEP 2: Handle API result or fallback to SQLite
     if (apiSuccess) {
+      setLoadError(null);
       setMessages(prev => {
         const merged = mergeMessagesWithPending(apiMessages, prev) as Message[];
         messagesLengthRef.current = merged.length;
@@ -324,8 +352,12 @@ export default function GroupChatScreen() {
         setLoading(false);
       }
     } else {
-      // ❌ API failed - fallback to SQLite
-      if (dbInitialized) {
+      // ❌ API failed - record reason (offline vs server error) for the UI.
+      const isOffline = !apiError?.response;
+      setLoadError(isOffline ? 'offline' : 'error');
+
+      // Fallback to SQLite (getDb initializes on demand).
+      {
         try {
           const sqliteMessages = await loadMessagesFromDb(MESSAGES_PER_PAGE);
           
@@ -371,16 +403,6 @@ export default function GroupChatScreen() {
           if (showLoading) {
             setLoading(false);
           }
-        }
-      } else {
-        // Keep last rendered messages if available while backend is unavailable.
-        if (messagesLengthRef.current === 0) {
-          setMessages([]);
-          messagesLengthRef.current = 0;
-        }
-        
-        if (showLoading) {
-          setLoading(false);
         }
       }
       
@@ -895,35 +917,7 @@ export default function GroupChatScreen() {
     };
 
     try {
-      let localMessageId: number | null = null;
-      if (dbInitialized) {
-        try {
-          const saved = await persistOutgoingMessage(Number(id), 'group', {
-            client_message_id: clientMessageId,
-            sender_id: senderId,
-            group_id: Number(id),
-            message: messageText || null,
-            created_at: now,
-            reply_to_id: replySnapshot?.id ?? null,
-            attachments: localAttachments as any,
-          });
-          if (saved[0]?.localMessageId) {
-            localMessageId = saved[0].localMessageId;
-            uiMessage.id = localMessageId;
-          }
-        } catch (dbError) {
-          console.error('[GroupChat] Error saving to SQLite:', dbError);
-        }
-      }
-
-      await enqueueOutgoingMessage({
-        clientMessageId,
-        localMessageId,
-        conversationId: Number(id),
-        conversationType: 'group',
-        payload: outboxPayload,
-      });
-
+      // Optimistic UI first: show the message immediately as "pending", even offline.
       setMessages(prev => deduplicateMessages([...prev, uiMessage].sort((a, b) =>
         new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
       )));
@@ -938,13 +932,44 @@ export default function GroupChatScreen() {
       isAtBottomRef.current = true;
       requestAnimationFrame(() => setTimeout(() => scrollToBottom(true), attachment || voiceRecording ? 200 : 50));
 
+      let localMessageId: number | null = null;
+      try {
+        const saved = await persistOutgoingMessage(Number(id), 'group', {
+          client_message_id: clientMessageId,
+          sender_id: senderId,
+          group_id: Number(id),
+          message: messageText || null,
+          created_at: now,
+          reply_to_id: replySnapshot?.id ?? null,
+          attachments: localAttachments as any,
+        });
+        if (saved[0]?.localMessageId) {
+          localMessageId = saved[0].localMessageId;
+          setMessages(prev => prev.map(m =>
+            m.client_message_id === clientMessageId ? { ...m, id: localMessageId! } : m
+          ));
+        }
+      } catch (dbError) {
+        console.error('[GroupChat] Error saving to SQLite (message stays pending):', dbError);
+      }
+
+      await enqueueOutgoingMessage({
+        clientMessageId,
+        localMessageId,
+        conversationId: Number(id),
+        conversationType: 'group',
+        payload: outboxPayload,
+      });
+
       usersAPI.updateLastSeen().catch(() => {});
 
     } catch (e: unknown) {
       const error = e as Error;
       console.error('[GroupChat] Error in handleSend:', error);
       setSending(false);
-      Alert.alert('Error', 'Failed to send message. Please check your connection and try again.', [{ text: 'OK' }]);
+      setMessages(prev => prev.map(m =>
+        m.client_message_id === clientMessageId ? { ...m, sync_status: 'failed' as const } : m
+      ));
     }
   };
 
@@ -2378,6 +2403,35 @@ export default function GroupChatScreen() {
                 ) : null
               }
             />
+            {!loading && messages.length === 0 && (
+              <View
+                pointerEvents="none"
+                style={{
+                  position: 'absolute',
+                  top: 0,
+                  left: 0,
+                  right: 0,
+                  bottom: 0,
+                  justifyContent: 'center',
+                  alignItems: 'center',
+                  paddingHorizontal: 32,
+                }}
+              >
+                <Text
+                  style={{
+                    color: isDark ? '#9CA3AF' : '#6B7280',
+                    fontSize: 16,
+                    textAlign: 'center',
+                  }}
+                >
+                  {loadError === 'offline'
+                    ? "You're offline. New messages will appear once you're back online."
+                    : loadError === 'error'
+                      ? "Couldn't load messages. Pull down or try again shortly."
+                      : 'No messages yet. Start a conversation!'}
+                </Text>
+              </View>
+            )}
           </TouchableOpacity>
         )}
         

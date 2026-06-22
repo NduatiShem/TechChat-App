@@ -80,6 +80,14 @@ export interface SyncState {
   last_sync_timestamp: string;
   sync_status: 'synced' | 'syncing' | 'failed';
   last_error?: string;
+  backfill_page?: number;
+  backfill_complete?: number;
+  oldest_synced_at?: string | null;
+}
+
+export interface BackfillState {
+  backfillPage: number;
+  backfillComplete: boolean;
 }
 
 export interface DatabaseGroup {

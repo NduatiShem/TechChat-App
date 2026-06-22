@@ -1,9 +1,13 @@
 import type { DatabaseMessage } from '@/types/database';
 import { logger } from '@/utils/logger';
+import { InteractionManager } from 'react-native';
+import NetInfo from '@react-native-community/netinfo';
 import { conversationsAPI, messagesAPI } from './api';
 import {
     deleteMessage,
     getDb,
+    getBackfillState,
+    setBackfillState,
     getConversations,
     saveConversations,
     saveMessages,
@@ -359,7 +363,8 @@ export async function syncOlderMessages(
   conversationType: 'individual' | 'group',
   page: number = 1,
   perPage: number = 50,
-  currentUserId: number = 0
+  currentUserId: number = 0,
+  skipDeletionCheck: boolean = false
 ): Promise<{ success: boolean; messagesCount: number; deletedCount?: number; hasMore: boolean; error?: string }> {
   try {
     let response;
@@ -401,12 +406,16 @@ export async function syncOlderMessages(
     }));
 
     await saveMessages(messagesToSave);
-    
-    // Remove messages that exist locally but were deleted on the server
-    // Note: For pagination, we only check deletions for the current page's messages
-    // Full deletion check should be done in syncConversationMessages (page 1)
-    const serverIds = messagesToSave.map(msg => msg.server_id!).filter(Boolean);
-    const deletedCount = await removeDeletedMessages(conversationId, conversationType, serverIds, currentUserId);
+
+    // IMPORTANT: deletion detection compares a single page's IDs against ALL local
+    // messages, so running it on a partial/older page would wrongly delete history.
+    // The backfill is purely additive (skipDeletionCheck = true); full reconciliation
+    // happens in syncConversationMessages (page 1).
+    let deletedCount = 0;
+    if (!skipDeletionCheck) {
+      const serverIds = messagesToSave.map(msg => msg.server_id!).filter(Boolean);
+      deletedCount = await removeDeletedMessages(conversationId, conversationType, serverIds, currentUserId);
+    }
 
     if (__DEV__) {
       logger.debug(`[Sync] Synced ${messagesToSave.length} older messages, removed ${deletedCount} deleted messages for ${conversationType} ${conversationId}`);
@@ -548,60 +557,167 @@ export async function bulkSyncAllMessages(
   }
 }
 
+// ---------------------------------------------------------------------------
+// Resumable historical backfill
+//
+// Instead of re-downloading every message from page 1 on each run (slow, blocks
+// the UI, repeats work), we keep a per-conversation cursor in sync_state and walk
+// older pages a little at a time. It is:
+//   - Resumable:  survives app restarts (cursor persisted in SQLite)
+//   - Idempotent: saveMessages upserts by server_id, so overlapping pages are safe
+//   - Throttled:  a few pages per conversation per tick, after interactions
+//   - Pausable:   yields to active chat interactions
+// ---------------------------------------------------------------------------
+
+let backfillRunning = false;
+let backfillPausedDepth = 0;
+let backfillInterval: ReturnType<typeof setInterval> | null = null;
+
+const BACKFILL_PAGE_SIZE = 50;
+const BACKFILL_PAGE_DELAY_MS = 250;
+const BACKFILL_CONVO_DELAY_MS = 400;
+const BACKFILL_PAGES_PER_CONVO_PER_TICK = 3; // trickle to keep each tick light
+const BACKFILL_MAX_PAGES = 200; // hard safety: up to 10k msgs/conversation
+const BACKFILL_INTERVAL_MS = 20000;
+
+/** Pause the historical backfill (e.g. while a chat screen is actively fetching). */
+export function pauseBackfill(): void {
+  backfillPausedDepth += 1;
+}
+
+/** Resume the historical backfill once active interaction is done. */
+export function resumeBackfill(): void {
+  backfillPausedDepth = Math.max(0, backfillPausedDepth - 1);
+}
+
+async function waitWhilePaused(): Promise<void> {
+  while (backfillPausedDepth > 0) {
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+}
+
 /**
- * Background bulk sync - runs when app starts or network comes back
- * Syncs in background without blocking UI
- * 
- * @param currentUserId - Current user ID
- * @param options - Sync options
+ * Perform one throttled pass of the resumable backfill across all conversations.
+ * Safe to call repeatedly; it picks up from each conversation's saved cursor.
+ */
+export async function runResumableBackfill(currentUserId: number): Promise<void> {
+  if (backfillRunning) return;
+  backfillRunning = true;
+
+  try {
+    const net = await NetInfo.fetch();
+    if (!net.isConnected) return;
+
+    const conversations = await getConversations();
+    if (conversations.length === 0) return;
+
+    for (const conv of conversations) {
+      const { backfillComplete, backfillPage } = await getBackfillState(
+        conv.conversation_id,
+        conv.conversation_type
+      );
+      if (backfillComplete) continue;
+
+      let page = backfillPage;
+      let pagesThisTick = 0;
+      let hasMore = true;
+
+      while (
+        hasMore &&
+        page <= BACKFILL_MAX_PAGES &&
+        pagesThisTick < BACKFILL_PAGES_PER_CONVO_PER_TICK
+      ) {
+        await waitWhilePaused();
+
+        const stillOnline = await NetInfo.fetch();
+        if (!stillOnline.isConnected) return;
+
+        const result = await syncOlderMessages(
+          conv.conversation_id,
+          conv.conversation_type,
+          page,
+          BACKFILL_PAGE_SIZE,
+          currentUserId,
+          true // additive backfill: never run deletion detection on partial pages
+        );
+
+        if (!result.success) {
+          // Transient failure — leave the cursor where it is and retry next tick.
+          break;
+        }
+
+        hasMore = result.hasMore;
+        page += 1;
+        await setBackfillState(
+          conv.conversation_id,
+          conv.conversation_type,
+          page,
+          !hasMore
+        );
+
+        if (!hasMore && __DEV__) {
+          logger.debug(`[Backfill] Completed ${conv.conversation_type} ${conv.conversation_id}`);
+        }
+
+        pagesThisTick += 1;
+        await new Promise((resolve) => setTimeout(resolve, BACKFILL_PAGE_DELAY_MS));
+      }
+
+      if (page > BACKFILL_MAX_PAGES) {
+        // Reached the safety ceiling; consider this conversation done.
+        await setBackfillState(conv.conversation_id, conv.conversation_type, page, true);
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, BACKFILL_CONVO_DELAY_MS));
+    }
+  } catch (error) {
+    console.error('[Backfill] Error during resumable backfill:', error);
+  } finally {
+    backfillRunning = false;
+  }
+}
+
+/**
+ * Start the background backfill scheduler. Idempotent — safe to call on every
+ * launch/foreground. Runs after interactions so it never competes with first paint.
+ */
+export function startBackfillScheduler(currentUserId: number): void {
+  // Always kick a (throttled) pass; useful on foreground/reconnect.
+  InteractionManager.runAfterInteractions(() => {
+    runResumableBackfill(currentUserId).catch(() => {});
+  });
+
+  if (backfillInterval) return;
+  backfillInterval = setInterval(() => {
+    InteractionManager.runAfterInteractions(() => {
+      runResumableBackfill(currentUserId).catch(() => {});
+    });
+  }, BACKFILL_INTERVAL_MS);
+}
+
+/** Stop the background backfill scheduler. */
+export function stopBackfillScheduler(): void {
+  if (backfillInterval) {
+    clearInterval(backfillInterval);
+    backfillInterval = null;
+  }
+}
+
+/**
+ * Backward-compatible entry point. Previously this ran a heavy full bulk sync from
+ * page 1 on every call; it now drives the resumable, throttled backfill scheduler.
  */
 export async function startBackgroundBulkSync(
   currentUserId: number,
-  options: {
-    onlyIfEmpty?: boolean; // Only sync if SQLite is mostly empty
-    maxConversations?: number; // Limit number of conversations to sync (for testing)
+  _options: {
+    onlyIfEmpty?: boolean;
+    maxConversations?: number;
   } = {}
 ): Promise<void> {
   try {
-    // Check if we should skip (if SQLite already has data)
-    if (options.onlyIfEmpty) {
-      const conversations = await getConversations();
-      if (conversations.length > 0) {
-        // Check if we have messages for at least some conversations
-        const database = await getDb();
-        if (database) {
-          const messageCount = await database.getFirstAsync<{ count: number }>(
-            `SELECT COUNT(*) as count FROM messages WHERE sync_status = 'synced'`
-          );
-          
-          // If we already have a reasonable amount of messages, skip bulk sync
-          if (messageCount && messageCount.count > 100) {
-            if (__DEV__) {
-              logger.debug(`[BulkSync] Skipping - already have ${messageCount.count} synced messages`);
-            }
-            return;
-          }
-        }
-      }
-    }
-    
-    // Run bulk sync in background (non-blocking)
-    bulkSyncAllMessages(currentUserId, (progress) => {
-      if (__DEV__) {
-        logger.debug(`[BulkSync] Progress: ${progress.conversationIndex}/${progress.totalConversations} - ${progress.conversationName} (${progress.messagesSynced} messages)`);
-      }
-    }).then(result => {
-      if (result.success) {
-        logger.debug(`[BulkSync] ✅ Background sync completed: ${result.totalSynced} messages synced`);
-      } else {
-        console.warn(`[BulkSync] ⚠️ Background sync completed with ${result.errors.length} errors: ${result.errors.slice(0, 3).join(', ')}${result.errors.length > 3 ? '...' : ''}`);
-      }
-    }).catch(error => {
-      console.error('[BulkSync] ❌ Background sync failed:', error);
-    });
-    
+    startBackfillScheduler(currentUserId);
   } catch (error) {
-    console.error('[BulkSync] Error starting background bulk sync:', error);
+    console.error('[Backfill] Error starting background backfill:', error);
   }
 }
 

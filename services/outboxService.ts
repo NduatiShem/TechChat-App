@@ -22,6 +22,22 @@ const MIN_RETRY_MS = 2000;
 const WORKER_INTERVAL_MS = 15000;
 
 const sendingClientIds = new Set<string>();
+
+/**
+ * In-memory fallback queue for messages whose local SQLite outbox write failed
+ * (e.g. corrupted/locked DB). Keeps the message alive as "pending" so the user
+ * is never told to "check your connection" while offline. The worker re-attempts
+ * the durable DB write, and direct-sends when online.
+ */
+type MemoryQueueEntry = {
+  clientMessageId: string;
+  localMessageId: number | null;
+  conversationId: number;
+  conversationType: 'individual' | 'group';
+  payload: OutboxPayload;
+};
+const memoryQueue = new Map<string, MemoryQueueEntry>();
+
 let workerInterval: ReturnType<typeof setInterval> | null = null;
 let isProcessing = false;
 let appState: AppStateStatus = 'active';
@@ -132,13 +148,75 @@ export async function enqueueOutgoingMessage(params: {
       conversationType: params.conversationType,
       payload: params.payload,
     });
+    memoryQueue.delete(params.clientMessageId);
     if (shouldLogOutbox) {
       logger.debug('[Outbox] Enqueued', params.clientMessageId, params.localMessageId);
     }
     kickOutboxWorker();
   } catch (error) {
-    logger.warn('[Outbox] Local enqueue failed, sending directly:', error);
-    await sendPayloadDirectly(params);
+    // Durable write failed. Never lose the message and never hard-fail the send:
+    // keep it in memory as pending and let the worker retry the DB write / send.
+    logger.warn('[Outbox] Local enqueue failed, holding in memory queue:', error);
+    memoryQueue.set(params.clientMessageId, {
+      clientMessageId: params.clientMessageId,
+      localMessageId: params.localMessageId,
+      conversationId: params.conversationId,
+      conversationType: params.conversationType,
+      payload: params.payload,
+    });
+
+    const net = await NetInfo.fetch();
+    if (net.isConnected) {
+      // Online: try to push immediately; if it fails it stays queued in memory.
+      try {
+        await sendPayloadDirectly(params);
+        memoryQueue.delete(params.clientMessageId);
+        return;
+      } catch (sendError) {
+        logger.warn('[Outbox] Direct send failed, will retry:', sendError);
+      }
+    }
+
+    // Offline (or direct send failed): surface as pending, schedule retries.
+    emit({
+      clientMessageId: params.clientMessageId,
+      localMessageId: params.localMessageId ?? 0,
+      status: 'pending',
+    });
+    kickOutboxWorker();
+  }
+}
+
+/** Re-attempt durable persistence (and online direct-send) for memory-queued messages. */
+async function flushMemoryQueue(): Promise<void> {
+  if (memoryQueue.size === 0) return;
+
+  const entries = Array.from(memoryQueue.values());
+  for (const entry of entries) {
+    try {
+      await upsertOutboxEntry({
+        clientMessageId: entry.clientMessageId,
+        localMessageId: entry.localMessageId,
+        conversationId: entry.conversationId,
+        conversationType: entry.conversationType,
+        payload: entry.payload,
+      });
+      memoryQueue.delete(entry.clientMessageId);
+      if (shouldLogOutbox) {
+        logger.debug('[Outbox] Memory entry persisted to DB', entry.clientMessageId);
+      }
+    } catch {
+      // Still can't persist. If online, try a direct send so the message is delivered.
+      const net = await NetInfo.fetch();
+      if (net.isConnected) {
+        try {
+          await sendPayloadDirectly(entry);
+          memoryQueue.delete(entry.clientMessageId);
+        } catch {
+          // keep for next cycle
+        }
+      }
+    }
   }
 }
 
@@ -342,6 +420,7 @@ export async function processOutboxQueue(): Promise<void> {
   if (isProcessing || appState !== 'active') return;
   isProcessing = true;
   try {
+    await flushMemoryQueue();
     const entries = await getPendingOutboxEntries(15);
     for (const entry of entries) {
       await processSingleOutboxEntry(entry);

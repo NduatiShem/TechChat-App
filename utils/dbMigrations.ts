@@ -1,6 +1,6 @@
 import * as SQLite from 'expo-sqlite';
 
-export const DB_VERSION = 4;
+export const DB_VERSION = 5;
 
 export async function runMigrations(db: SQLite.SQLiteDatabase): Promise<void> {
   const result = await db.getFirstAsync<{ user_version: number }>(
@@ -24,13 +24,18 @@ export async function runMigrations(db: SQLite.SQLiteDatabase): Promise<void> {
     await migrateToVersion4(db);
   }
 
+  if (currentVersion < 5) {
+    await migrateToVersion5(db);
+  }
+
   // Repair partial upgrades where user_version was bumped but objects are missing
   await ensureSchemaIntegrity(db);
 }
 
-/** Idempotently ensure v4 outbox schema exists (fixes stale user_version on upgraded installs). */
+/** Idempotently ensure v4/v5 schema exists (fixes stale user_version on upgraded installs). */
 export async function ensureSchemaIntegrity(db: SQLite.SQLiteDatabase): Promise<void> {
   await applyVersion4Schema(db);
+  await applyVersion5Schema(db);
 }
 
 async function migrateToVersion1(db: SQLite.SQLiteDatabase): Promise<void> {
@@ -210,6 +215,33 @@ async function applyVersion4Schema(db: SQLite.SQLiteDatabase): Promise<void> {
     CREATE INDEX IF NOT EXISTS idx_outbox_status ON message_outbox(status);
     CREATE INDEX IF NOT EXISTS idx_outbox_local_message ON message_outbox(local_message_id);
   `);
+
+  await db.execAsync(`PRAGMA user_version = 4`);
+}
+
+async function migrateToVersion5(db: SQLite.SQLiteDatabase): Promise<void> {
+  await applyVersion5Schema(db);
+}
+
+/**
+ * Resumable historical backfill cursor on sync_state.
+ * - backfill_page: next page to request from the API (page-based, newest=1)
+ * - backfill_complete: 1 once the server has no older pages left
+ * - oldest_synced_at: oldest message timestamp persisted locally (diagnostics)
+ */
+async function applyVersion5Schema(db: SQLite.SQLiteDatabase): Promise<void> {
+  const columns = [
+    `ALTER TABLE sync_state ADD COLUMN backfill_page INTEGER NOT NULL DEFAULT 1`,
+    `ALTER TABLE sync_state ADD COLUMN backfill_complete INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE sync_state ADD COLUMN oldest_synced_at TEXT`,
+  ];
+  for (const sql of columns) {
+    try {
+      await db.execAsync(sql);
+    } catch {
+      // Column already exists — safe to ignore.
+    }
+  }
 
   await db.execAsync(`PRAGMA user_version = ${DB_VERSION}`);
 }

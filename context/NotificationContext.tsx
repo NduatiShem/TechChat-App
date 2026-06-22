@@ -69,12 +69,67 @@ interface NotificationContextType {
 
 const NotificationContext = createContext<NotificationContextType | undefined>(undefined);
 
+// Module-level mirror of the conversation the user is currently viewing.
+// The notification handler below runs outside React, so it cannot read state
+// directly; we keep this in sync from setActiveConversation/clearActiveConversation.
+let activeConversationIdForHandler: number | null = null;
+
+const extractConversationId = (data: unknown): number | null => {
+  if (!data || typeof data !== 'object') return null;
+  const record = data as Record<string, unknown>;
+  const raw = record.conversation_id ?? record.conversationId;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) ? parsed : null;
+};
+
+// The native FCM/APNs device token is required for server-side per-conversation
+// notification collapsing (the Expo push token cannot carry the Android `tag`).
+// The native token is sometimes not ready at cold start (Play Services warming
+// up), so retry a few times before giving up.
+const getDevicePushTokenWithRetry = async (
+  attempts = 3,
+  baseDelayMs = 1500,
+): Promise<string | null> => {
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    try {
+      const result = await Notifications.getDevicePushTokenAsync();
+      if (result?.data) {
+        return result.data;
+      }
+    } catch (error) {
+      console.warn(`Device push token attempt ${attempt + 1}/${attempts} failed:`, error);
+    }
+
+    if (attempt < attempts - 1) {
+      await new Promise((resolve) => setTimeout(resolve, baseDelayMs * (attempt + 1)));
+    }
+  }
+
+  return null;
+};
+
 // Configure notification behavior
 Notifications.setNotificationHandler({
   handleNotification: async (notification) => {
-    console.log('Notification handler called:', notification);
-    
-    // Always show notifications, even when app is in foreground
+    // This handler only fires while the app is foregrounded. If the incoming
+    // notification belongs to the conversation the user is actively viewing,
+    // suppress the alert entirely (no banner, sound, or list entry) so the
+    // user is not interrupted by a message they can already see.
+    const data = notification.request.content.data;
+    const conversationId = extractConversationId(data);
+    const isViewingThisConversation =
+      conversationId !== null && conversationId === activeConversationIdForHandler;
+
+    if (isViewingThisConversation) {
+      return {
+        shouldShowAlert: false,
+        shouldPlaySound: false,
+        shouldSetBadge: false,
+        shouldShowBanner: false,
+        shouldShowList: false,
+      };
+    }
+
     return {
       shouldShowAlert: true,
       shouldPlaySound: true,
@@ -276,20 +331,19 @@ export const NotificationProvider: React.FC<NotificationProviderProps> = ({ chil
         console.warn('⚠️ Expo push token returned but no data field');
       }
 
-      // Attempt to get the native device push token (FCM/APNs)
+      // Attempt to get the native device push token (FCM/APNs). This is the
+      // token we prefer to register with the backend because only the native
+      // token supports per-conversation notification collapsing on Android.
       let deviceTokenError: any = null;
       try {
         console.log('🔍 [DIAGNOSTIC] Attempting to get device push token (FCM/APNs)...');
-        const deviceTokenResult = await Notifications.getDevicePushTokenAsync();
-        console.log('🔍 [DIAGNOSTIC] Device push token result:', deviceTokenResult ? 'Success' : 'Failed');
-        console.log('🔍 [DIAGNOSTIC] Device token type:', deviceTokenResult?.type);
-        console.log('🔍 [DIAGNOSTIC] Device token data:', deviceTokenResult?.data ? `${deviceTokenResult.data.substring(0, 20)}...` : 'No data');
-        
-        if (deviceTokenResult?.data) {
-          console.log(`✅ Device push token (${deviceTokenResult.type}) generated:`, deviceTokenResult.data);
-          setDevicePushToken(deviceTokenResult.data);
+        const deviceTokenData = await getDevicePushTokenWithRetry();
+
+        if (deviceTokenData) {
+          console.log('✅ Device push token (native) generated:', deviceTokenData);
+          setDevicePushToken(deviceTokenData);
         } else {
-          console.warn('⚠️ Device push token not available yet');
+          console.warn('⚠️ Device push token not available yet after retries');
         }
       } catch (error: any) {
         deviceTokenError = error;
@@ -356,7 +410,25 @@ export const NotificationProvider: React.FC<NotificationProviderProps> = ({ chil
         return false;
       }
 
-      const tokenToRegister = devicePushToken || expoPushToken;
+      // Prefer the native FCM/APNs device token on mobile. Server-side
+      // per-conversation collapsing relies on the Android notification `tag`,
+      // which Expo push tokens cannot carry. If we only have an Expo token on a
+      // mobile build, make one more attempt to obtain the native token before
+      // silently falling back to Expo.
+      let resolvedDeviceToken = devicePushToken;
+      if (!resolvedDeviceToken && Platform.OS !== 'web') {
+        resolvedDeviceToken = await getDevicePushTokenWithRetry(2, 1000);
+        if (resolvedDeviceToken) {
+          setDevicePushToken(resolvedDeviceToken);
+        } else {
+          console.warn(
+            `⚠️ Native device push token unavailable (${reason}); falling back to Expo token. ` +
+            `Per-conversation notification collapsing will not work until a native token is obtained.`,
+          );
+        }
+      }
+
+      const tokenToRegister = resolvedDeviceToken || expoPushToken;
       if (!tokenToRegister) {
         console.log(`⏳ Push token not yet available (${reason})`);
         return false;
@@ -439,8 +511,8 @@ export const NotificationProvider: React.FC<NotificationProviderProps> = ({ chil
         });
 
         const payload = {
-          fcm_token: devicePushToken ?? expoPushToken ?? undefined,
-          expo_push_token: expoPushToken && devicePushToken !== expoPushToken ? expoPushToken : undefined,
+          fcm_token: resolvedDeviceToken ?? expoPushToken ?? undefined,
+          expo_push_token: expoPushToken && resolvedDeviceToken !== expoPushToken ? expoPushToken : undefined,
           device_type: Platform.OS,
           app_version: Constants.expoConfig?.version,
           runtime_version: Constants.expoConfig?.runtimeVersion,
@@ -834,10 +906,12 @@ export const NotificationProvider: React.FC<NotificationProviderProps> = ({ chil
   };
 
   const setActiveConversation = useCallback((conversationId: number | null) => {
+    activeConversationIdForHandler = conversationId;
     setActiveConversationId(conversationId);
   }, []);
 
   const clearActiveConversation = useCallback(() => {
+    activeConversationIdForHandler = null;
     setActiveConversationId(null);
   }, []);
 
@@ -1002,42 +1076,21 @@ export const NotificationProvider: React.FC<NotificationProviderProps> = ({ chil
               }
             }
             
-            // Only show a local notification while the app is open in the foreground.
-            // Background pushes are already displayed by FCM / the system tray.
+            // Do NOT post a second local notification here. The incoming push
+            // is already displayed by the system (via the notification handler
+            // when foregrounded, or by the system tray when backgrounded) and it
+            // carries the per-conversation tag, so it collapses correctly into a
+            // single updating line. Re-posting a local copy with a different tag
+            // would produce duplicate cards. This listener only keeps the unread
+            // count and badge in sync (handled above). The handler itself
+            // suppresses the alert when the user is viewing this conversation.
             const isViewingThisConversation = conversationId === activeConversationId;
-            const shouldShowLocalNotification =
-              appState === 'active' && !isViewingThisConversation;
-            
-            if (shouldShowLocalNotification) {
-              const title = (data.sender_name as string) || notification.request.content.title || 'New Message';
-              const body = notification.request.content.body || 'You have a new message';
-              
-              console.log('Showing foreground notification for new message:', {
-                title, 
-                body, 
-                appState, 
-                conversationId, 
-                activeConversationId,
-                isViewingThisConversation,
-                conversationUnreadCount,
-              });
-              
-              setTimeout(() => {
-                showForegroundNotification(title, body, data, {
-                  conversationId:
-                    conversationId && typeof conversationId === 'number'
-                      ? conversationId
-                      : undefined,
-                  unreadCount: conversationUnreadCount,
-                }).catch((err: unknown) => {
-                  console.error('Error showing foreground notification:', err);
-                });
-              }, 100);
-            } else if (appState === 'active' && isViewingThisConversation) {
-              console.log('Suppressing notification - user is viewing this conversation:', {
+            if (appState === 'active' && isViewingThisConversation) {
+              console.log('Active conversation in foreground - alert suppressed by handler:', {
                 conversationId,
                 activeConversationId,
-                appState
+                appState,
+                conversationUnreadCount,
               });
             }
           }
