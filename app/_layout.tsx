@@ -1,8 +1,12 @@
 import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { NotificationBadge } from "@/components/NotificationBadge";
+import { ShareIntentBridge } from "@/components/ShareIntentBridge";
 import { AuthProvider, useAuth } from "@/context/AuthContext";
 import { NotificationProvider, useNotifications } from "@/context/NotificationContext";
+import { PendingShareProvider } from "@/context/PendingShareContext";
 import { ThemeProvider, useTheme } from "@/context/ThemeContext";
+import { IncomingShareHandler } from "@/components/IncomingShareHandler";
+import { ShareToModal } from "@/components/ShareToModal";
 import { usersAPI } from "@/services/api";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import { Stack, Tabs, usePathname } from "expo-router";
@@ -17,6 +21,7 @@ import { UpdateNotification } from "@/components/UpdateNotification";
 import { initDatabase } from "@/services/database";
 import { initSentry, Sentry } from "@/services/sentry";
 import NetInfo from '@react-native-community/netinfo';
+import { ShareIntentProvider } from "expo-share-intent";
 import "../global.css";
 
 // Prevent splash screen from auto-hiding
@@ -357,7 +362,7 @@ function AppLayout() {
   const { isAuthenticated, isLoading, user } = useAuth();
   const { currentTheme } = useTheme();
   const isDark = currentTheme === 'dark';
-  
+
   // Background update check - runs after app is fully loaded, non-blocking
   const { updateAvailable, isChecking, applyUpdate } = useBackgroundUpdateCheck();
   
@@ -529,13 +534,20 @@ function RootLayout() {
   return (
     <ErrorBoundary>
       <SafeAreaProvider>
-        <AuthProvider>
-          <ThemeProvider>
-            <NotificationProvider>
-              <AppLayout />
-            </NotificationProvider>
-          </ThemeProvider>
-        </AuthProvider>
+        <ShareIntentProvider options={{ resetOnBackground: false, disabled: false }}>
+          <ShareIntentBridge />
+          <AuthProvider>
+            <ThemeProvider>
+              <NotificationProvider>
+                <PendingShareProvider>
+                  <IncomingShareHandler />
+                  <ShareToModal />
+                  <AppLayout />
+                </PendingShareProvider>
+              </NotificationProvider>
+            </ThemeProvider>
+          </AuthProvider>
+        </ShareIntentProvider>
       </SafeAreaProvider>
     </ErrorBoundary>
   );

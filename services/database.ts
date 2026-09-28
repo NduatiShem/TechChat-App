@@ -2501,6 +2501,60 @@ export async function updateMessageStatus(
   }
 }
 
+export async function replaceMessageAttachments(
+  localMessageId: number,
+  attachments: Array<{
+    server_id?: number;
+    name: string;
+    mime: string;
+    url: string;
+  }>
+): Promise<void> {
+  if (!attachments.length) {
+    return;
+  }
+
+  try {
+    let database = await getDb();
+    if (!database) {
+      return;
+    }
+
+    await writeQueue.enqueue(async () => {
+      const validDb = database;
+      if (!validDb) return;
+
+      await validDb.runAsync(`DELETE FROM attachments WHERE message_id = ?`, [localMessageId]);
+
+      for (const attachment of attachments) {
+        if (!attachment.url || !attachment.name || !attachment.mime) {
+          continue;
+        }
+        await validDb.runAsync(
+          `INSERT INTO attachments (
+            server_id, message_id, name, mime, url, local_path, size, type, sync_status
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            attachment.server_id ?? null,
+            localMessageId,
+            attachment.name,
+            attachment.mime,
+            attachment.url,
+            null,
+            null,
+            null,
+            'synced',
+          ]
+        );
+      }
+    });
+  } catch (error) {
+    if (__DEV__) {
+      console.warn('[Database] replaceMessageAttachments failed:', error);
+    }
+  }
+}
+
 export async function updateMessageByServerId(
   serverId: number,
   updates: {

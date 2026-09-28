@@ -118,7 +118,12 @@ export function resolveMediaUrl(
     return null;
   }
 
-  if (rawUrl.startsWith('http://') || rawUrl.startsWith('https://') || rawUrl.startsWith('file://')) {
+  if (
+    rawUrl.startsWith('http://') ||
+    rawUrl.startsWith('https://') ||
+    rawUrl.startsWith('file://') ||
+    rawUrl.startsWith('content://')
+  ) {
     return rawUrl;
   }
 

@@ -2,7 +2,12 @@ import type { OutboxPayload } from '@/types/database';
 import { AppState, AppStateStatus } from 'react-native';
 import NetInfo from '@react-native-community/netinfo';
 import { messagesAPI } from './api';
-import { getDb, getMessageByClientMessageId, updateMessageStatus } from './database';
+import {
+  getDb,
+  getMessageByClientMessageId,
+  replaceMessageAttachments,
+  updateMessageStatus,
+} from './database';
 import {
   getPendingOutboxEntries,
   resetOutboxForRetry,
@@ -44,12 +49,20 @@ let appState: AppStateStatus = 'active';
 let appStateSub: { remove: () => void } | null = null;
 let netSub: (() => void) | null = null;
 
+export type OutboxSyncAttachment = {
+  id: number;
+  name: string;
+  mime: string;
+  url: string;
+};
+
 export type OutboxSyncEvent = {
   clientMessageId: string;
   localMessageId: number;
   serverId?: number;
   serverCreatedAt?: string;
   status: 'synced' | 'failed' | 'pending';
+  attachments?: OutboxSyncAttachment[];
 };
 
 type OutboxListener = (event: OutboxSyncEvent) => void;
@@ -95,6 +108,87 @@ function extractServerMessageId(data: unknown): { id?: number; created_at?: stri
     };
   }
   return {};
+}
+
+function getMessagePayloadFromResponse(data: unknown): Record<string, unknown> | null {
+  if (!data || typeof data !== 'object') return null;
+  const root = data as Record<string, unknown>;
+
+  if (Array.isArray(root.attachments)) {
+    return root;
+  }
+
+  const nestedMessage = root.message;
+  if (nestedMessage && typeof nestedMessage === 'object') {
+    return nestedMessage as Record<string, unknown>;
+  }
+
+  const nestedData = root.data;
+  if (nestedData && typeof nestedData === 'object') {
+    const inner = nestedData as Record<string, unknown>;
+    if (Array.isArray(inner.attachments)) {
+      return inner;
+    }
+    if (inner.message && typeof inner.message === 'object') {
+      return inner.message as Record<string, unknown>;
+    }
+  }
+
+  return null;
+}
+
+function extractServerAttachments(data: unknown): OutboxSyncAttachment[] {
+  const message = getMessagePayloadFromResponse(data);
+  if (!message || !Array.isArray(message.attachments)) {
+    return [];
+  }
+
+  return message.attachments
+    .map((raw, index) => {
+      if (!raw || typeof raw !== 'object') return null;
+      const att = raw as Record<string, unknown>;
+      const url = String(att.url ?? att.path ?? '');
+      const name = String(att.name ?? att.file_name ?? `attachment_${index + 1}`);
+      const mime = String(att.mime ?? att.mime_type ?? att.type ?? 'application/octet-stream');
+      const id = Number(att.id ?? att.server_id ?? index + 1);
+      if (!url) return null;
+      return { id, name, mime, url };
+    })
+    .filter((att): att is OutboxSyncAttachment => att !== null);
+}
+
+async function finalizeSuccessfulSend(params: {
+  clientMessageId: string;
+  localMessageId: number | null;
+  responseData: unknown;
+}): Promise<void> {
+  const { clientMessageId, localMessageId, responseData } = params;
+  const { id: serverId, created_at: serverCreatedAt } = extractServerMessageId(responseData);
+  const attachments = extractServerAttachments(responseData);
+
+  if (localMessageId && serverId) {
+    await updateMessageStatus(localMessageId, serverId, 'synced', serverCreatedAt);
+  }
+  if (localMessageId && attachments.length > 0) {
+    await replaceMessageAttachments(
+      localMessageId,
+      attachments.map((att) => ({
+        server_id: att.id,
+        name: att.name,
+        mime: att.mime,
+        url: att.url,
+      }))
+    );
+  }
+
+  emit({
+    clientMessageId,
+    localMessageId: localMessageId ?? 0,
+    serverId,
+    serverCreatedAt,
+    status: 'synced',
+    attachments: attachments.length > 0 ? attachments : undefined,
+  });
 }
 
 function buildFormData(payload: OutboxPayload, clientMessageId: string): FormData {
@@ -237,35 +331,24 @@ async function sendPayloadDirectly(params: {
     const res = await messagesAPI.sendMessage(formData);
 
     if (res.status >= 200 && res.status < 300) {
-      const { id: serverId, created_at: serverCreatedAt } = extractServerMessageId(res.data);
-      if (localMessageId && serverId) {
-        await updateMessageStatus(localMessageId, serverId, 'synced', serverCreatedAt);
-      }
-      emit({
+      await finalizeSuccessfulSend({
         clientMessageId,
-        localMessageId: localMessageId ?? 0,
-        serverId,
-        serverCreatedAt,
-        status: 'synced',
+        localMessageId,
+        responseData: res.data,
       });
       if (shouldLogOutbox) {
-        logger.debug('[Outbox] Direct send synced', clientMessageId, serverId);
+        logger.debug('[Outbox] Direct send synced', clientMessageId);
       }
     }
   } catch (error: unknown) {
     const err = error as { response?: { status?: number; data?: unknown }; message?: string };
     if (err.response?.status === 409) {
-      const { id: serverId, created_at: serverCreatedAt } = extractServerMessageId(err.response.data);
+      const serverId = extractServerMessageId(err.response.data).id;
       if (serverId) {
-        if (localMessageId) {
-          await updateMessageStatus(localMessageId, serverId, 'synced', serverCreatedAt);
-        }
-        emit({
+        await finalizeSuccessfulSend({
           clientMessageId,
-          localMessageId: localMessageId ?? 0,
-          serverId,
-          serverCreatedAt,
-          status: 'synced',
+          localMessageId,
+          responseData: err.response.data,
         });
         return;
       }
@@ -338,8 +421,10 @@ async function processSingleOutboxEntry(
     payload = JSON.parse(row.payload_json) as OutboxPayload;
   } catch {
     await updateOutboxStatus(clientMessageId, 'failed');
-    await updateMessageStatus(localMessageId, undefined, 'failed');
-    emit({ clientMessageId, localMessageId, status: 'failed' });
+    if (localMessageId) {
+      await updateMessageStatus(localMessageId, undefined, 'failed');
+    }
+    emit({ clientMessageId, localMessageId: localMessageId ?? 0, status: 'failed' });
     sendingClientIds.delete(clientMessageId);
     return;
   }
@@ -356,26 +441,23 @@ async function processSingleOutboxEntry(
     const res = await messagesAPI.sendMessage(formData);
 
     if (res.status >= 200 && res.status < 300) {
-      const { id: serverId, created_at: serverCreatedAt } = extractServerMessageId(res.data);
+      const serverId = extractServerMessageId(res.data).id;
       if (serverId) {
-        await updateMessageStatus(localMessageId, serverId, 'synced', serverCreatedAt);
-        await updateOutboxStatus(clientMessageId, 'synced');
-        emit({
+        await finalizeSuccessfulSend({
           clientMessageId,
           localMessageId,
-          serverId,
-          serverCreatedAt,
-          status: 'synced',
+          responseData: res.data,
         });
+        await updateOutboxStatus(clientMessageId, 'synced');
         if (shouldLogOutbox) {
           logger.debug('[Outbox] Synced', clientMessageId, '→', serverId);
         }
       } else {
         await updateOutboxStatus(clientMessageId, 'pending', attempts + 1, new Date().toISOString());
-        emit({ clientMessageId, localMessageId, status: 'pending' });
+        emit({ clientMessageId, localMessageId: localMessageId ?? 0, status: 'pending' });
         captureException(new Error('[Outbox] 2xx response missing server message id'), {
           clientMessageId,
-          localMessageId,
+          localMessageId: localMessageId ?? 0,
         });
       }
     } else {
@@ -387,29 +469,28 @@ async function processSingleOutboxEntry(
     const isClientError = status != null && status >= 400 && status < 500;
 
     if (status === 409) {
-      const { id: serverId, created_at: serverCreatedAt } = extractServerMessageId(err.response?.data);
+      const serverId = extractServerMessageId(err.response?.data).id;
       if (serverId) {
-        await updateMessageStatus(localMessageId, serverId, 'synced', serverCreatedAt);
-        await updateOutboxStatus(clientMessageId, 'synced');
-        emit({
+        await finalizeSuccessfulSend({
           clientMessageId,
           localMessageId,
-          serverId,
-          serverCreatedAt,
-          status: 'synced',
+          responseData: err.response?.data,
         });
+        await updateOutboxStatus(clientMessageId, 'synced');
       } else {
         await updateOutboxStatus(clientMessageId, 'pending', attempts + 1, new Date().toISOString());
-        emit({ clientMessageId, localMessageId, status: 'pending' });
+        emit({ clientMessageId, localMessageId: localMessageId ?? 0, status: 'pending' });
       }
     } else if (isClientError) {
       await updateOutboxStatus(clientMessageId, 'failed');
-      await updateMessageStatus(localMessageId, undefined, 'failed');
-      emit({ clientMessageId, localMessageId, status: 'failed' });
+      if (localMessageId) {
+        await updateMessageStatus(localMessageId, undefined, 'failed');
+      }
+      emit({ clientMessageId, localMessageId: localMessageId ?? 0, status: 'failed' });
       logger.error('[Outbox] Permanent failure', clientMessageId, status);
     } else {
       await updateOutboxStatus(clientMessageId, 'pending', attempts + 1, new Date().toISOString());
-      emit({ clientMessageId, localMessageId, status: 'pending' });
+      emit({ clientMessageId, localMessageId: localMessageId ?? 0, status: 'pending' });
     }
   } finally {
     sendingClientIds.delete(clientMessageId);

@@ -2,7 +2,7 @@
   "expo": {
     "name": "TechChat",
     "slug": "techchat",
-    "version": "1.1.4",
+    "version": "1.1.5",
     "sdkVersion": "54.0.0",
     "orientation": "portrait",
     "icon": "./assets/images/healtclassique-icon.png",
@@ -56,6 +56,40 @@
         {
           "icon": "./assets/ic_launcher/android/ic_launcher-web.png",
           "color": "#283891"
+        }
+      ],
+      [
+        "expo-share-intent",
+        {
+          "androidIntentFilters": [
+            "text/plain",
+            "text/*",
+            "image/*",
+            "application/pdf",
+            "application/msword",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "application/vnd.ms-excel",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "application/vnd.ms-powerpoint",
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+          ],
+          "androidMultiIntentFilters": [
+            "text/plain",
+            "text/*",
+            "image/*",
+            "application/pdf",
+            "application/msword",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "application/vnd.ms-excel",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "application/vnd.ms-powerpoint",
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+          ],
+          "androidMainActivityAttributes": {
+            "android:launchMode": "singleTask",
+            "android:windowSoftInputMode": "adjustResize"
+          },
+          "disableIOS": true
         }
       ]
     ],

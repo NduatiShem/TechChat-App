@@ -145,6 +145,7 @@ export function applyOutboxSyncToMessages(
     serverId?: number;
     serverCreatedAt?: string;
     status: 'synced' | 'failed' | 'pending';
+    attachments?: Array<{ id: number; name: string; mime: string; url: string }>;
   }
 ): ChatMessage[] {
   const target = messages.find(
@@ -175,6 +176,14 @@ export function applyOutboxSyncToMessages(
       server_id: event.serverId,
       sync_status: 'synced',
       created_at: event.serverCreatedAt || target.created_at,
+      attachments: event.attachments?.length
+        ? event.attachments.map((att) => ({
+            id: att.id,
+            name: att.name,
+            mime: att.mime,
+            url: att.url,
+          }))
+        : target.attachments,
     };
     return dedupeMessages([...withoutLocal, updated]);
   }

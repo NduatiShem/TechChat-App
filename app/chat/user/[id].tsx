@@ -28,6 +28,7 @@ import {
   useOutboxSync,
   deduplicateMessages,
 } from '@/hooks/useChatMessages';
+import { useConsumePendingShareAttachment } from '@/hooks/useConsumePendingShareAttachment';
 import { useDatabaseInit } from '@/hooks/useDatabaseInit';
 import { generateClientMessageId } from '@/utils/clientMessageId';
 import { getCachedAuthUserId } from '@/utils/cachedAuthUser';
@@ -40,6 +41,9 @@ import {
 import { markUserChatAsRead } from '@/services/markReadService';
 import { subscribeConversationChannel, onRealtimeMessage, handleRealtimeMessage, isRealtimeConnected } from '@/services/realtimeService';
 import { syncOlderMessages, pauseBackfill, resumeBackfill } from '@/services/syncService';
+import ChatAttachmentImage from '@/components/ChatAttachmentImage';
+import { getAttachmentDisplayUrl } from '@/utils/attachmentUrl';
+import { persistAttachmentForUpload } from '@/utils/persistAttachmentForUpload';
 import { isVideoAttachment } from '@/utils/textUtils';
 import { MaterialCommunityIcons, MaterialIcons } from '@expo/vector-icons';
 import { useFocusEffect } from '@react-navigation/native';
@@ -153,6 +157,7 @@ export default function UserChatScreen() {
   const [sending, setSending] = useState(false);
   const [showEmoji, setShowEmoji] = useState(false);
   const [attachment, setAttachment] = useState<Attachment | null>(null); // { uri, name, type, isImage }
+  useConsumePendingShareAttachment(setAttachment);
   const [userInfo, setUserInfo] = useState<any>(null);
   const [isOnline, setIsOnline] = useState(false);
   const [showVoiceRecorder, setShowVoiceRecorder] = useState(false);
@@ -1149,15 +1154,20 @@ export default function UserChatScreen() {
     });
     if (!result.canceled && result.assets && result.assets.length > 0) {
       const asset = result.assets[0];
-      // Normalize filename and mime type for upload compatibility
       const guessedName = asset.fileName || `photo_${Date.now()}.jpg`;
-      const guessedMime = (asset as any).mimeType || 'image/jpeg';
-      setAttachment({
-        uri: asset.uri,
-        name: guessedName,
-        type: guessedMime,
-        isImage: true,
-      });
+      const guessedMime = (asset as { mimeType?: string }).mimeType || 'image/jpeg';
+      try {
+        const uri = await persistAttachmentForUpload(asset.uri, guessedName);
+        setAttachment({
+          uri,
+          name: guessedName,
+          type: guessedMime,
+          isImage: true,
+        });
+      } catch (error) {
+        console.warn('[UserChat] Failed to copy image for upload:', error);
+        Alert.alert('Error', 'Could not prepare this image for sending.');
+      }
     }
   };
 
@@ -1725,14 +1735,7 @@ export default function UserChatScreen() {
             return isVideoAttachment(firstAttachment) ? (
               <View style={{ width: '100%' }}>
                 <VideoPlayer
-                  url={(() => {
-                    let url = firstAttachment.url || firstAttachment.path || firstAttachment.uri || '';
-                    if (url && !url.startsWith('http')) {
-                      const cleanUrl = url.startsWith('/') ? url.substring(1) : url;
-                      url = `${getBaseUrl()}/${cleanUrl}`;
-                    }
-                    return url || '';
-                  })()}
+                  url={getAttachmentDisplayUrl(firstAttachment, getBaseUrl) || ''}
                   isMine={isMine}
                   isDark={isDark}
                   style={{ marginBottom: 4 }}
@@ -1762,55 +1765,16 @@ export default function UserChatScreen() {
               </View>
             ) : firstAttachment.mime?.startsWith('image/') ? (
               <View style={{ width: '100%' }}>
-                <TouchableOpacity 
+                <ChatAttachmentImage
+                  uri={getAttachmentDisplayUrl(firstAttachment, getBaseUrl)}
+                  isDark={isDark}
                   onPress={() => {
-                    // Try multiple possible URL fields and construct full URL
-                    let imageUrl = firstAttachment.url || 
-                                  firstAttachment.path || 
-                                  firstAttachment.uri;
-                    
-                    // If URL is relative, make it absolute
-                    if (imageUrl && !imageUrl.startsWith('http')) {
-                      const cleanUrl = imageUrl.startsWith('/') ? imageUrl.substring(1) : imageUrl;
-                      imageUrl = `${getBaseUrl()}/${cleanUrl}`;
-                    }
-                    
+                    const imageUrl = getAttachmentDisplayUrl(firstAttachment, getBaseUrl);
                     if (imageUrl) {
                       setShowImagePreview(imageUrl);
                     }
                   }}
-                >
-                  <Image 
-                    source={{ 
-                      uri: (() => {
-                        let url = firstAttachment.url || firstAttachment.path || firstAttachment.uri || '';
-                        
-                        if (url && !url.startsWith('http')) {
-                          // Remove leading slash if present and construct full URL
-                          const cleanUrl = url.startsWith('/') ? url.substring(1) : url;
-                          const fullUrl = `${getBaseUrl()}/${cleanUrl}`;
-                          return fullUrl;
-                        }
-                        return url || '';
-                      })()
-                    }} 
-                    style={{ 
-                      width: 200, 
-                      height: 200, 
-                      borderRadius: 12,
-                      backgroundColor: isDark ? '#374151' : '#F3F4F6',
-                      alignSelf: 'flex-start', // Prevent overflow
-                      maxWidth: '100%',         // Ensure it doesn't overflow
-                    }}
-                    resizeMode="cover"
-                    onError={(error) => {
-                      // Silent fail for image loading
-                    }}
-                    onLoad={() => {
-                      // Image loaded successfully
-                    }}
-                  />
-                </TouchableOpacity>
+                />
                 
                 {/* Timestamp and read receipt below image */}
                 <View style={{ 
